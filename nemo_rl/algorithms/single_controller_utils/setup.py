@@ -44,7 +44,10 @@ from nemo_rl.environments.nemo_gym import spinup_nemo_gym_actor
 from nemo_rl.experience.rollout_manager import RolloutManager
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
-from nemo_rl.models.megatron.router_replay import router_replay_enabled
+from nemo_rl.models.megatron.router_replay import (
+    configure_vllm_for_router_replay,
+    router_replay_enabled,
+)
 from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.weight_sync import WeightSynchronizer, create_weight_synchronizer
 
@@ -151,6 +154,7 @@ def _build_generation(
         generation_config["vllm_kwargs"]["hf_overrides"] = master_config.policy.get(
             "hf_config_overrides", {}
         )
+        configure_vllm_for_router_replay(master_config.policy)
         gen = VllmGeneration(cluster=inference_cluster, config=generation_config)
     elif backend == "sglang":
         generation_config["sglang_cfg"].setdefault(
