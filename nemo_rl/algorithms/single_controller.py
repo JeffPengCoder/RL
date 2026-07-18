@@ -236,7 +236,23 @@ class SingleControllerActor:
         rollout_task = asyncio.create_task(self._rollout_pump())
         train_task = asyncio.create_task(self._train_pump())
 
-        # Wait until the train pump is done
+        # FIRST_COMPLETED so a pump crash surfaces immediately instead of
+        # sitting silently on the task while the other pump hangs.
+        done, _ = await asyncio.wait(
+            {rollout_task, train_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        for pump in done:
+            if not pump.cancelled() and pump.exception() is not None:
+                # One pump raised. Cancel the other, drain, then re-raise.
+                other = train_task if pump is rollout_task else rollout_task
+                other.cancel()
+                try:
+                    await other
+                except asyncio.CancelledError:
+                    pass
+                pump.result()  # re-raises the stored exception
+
+        # Wait for train to finish (rollout may still be draining epochs).
         await train_task
         self._logger.finish()
 
@@ -363,6 +379,11 @@ class SingleControllerActor:
                     task.add_done_callback(self._dispatched_rollouts.discard)
 
             self._current_epoch += 1
+
+        # Drain in-flight so return implies "all rollouts in TQ".
+        inflight = list(self._dispatched_rollouts)
+        if inflight:
+            await asyncio.gather(*inflight, return_exceptions=True)
 
         print(f"rollout_pump: completed {self._current_epoch} epoch(s)", flush=True)
 
