@@ -281,18 +281,31 @@ _patch_nsight_file()
 # Need to set PYTHONPATH to include transformers downloaded modules.
 # Assuming the cache directory is the same cross venvs.
 def patch_transformers_module_dir(env_vars: dict[str, str]):
-    hf_home = os.environ.get("HF_HOME", None)
-    if hf_home is None:
-        return env_vars
+    """Put the authoritative Transformers module cache first on PYTHONPATH.
 
-    module_dir = os.path.join(hf_home, "modules")
+    ``HF_MODULES_CACHE`` may intentionally point at a writable, materialized
+    cache while ``HF_HOME/modules`` is a read-only seed. Preferring the seed
+    can bind ``transformers_modules`` to a tree that lacks dynamic model files
+    created in the writable cache, which then breaks fresh Ray actor imports.
+    """
+    module_dir = env_vars.get("HF_MODULES_CACHE") or os.environ.get("HF_MODULES_CACHE")
+    if module_dir is None:
+        hf_home = env_vars.get("HF_HOME") or os.environ.get("HF_HOME")
+        if hf_home is None:
+            return env_vars
+        module_dir = os.path.join(hf_home, "modules")
+
     if not os.path.isdir(module_dir):
         return env_vars
 
-    if "PYTHONPATH" not in env_vars:
-        env_vars["PYTHONPATH"] = module_dir
-    else:
-        env_vars["PYTHONPATH"] = f"{module_dir}:{env_vars['PYTHONPATH']}"
+    module_dir_norm = os.path.normpath(module_dir)
+    existing_paths = [
+        path for path in env_vars.get("PYTHONPATH", "").split(os.pathsep) if path
+    ]
+    remaining_paths = [
+        path for path in existing_paths if os.path.normpath(path) != module_dir_norm
+    ]
+    env_vars["PYTHONPATH"] = os.pathsep.join([module_dir, *remaining_paths])
 
     return env_vars
 

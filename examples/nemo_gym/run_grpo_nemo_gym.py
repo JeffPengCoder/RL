@@ -222,11 +222,11 @@ The validation set you pass in will directly be used for validation with no addi
     with rl_init_timer.time("ray_connect"):
         init_ray()
 
-    # `is_trajectory_collection` is a NeMo-RL-side control-flow knob; pop it
-    # before setup() so it is not forwarded into NeMo-Gym's global config (the
-    # gym actor is now created inside setup()).
-    is_trajectory_collection = (
-        config.env["nemo_gym"].pop("is_trajectory_collection", False) or False
+    # This is a NeMo-RL control-flow marker. spinup_nemo_gym_actor removes it
+    # from its copied Gym config, while setup uses it to avoid enabling the
+    # training-only exact-runtime admission path during benchmark collection.
+    is_trajectory_collection = bool(
+        config.env["nemo_gym"].get("is_trajectory_collection", False)
     )
 
     with rl_init_timer.time("setup"):

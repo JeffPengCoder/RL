@@ -38,7 +38,8 @@ from nemo_rl.environments.nemo_gym import (
     _compact_json_size,
     _index_per_turn_images,
     _resolve_images_by_media_id,
-    _stamp_context_compaction_rollout_ids,
+    _stamp_trajectory_rollout_ids,
+    _validate_trajectory_transitions,
     build_reward_component_columns,
     extract_reward_components,
     setup_nemo_gym_config,
@@ -156,6 +157,57 @@ _TEST_FINAL_POLICY_DECISION = {
 }
 
 
+def _test_trajectory_contract(
+    *,
+    rollout_id: str,
+    transition_count: int,
+    model_call_count: int,
+    exact: bool = True,
+    identity_source: str = "caller",
+) -> dict:
+    reasons = []
+    status = "requires_runtime_admission"
+    if not exact:
+        reasons.append("exact_model_call_evidence_unavailable")
+        status = "ineligible"
+    if identity_source != "caller":
+        reasons.append("caller_owned_rollout_identity_unavailable")
+        status = "ineligible"
+    identity = {
+        "rollout_id": rollout_id,
+        "group_id": "group-cc",
+        "task_id": "task-cc",
+        "rollout_index": 3,
+        "attempt_index": 0,
+        "identity_source": identity_source,
+    }
+    model_name = "test-model"
+    contract = {
+        "schema_version": 2,
+        "mode": "osworld_semantic_trajectory",
+        **identity,
+        "trajectory_id": stable_id("trajectory", identity, model_name),
+        "model_name": model_name,
+        "transition_count": transition_count,
+        "model_call_count": model_call_count,
+        "capabilities": {
+            "semantic_trajectory": True,
+            "exact_model_call_evidence": exact,
+            "arbitrary_prompt_rewrites": exact,
+            "trainable_token_reconstruction": exact,
+        },
+        "training_eligibility": {
+            "status": status,
+            "incomplete_reasons": reasons,
+        },
+    }
+    contract["trajectory_contract_id"] = stable_id(
+        "trajectory-contract",
+        contract,
+    )
+    return contract
+
+
 def _test_runtime_contract() -> dict:
     definitions = {
         "model": {"generation_policy_version": "sync-policy-step-00000000"},
@@ -235,10 +287,15 @@ def _exact_evidence_contract_fields(
     media_ids: list[str],
     expected_append_compatible: bool,
     compaction_event_id: str | None = None,
+    model_call_id: str | None = None,
 ) -> dict:
     action_id = f"action-{turn_id}"
-    model_call_id = f"model-call-{turn_id}"
+    model_call_id = model_call_id or f"model-call-{turn_id}"
     return {
+        "environment_step": turn_id - 1,
+        "parse_attempt": 1,
+        "accepted": True,
+        "parse_error": None,
         "prepared_request_id": f"prepared-{turn_id}",
         "request_id": f"request-{turn_id}",
         "context_epoch": segment_index,
@@ -586,8 +643,100 @@ def test_nemo_gym_postprocess_builds_exact_compacted_trace_bundle():
         "config_digest": "policy-config",
     }
     rollout_id = "group-cc:batch-000000:row-000003"
+    trajectory_contract = _test_trajectory_contract(
+        rollout_id=rollout_id,
+        transition_count=2,
+        model_call_count=2,
+    )
+    model_call_ids = [
+        stable_id(
+            "model-call",
+            trajectory_contract["trajectory_id"],
+            transition_index,
+            1,
+        )
+        for transition_index in range(2)
+    ]
+    media_sources = [
+        {
+            "type": "input_image",
+            "image_url": image_url,
+            "detail": "high",
+        }
+        for image_url in (
+            "data:image/png;base64,A",
+            "data:image/png;base64,B",
+        )
+    ]
+    media_ids = [f"media-{canonical_digest(source)[:24]}" for source in media_sources]
+    media_assets = {
+        media_id: {
+            "media_id": media_id,
+            "content_digest": canonical_digest(source),
+            "source_part": source,
+            "original_dimensions": None,
+            "color_mode": None,
+            "source_format": None,
+        }
+        for media_id, source in zip(media_ids, media_sources)
+    }
+    trajectory_model_calls = [
+        {
+            "model_call_id": model_call_ids[turn_id - 1],
+            "turn_id": turn_id,
+            "environment_step": turn_id - 1,
+            "parse_attempt": 1,
+            "state": {
+                "prompt_messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_image",
+                                "media_id": media_id,
+                                "detail": "high",
+                            }
+                            for media_id in media_ids[:turn_id]
+                        ],
+                    }
+                ],
+                "media_ids": media_ids[:turn_id],
+            },
+            "action": {
+                "raw_completion": f"turn {turn_id}",
+                "parsed_actions": [{"type": "computer_initialize_state"}],
+            },
+            "reward": float(turn_id == 2),
+            "done": turn_id == 2,
+            "eligible": turn_id == 1,
+            "accepted": True,
+            "parse_error": None,
+            "generation_evidence": {
+                "prompt_token_ids": [1] if turn_id == 1 else [8],
+                "generation_token_ids": [2] if turn_id == 1 else [9],
+                "generation_log_probs": [-0.1] if turn_id == 1 else [-0.2],
+                "finish_reason": "stop",
+                "exact": True,
+            },
+        }
+        for turn_id in (1, 2)
+    ]
     result_payload = {
         "response": {
+            "trajectory_contract": trajectory_contract,
+            "trajectory_model_calls": trajectory_model_calls,
+            "model_call_summaries": [
+                {
+                    "model_call_id": model_call["model_call_id"],
+                    "turn_id": model_call["turn_id"],
+                    "environment_step": model_call["environment_step"],
+                    "parse_attempt": model_call["parse_attempt"],
+                    "accepted": model_call["accepted"],
+                    "parse_error": model_call["parse_error"],
+                    "exact_evidence": model_call["generation_evidence"]["exact"],
+                }
+                for model_call in trajectory_model_calls
+            ],
             "context_compaction_contract": {
                 "schema_version": 2,
                 "mode": "exact_trace_authority",
@@ -596,18 +745,11 @@ def test_nemo_gym_postprocess_builds_exact_compacted_trace_bundle():
                 "task_id": "task-cc",
                 "rollout_index": 3,
                 "attempt_index": 0,
+                "identity_source": "caller",
+                "trajectory_contract_id": trajectory_contract["trajectory_contract_id"],
                 "generation_contract": _TEST_GENERATION_CONTRACT,
             },
-            "media_assets": {
-                "screen-a": {
-                    "type": "input_image",
-                    "image_url": "data:image/png;base64,A",
-                },
-                "screen-b": {
-                    "type": "input_image",
-                    "image_url": "data:image/png;base64,B",
-                },
-            },
+            "media_assets": media_assets,
             "final_policy_decision": _TEST_FINAL_POLICY_DECISION,
             "lineage_deltas": _test_lineage_deltas(2),
             "boundary_events": [boundary],
@@ -617,10 +759,11 @@ def test_nemo_gym_postprocess_builds_exact_compacted_trace_bundle():
                     "turn_id": 1,
                     "completion_id": "completion-1",
                     "action_id": "action-1",
+                    "model_call_id": model_call_ids[0],
                     "prompt_token_ids": [1],
                     "sampled_token_ids": [2],
                     "sampled_logprobs": [-0.1],
-                    "media_ids": ["screen-a"],
+                    "media_ids": media_ids[:1],
                     "policy_decision": {
                         "policy_name": "recency",
                         "policy_version": "1",
@@ -632,8 +775,9 @@ def test_nemo_gym_postprocess_builds_exact_compacted_trace_bundle():
                     **_exact_evidence_contract_fields(
                         turn_id=1,
                         segment_index=0,
-                        media_ids=["screen-a"],
+                        media_ids=media_ids[:1],
                         expected_append_compatible=False,
+                        model_call_id=model_call_ids[0],
                     ),
                 },
                 {
@@ -641,10 +785,11 @@ def test_nemo_gym_postprocess_builds_exact_compacted_trace_bundle():
                     "turn_id": 2,
                     "completion_id": "completion-2",
                     "action_id": "action-2",
+                    "model_call_id": model_call_ids[1],
                     "prompt_token_ids": [8],
                     "sampled_token_ids": [9],
                     "sampled_logprobs": [-0.2],
-                    "media_ids": ["screen-a", "screen-b"],
+                    "media_ids": media_ids,
                     "policy_decision": {
                         "policy_name": "recency",
                         "policy_version": "1",
@@ -656,9 +801,10 @@ def test_nemo_gym_postprocess_builds_exact_compacted_trace_bundle():
                     **_exact_evidence_contract_fields(
                         turn_id=2,
                         segment_index=1,
-                        media_ids=["screen-a", "screen-b"],
+                        media_ids=media_ids,
                         expected_append_compatible=False,
                         compaction_event_id="boundary-2",
+                        model_call_id=model_call_ids[1],
                     ),
                 },
             ],
@@ -678,14 +824,45 @@ def test_nemo_gym_postprocess_builds_exact_compacted_trace_bundle():
         "responses_create_params": {"input": []},
         "reward": 0.75,
     }
+    result_payload["response"]["trajectory_transitions"] = [
+        {
+            "transition_id": stable_id(
+                "transition",
+                trajectory_contract["trajectory_id"],
+                evidence["turn_id"] - 1,
+            ),
+            "turn_id": evidence["turn_id"],
+            "state": {
+                "observation": {"screenshot_sha256": f"screen-{evidence['turn_id']}"},
+                "model_call_ids": [evidence["model_call_id"]],
+            },
+            "action": {
+                "raw_completion": f"turn {evidence['turn_id']}",
+                "parsed_actions": [{"type": "computer_initialize_state"}],
+                "accepted_model_call_id": evidence["model_call_id"],
+            },
+            "reward": float(evidence["turn_id"] == 2),
+            "next_state": {
+                "observation": {
+                    "screenshot_sha256": f"screen-{evidence['turn_id'] + 1}"
+                }
+            },
+            "done": evidence["turn_id"] == 2,
+            "eligible": evidence["eligible"],
+        }
+        for evidence in result_payload["response"]["completion_evidence"]
+    ]
     row = {
         "_rowidx": 3,
-        "context_compaction_rollout_id": rollout_id,
-        "context_compaction_group_id": "group-cc",
-        "context_compaction_task_id": "task-cc",
-        "context_compaction_rollout_index": 3,
-        "context_compaction_attempt_index": 0,
-        "context_compaction_runtime_contract": _test_runtime_contract(),
+        "trajectory_identity": {
+            "schema_version": 1,
+            "rollout_id": rollout_id,
+            "group_id": "group-cc",
+            "task_id": "task-cc",
+            "rollout_index": 3,
+            "attempt_index": 0,
+        },
+        "trajectory_runtime_contract": _test_runtime_contract(),
     }
 
     class _MockSelf:
@@ -759,6 +936,13 @@ def test_nemo_gym_postprocess_builds_exact_compacted_trace_bundle():
         < 1.0
     )
     projected_response = result["full_result"]["response"]
+    projected_transitions = projected_response["trajectory_transitions"]
+    assert projected_transitions[0]["action"] == {
+        "raw_completion": "turn 1",
+        "parsed_actions": [{"type": "computer_initialize_state"}],
+        "accepted_model_call_id": model_call_ids[0],
+    }
+    assert projected_transitions[1]["reward"] == 1.0
     assert set(projected_response).isdisjoint(
         {
             "agent_input",
@@ -769,6 +953,63 @@ def test_nemo_gym_postprocess_builds_exact_compacted_trace_bundle():
             "lineage_deltas",
         }
     )
+
+
+def test_validate_trajectory_transitions_rejects_unknown_model_call_reference():
+    contract = _test_trajectory_contract(
+        rollout_id="rollout-1",
+        transition_count=1,
+        model_call_count=1,
+    )
+    model_calls = [
+        {
+            "model_call_id": "model-call-1",
+            "turn_id": 1,
+            "environment_step": 0,
+            "parse_attempt": 1,
+            "state": {"prompt_messages": [], "media_ids": []},
+            "action": {"raw_completion": "click", "parsed_actions": []},
+            "reward": 0.0,
+            "done": False,
+            "eligible": True,
+            "accepted": True,
+            "parse_error": None,
+            "generation_evidence": {
+                "prompt_token_ids": [1],
+                "generation_token_ids": [2],
+                "generation_log_probs": [-0.1],
+                "finish_reason": "stop",
+                "exact": True,
+            },
+        }
+    ]
+    transition = {
+        "transition_id": "transition-1",
+        "turn_id": 1,
+        "state": {
+            "observation": {},
+            "model_call_ids": ["model-call-unknown"],
+        },
+        "action": {
+            "raw_completion": "click",
+            "parsed_actions": [{"type": "computer_initialize_state"}],
+            "accepted_model_call_id": "model-call-unknown",
+        },
+        "reward": 0.0,
+        "next_state": {"observation": {}},
+        "done": False,
+        "eligible": True,
+    }
+
+    with pytest.raises(ValueError, match="unknown model call"):
+        _validate_trajectory_transitions(
+            [transition],
+            trajectory_contract=contract,
+            trajectory_model_calls=model_calls,
+            model_call_summaries=None,
+            completion_evidence=[],
+            media_assets={},
+        )
 
 
 def test_nemo_gym_postprocess_exact_authority_rejects_missing_evidence():
@@ -823,6 +1064,156 @@ def test_nemo_gym_postprocess_exact_authority_rejects_missing_evidence():
         )
 
 
+def test_nemo_gym_training_rejects_semantic_only_trajectory() -> None:
+    trajectory_contract = _test_trajectory_contract(
+        rollout_id="rollout-semantic-only",
+        transition_count=0,
+        model_call_count=0,
+        exact=False,
+    )
+    payload = {
+        "response": {
+            "trajectory_contract": trajectory_contract,
+            "trajectory_transitions": [],
+            "trajectory_model_calls": [],
+            "model_call_summaries": [],
+            "media_assets": {},
+            "output": [],
+        },
+        "responses_create_params": {"input": []},
+    }
+    row = {
+        "_rowidx": 0,
+        "trajectory_runtime_contract": _test_runtime_contract(),
+    }
+
+    postprocess = (
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result
+    )
+    with pytest.raises(ValueError, match="only semantic trajectory evidence"):
+        postprocess(
+            type("_MockSelf", (), {"cfg": {}})(),
+            row,
+            payload,
+            object(),
+            generation_only=False,
+        )
+
+
+def test_nemo_gym_generation_only_accepts_semantic_trajectory_without_tokens() -> None:
+    trajectory_contract = _test_trajectory_contract(
+        rollout_id="rollout-semantic-benchmark",
+        transition_count=1,
+        model_call_count=1,
+        exact=False,
+        identity_source="derived",
+    )
+    model_call_id = stable_id(
+        "model-call",
+        trajectory_contract["trajectory_id"],
+        0,
+        1,
+    )
+    payload = {
+        "response": {
+            "trajectory_contract": trajectory_contract,
+            "trajectory_model_calls": [
+                {
+                    "model_call_id": model_call_id,
+                    "turn_id": 1,
+                    "environment_step": 0,
+                    "parse_attempt": 1,
+                    "state": {
+                        "prompt_messages": [
+                            {"role": "user", "content": "inspect the desktop"}
+                        ],
+                        "media_ids": [],
+                    },
+                    "action": {
+                        "raw_completion": "DONE",
+                        "parsed_actions": ["DONE"],
+                    },
+                    "reward": 1.0,
+                    "done": True,
+                    "eligible": True,
+                    "accepted": True,
+                    "parse_error": None,
+                    "generation_evidence": {
+                        "prompt_token_ids": None,
+                        "generation_token_ids": None,
+                        "generation_log_probs": None,
+                        "finish_reason": "stop",
+                        "exact": False,
+                    },
+                }
+            ],
+            "model_call_summaries": [
+                {
+                    "model_call_id": model_call_id,
+                    "turn_id": 1,
+                    "environment_step": 0,
+                    "parse_attempt": 1,
+                    "accepted": True,
+                    "parse_error": None,
+                    "exact_evidence": False,
+                }
+            ],
+            "trajectory_transitions": [
+                {
+                    "transition_id": stable_id(
+                        "transition", trajectory_contract["trajectory_id"], 0
+                    ),
+                    "turn_id": 1,
+                    "state": {
+                        "observation": {},
+                        "model_call_ids": [model_call_id],
+                    },
+                    "action": {
+                        "raw_completion": "DONE",
+                        "parsed_actions": ["DONE"],
+                        "accepted_model_call_id": model_call_id,
+                    },
+                    "reward": 1.0,
+                    "next_state": {"observation": {}},
+                    "done": True,
+                    "eligible": True,
+                }
+            ],
+            "media_assets": {},
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "DONE"}],
+                }
+            ],
+        },
+        "responses_create_params": {"input": []},
+        "reward": 1.0,
+    }
+
+    result = (
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            type("_MockSelf", (), {"cfg": {}})(),
+            {"_rowidx": 0},
+            payload,
+            object(),
+            generation_only=True,
+        )
+    )
+
+    assert result["message_log"][0]["token_ids"].numel() == 0
+    assert result["rollout_trace_bundle"]["rollout_id"] == (
+        "rollout-semantic-benchmark"
+    )
+    assert (
+        result["full_result"]["response"]["trajectory_model_calls"][0]["action"][
+            "raw_completion"
+        ]
+        == "DONE"
+    )
+
+
 def test_context_compaction_rollout_ids_are_unique_within_and_across_batches():
     rows = [
         {
@@ -832,7 +1223,7 @@ def test_context_compaction_rollout_ids_are_unique_within_and_across_batches():
         }
         for row_index in range(2)
     ]
-    _stamp_context_compaction_rollout_ids(rows, rollout_batch_index=4)
+    _stamp_trajectory_rollout_ids(rows, rollout_batch_index=4)
 
     assert [row["context_compaction_rollout_id"] for row in rows] == [
         "group-cc:batch-000004:row-000000",
@@ -840,7 +1231,7 @@ def test_context_compaction_rollout_ids_are_unique_within_and_across_batches():
     ]
 
     next_batch = [dict(rows[0])]
-    _stamp_context_compaction_rollout_ids(next_batch, rollout_batch_index=5)
+    _stamp_trajectory_rollout_ids(next_batch, rollout_batch_index=5)
     assert next_batch[0]["context_compaction_rollout_id"] == (
         "group-cc:batch-000005:row-000000"
     )
@@ -851,9 +1242,9 @@ def test_context_compaction_training_rejects_rows_without_identity_contract():
 
     with pytest.raises(
         ValueError,
-        match="training rows require context_compaction_contract_version",
+        match="require trajectory_identity",
     ):
-        _stamp_context_compaction_rollout_ids(
+        _stamp_trajectory_rollout_ids(
             rows,
             rollout_batch_index=0,
             runtime_contract=_test_runtime_contract(),
@@ -874,8 +1265,8 @@ def test_v2_context_compaction_rollout_ids_are_retry_and_order_stable():
     ]
     reordered = [dict(rows[1]), dict(rows[0])]
 
-    _stamp_context_compaction_rollout_ids(rows, rollout_batch_index=4)
-    _stamp_context_compaction_rollout_ids(reordered, rollout_batch_index=99)
+    _stamp_trajectory_rollout_ids(rows, rollout_batch_index=4)
+    _stamp_trajectory_rollout_ids(reordered, rollout_batch_index=99)
 
     by_task = {
         row["context_compaction_task_id"]: row["context_compaction_rollout_id"]
@@ -889,8 +1280,43 @@ def test_v2_context_compaction_rollout_ids_are_retry_and_order_stable():
     assert len(set(by_task.values())) == 2
 
     new_attempt = [dict(rows[0], context_compaction_attempt_index=1)]
-    _stamp_context_compaction_rollout_ids(new_attempt, rollout_batch_index=4)
+    _stamp_trajectory_rollout_ids(new_attempt, rollout_batch_index=4)
     assert new_attempt[0]["context_compaction_rollout_id"] != by_task["task-a"]
+
+
+def test_generic_trajectory_ids_are_retry_and_order_stable():
+    rows = [
+        {
+            "_rowidx": 19,
+            "trajectory_identity": {
+                "schema_version": 1,
+                "group_id": "group-trajectory",
+                "task_id": task_id,
+                "rollout_index": rollout_index,
+                "attempt_index": 0,
+            },
+        }
+        for task_id, rollout_index in (("task-a", 0), ("task-b", 1))
+    ]
+    reordered = [deepcopy(rows[1]), deepcopy(rows[0])]
+
+    _stamp_trajectory_rollout_ids(rows, rollout_batch_index=4)
+    _stamp_trajectory_rollout_ids(reordered, rollout_batch_index=99)
+
+    by_task = {
+        row["trajectory_identity"]["task_id"]: row["trajectory_identity"]["rollout_id"]
+        for row in rows
+    }
+    reordered_by_task = {
+        row["trajectory_identity"]["task_id"]: row["trajectory_identity"]["rollout_id"]
+        for row in reordered
+    }
+    assert by_task == reordered_by_task
+
+    new_attempt = deepcopy(rows[0])
+    new_attempt["trajectory_identity"]["attempt_index"] = 1
+    _stamp_trajectory_rollout_ids([new_attempt], rollout_batch_index=4)
+    assert new_attempt["trajectory_identity"]["rollout_id"] != by_task["task-a"]
 
 
 def test_index_per_turn_images_preserves_initial_and_observation_order():

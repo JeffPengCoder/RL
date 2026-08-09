@@ -18,6 +18,7 @@ import pytest
 import torch
 
 from nemo_rl.utils.packed_tensor import (
+    get_target_packed_tensor_size,
     packed_broadcast_consumer,
     packed_broadcast_producer,
 )
@@ -66,6 +67,27 @@ def create_mock_model_params():
 def create_mock_state_dict_info(params):
     """Create state dict info (name -> (shape, dtype)) from params."""
     return {name: (tensor.shape, tensor.dtype) for name, tensor in params}
+
+
+def test_explicit_packed_tensor_size_does_not_depend_on_local_gpu(monkeypatch):
+    """A fixed size is safe for collectives spanning heterogeneous GPUs."""
+    get_target_packed_tensor_size.cache_clear()
+    monkeypatch.setenv("NRL_REFIT_BUFFER_SIZE_BYTES", "536870912")
+    try:
+        assert get_target_packed_tensor_size() == 512 * 1024**2
+    finally:
+        get_target_packed_tensor_size.cache_clear()
+
+
+@pytest.mark.parametrize("value", ["not-an-int", "0", "-1", str(5 * 1024**3 + 1)])
+def test_explicit_packed_tensor_size_rejects_invalid_values(monkeypatch, value):
+    get_target_packed_tensor_size.cache_clear()
+    monkeypatch.setenv("NRL_REFIT_BUFFER_SIZE_BYTES", value)
+    try:
+        with pytest.raises(ValueError, match="NRL_REFIT_BUFFER_SIZE_BYTES"):
+            get_target_packed_tensor_size()
+    finally:
+        get_target_packed_tensor_size.cache_clear()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from collections import defaultdict
 from typing import Any, Optional
 
@@ -318,6 +319,23 @@ def attach_routed_experts_to_chat_response_choices(
     return response
 
 
+def _find_non_finite_float_paths(value: Any, path: str = "$") -> list[str]:
+    """Return JSON-style paths for non-finite float values."""
+    if isinstance(value, float):
+        return [] if math.isfinite(value) else [f"{path}={value!r}"]
+    if isinstance(value, dict):
+        paths = []
+        for key, item in value.items():
+            paths.extend(_find_non_finite_float_paths(item, f"{path}.{key}"))
+        return paths
+    if isinstance(value, (list, tuple)):
+        paths = []
+        for index, item in enumerate(value):
+            paths.extend(_find_non_finite_float_paths(item, f"{path}[{index}]"))
+        return paths
+    return []
+
+
 def model_dump_chat_response_with_routed_experts(response: Any) -> dict[str, Any]:
     """Dump a vLLM OpenAI chat response while preserving dynamic R3 fields."""
     response_dict = response.model_dump()
@@ -329,6 +347,15 @@ def model_dump_chat_response_with_routed_experts(response: Any) -> dict[str, Any
         )
         if routed_experts is not None:
             choice_dict.setdefault("message", {})["routed_experts"] = routed_experts
+
+    non_finite_paths = _find_non_finite_float_paths(response_dict)
+    if non_finite_paths:
+        preview = ", ".join(non_finite_paths[:16])
+        omitted = len(non_finite_paths) - 16
+        suffix = f", ... and {omitted} more" if omitted > 0 else ""
+        raise ValueError(
+            f"vLLM chat response contains non-finite float values at {preview}{suffix}"
+        )
     return response_dict
 
 

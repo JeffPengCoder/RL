@@ -1,0 +1,24 @@
+# OpenSandbox overlay for the OSWorld exact-trace recipe.
+
+defaults: grpo_nemotron_omni_30ba3b_osworld_exact_trace.yaml
+
+env:
+  nemo_gym:
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - responses_api_agents/osworld_agent/configs/osworld_agent.yaml
+      - benchmarks/osworld/configs/osworld_opensandbox.yaml
+    osworld_simple_agent:
+      responses_api_agents:
+        osworld_agent:
+          sandbox_provider: osworld_opensandbox
+          vm_path: /opensandbox/Ubuntu.qcow2
+          sandbox_require_kvm: false
+          sandbox_ready_timeout_s: 600.0
+          sandbox_spec:
+            image: null
+            ttl_s: 14400
+            ready_timeout_s: 1200
+            provider_options:
+              extensions:
+                poolRef: ${oc.env:OPENSANDBOX_POOL_REF,osworld-kvm}

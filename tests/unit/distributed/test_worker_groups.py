@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
 import os
 import sys
 
@@ -311,6 +312,33 @@ def test_initializer_pool_is_per_node_multi_node(worker_group_2d_sharding):
     assert len(worker_group.workers) == 4
     assert len(worker_group._initializer_pool) == 2
     assert set(worker_group._initializer_pool.keys()) == {0, 1}
+
+
+def test_initializer_pool_inherits_pythonpath_for_argument_deserialization(
+    register_test_actor, virtual_cluster, tmp_path, monkeypatch
+):
+    """Pooled initializers can unpickle objects from PYTHONPATH-only modules."""
+    module_name = "_nrl_initializer_payload"
+    (tmp_path / f"{module_name}.py").write_text(
+        "class Payload:\n    def __init__(self, value):\n        self.value = value\n"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload_module = importlib.import_module(module_name)
+    payload = payload_module.Payload("dynamic-module-ready")
+
+    builder = RayWorkerBuilder(register_test_actor, payload)
+    worker_group = RayWorkerGroup(
+        cluster=virtual_cluster,
+        remote_worker_builder=builder,
+        workers_per_node=1,
+        env_vars={"PYTHONPATH": str(tmp_path)},
+    )
+    try:
+        init_args, _ = ray.get(worker_group.workers[0].get_init_args_kwargs.remote())
+        assert init_args[0].value == "dynamic-module-ready"
+    finally:
+        worker_group.shutdown(force=True)
+        sys.modules.pop(module_name, None)
 
 
 def test_shutdown_clears_initializer_pool(
