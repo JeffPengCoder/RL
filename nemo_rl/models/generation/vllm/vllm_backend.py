@@ -198,11 +198,18 @@ class VllmInternalWorkerExtension:
         self.model_runner.model.load_weights(weights=policy_weights)
 
     def _load_hf_weights(self, policy_weights: list[tuple[str, torch.Tensor]]) -> None:
-        from nemo_rl.models.generation.vllm.quantization import fp8
+        vllm_config = self.model_runner.vllm_config
+        # FP8 support follows vLLM internals closely and can therefore require a
+        # newer vLLM layout than the ordinary BF16 refit path.  Do not import
+        # that optional compatibility layer for an unquantized model: besides
+        # being unnecessary, an eager import can make a supported BF16 runtime
+        # fail on FP8-only symbols before its normal weight loader is reached.
+        if getattr(vllm_config, "quant_config", None) is not None:
+            from nemo_rl.models.generation.vllm.quantization import fp8
 
-        if fp8.is_fp8_model(self.model_runner.vllm_config):
-            fp8.load_weights(policy_weights, self.model_runner)
-            return
+            if fp8.is_fp8_model(vllm_config):
+                fp8.load_weights(policy_weights, self.model_runner)
+                return
         self._load_full_hf_weights(policy_weights)
 
     def bind_numa(self) -> bool:
