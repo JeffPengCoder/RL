@@ -984,7 +984,7 @@ def test_validate_trajectory_transitions_rejects_unknown_model_call_reference():
         }
     ]
     transition = {
-        "transition_id": "transition-1",
+        "transition_id": stable_id("transition", contract["trajectory_id"], 0),
         "turn_id": 1,
         "state": {
             "observation": {},
