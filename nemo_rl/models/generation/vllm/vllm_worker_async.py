@@ -347,6 +347,8 @@ class VllmAsyncGenerationWorkerImpl(
     # ruff: noqa
     def _setup_vllm_openai_api_server(self, app: FastAPI) -> FastAPI:
         from copy import deepcopy
+        from importlib import import_module
+        from importlib.metadata import PackageNotFoundError, version as package_version
         from logging import Filter as LoggingFilter
         from logging import LogRecord
         from typing import List, Optional, Union
@@ -368,10 +370,46 @@ class VllmAsyncGenerationWorkerImpl(
             TokenizeCompletionRequest,
             TokenizeResponse,
         )
-        from vllm.entrypoints.serve.tokenize.serving import (
-            ServingTokenization,
+
+        tokenization_serving = import_module("vllm.entrypoints.serve.tokenize.serving")
+        if hasattr(tokenization_serving, "ServingTokenization"):
+            ServingTokenizationBase = tokenization_serving.ServingTokenization
+            ServingRendererBase = import_module(
+                "vllm.renderers.online_renderer"
+            ).OnlineRenderer
+            legacy_vllm_serving = False
+            load_chat_template = None
+        elif hasattr(tokenization_serving, "OpenAIServingTokenization"):
+            # The accepted Nano Omni image is pinned to vLLM 0.20, while this
+            # branch's dependency lock has moved to vLLM 0.25. The two releases
+            # expose the same serving responsibilities under different class
+            # names and constructor contracts. Keep source-checkout validation
+            # compatible with the accepted image without weakening the 0.25
+            # path used by a freshly resolved environment.
+            load_chat_template = import_module(
+                "vllm.entrypoints.chat_utils"
+            ).load_chat_template
+            ServingRendererBase = import_module(
+                "vllm.entrypoints.serve.render.serving"
+            ).OpenAIServingRender
+            ServingTokenizationBase = tokenization_serving.OpenAIServingTokenization
+            legacy_vllm_serving = True
+        else:
+            raise ImportError(
+                "vLLM tokenize serving exposes neither ServingTokenization "
+                "nor OpenAIServingTokenization"
+            )
+        try:
+            vllm_version = package_version("vllm")
+        except PackageNotFoundError:
+            vllm_version = "unknown"
+        serving_api = (
+            "openai-serving-render" if legacy_vllm_serving else "online-renderer"
         )
-        from vllm.renderers.online_renderer import OnlineRenderer
+        print(
+            f"VLLM_SERVING_API_SELECTED|version={vllm_version}|api={serving_api}",
+            flush=True,
+        )
         from vllm.exceptions import VLLMValidationError
         from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager
         from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
@@ -459,6 +497,8 @@ class VllmAsyncGenerationWorkerImpl(
                 default_template_kwargs,
                 tool_dicts=None,
                 parser=None,
+                tool_parser=None,
+                reasoning_parser=None,
                 *,
                 skip_mm_cache: bool = False,
             ):
@@ -482,17 +522,25 @@ class VllmAsyncGenerationWorkerImpl(
                     if actual_request_max_tokens is not None:
                         self._set_max_tokens(request, 1)
 
-                try:
-                    res = await super().preprocess_chat(
-                        request=request,
-                        messages=messages,
-                        default_template=default_template,
-                        default_template_content_format=default_template_content_format,
-                        default_template_kwargs=default_template_kwargs,
-                        tool_dicts=tool_dicts,
-                        parser=parser,
-                        skip_mm_cache=skip_mm_cache,
+                preprocess_kwargs = {
+                    "request": request,
+                    "messages": messages,
+                    "default_template": default_template,
+                    "default_template_content_format": default_template_content_format,
+                    "default_template_kwargs": default_template_kwargs,
+                    "tool_dicts": tool_dicts,
+                    "skip_mm_cache": skip_mm_cache,
+                }
+                if legacy_vllm_serving:
+                    preprocess_kwargs.update(
+                        tool_parser=tool_parser,
+                        reasoning_parser=reasoning_parser,
                     )
+                else:
+                    preprocess_kwargs["parser"] = parser
+
+                try:
+                    res = await super().preprocess_chat(**preprocess_kwargs)
                 except (ValueError, VLLMValidationError) as e:
                     if "maximum context length" in str(e):
                         import logging
@@ -536,15 +584,13 @@ class VllmAsyncGenerationWorkerImpl(
                     update={"add_generation_prompt": False}
                 )
 
+                corresponding_kwargs = {
+                    **preprocess_kwargs,
+                    "request": modified_request,
+                    "messages": messages_to_last_assistant_message,
+                }
                 corresponding_res = await super().preprocess_chat(
-                    request=modified_request,
-                    messages=messages_to_last_assistant_message,
-                    default_template=default_template,
-                    default_template_content_format=default_template_content_format,
-                    default_template_kwargs=default_template_kwargs,
-                    tool_dicts=tool_dicts,
-                    parser=parser,
-                    skip_mm_cache=skip_mm_cache,
+                    **corresponding_kwargs
                 )
                 actual_corresponding_token_ids = corresponding_res[1][0][
                     "prompt_token_ids"
@@ -626,7 +672,7 @@ class VllmAsyncGenerationWorkerImpl(
         class NeMoRLOpenAIServingChat(NeMoRLOpenAIServingChatMixin, OpenAIServingChat):
             pass
 
-        class NeMoRLOnlineRenderer(NeMoRLOpenAIServingMixin, OnlineRenderer):
+        class NeMoRLServingRenderer(NeMoRLOpenAIServingMixin, ServingRendererBase):
             pass
 
         serving_chat_default_kwargs = dict(
@@ -639,26 +685,51 @@ class VllmAsyncGenerationWorkerImpl(
         serving_chat_kwargs = serving_chat_default_kwargs | self.cfg["vllm_cfg"].get(
             "http_server_serving_chat_kwargs", dict()
         )
-        online_renderer = NeMoRLOnlineRenderer(
-            model_config=engine_client.model_config,
-            renderer=engine_client.renderer,
-            request_logger=serving_chat_kwargs["request_logger"],
-            chat_template=serving_chat_kwargs["chat_template"],
-            chat_template_content_format=serving_chat_kwargs[
-                "chat_template_content_format"
-            ],
-            enable_auto_tools=serving_chat_kwargs["enable_auto_tools"],
-            # Keep the renderer's parser consistent with any parser overrides
-            # passed to OpenAIServingChat via http_server_serving_chat_kwargs.
-            tool_parser=serving_chat_kwargs.get("tool_parser"),
-            reasoning_parser=serving_chat_kwargs.get("reasoning_parser"),
-        )
+        default_chat_template_kwargs = {}
+        if legacy_vllm_serving:
+            # vLLM 0.20 threads template kwargs on each request rather than
+            # accepting them in OpenAIServingChat.__init__.
+            default_chat_template_kwargs = (
+                serving_chat_kwargs.pop("chat_template_kwargs", None) or {}
+            )
+            assert load_chat_template is not None
+            serving_chat_kwargs["chat_template"] = load_chat_template(
+                serving_chat_kwargs["chat_template"]
+            )
+            serving_renderer = NeMoRLServingRenderer(
+                model_config=engine_client.model_config,
+                renderer=engine_client.renderer,
+                model_registry=openai_serving_models.registry,
+                request_logger=serving_chat_kwargs["request_logger"],
+                chat_template=serving_chat_kwargs["chat_template"],
+                chat_template_content_format=serving_chat_kwargs[
+                    "chat_template_content_format"
+                ],
+                enable_auto_tools=serving_chat_kwargs["enable_auto_tools"],
+            )
+            renderer_binding = {"openai_serving_render": serving_renderer}
+        else:
+            serving_renderer = NeMoRLServingRenderer(
+                model_config=engine_client.model_config,
+                renderer=engine_client.renderer,
+                request_logger=serving_chat_kwargs["request_logger"],
+                chat_template=serving_chat_kwargs["chat_template"],
+                chat_template_content_format=serving_chat_kwargs[
+                    "chat_template_content_format"
+                ],
+                enable_auto_tools=serving_chat_kwargs["enable_auto_tools"],
+                # Keep the renderer's parser consistent with any parser
+                # overrides passed through serving kwargs.
+                tool_parser=serving_chat_kwargs.get("tool_parser"),
+                reasoning_parser=serving_chat_kwargs.get("reasoning_parser"),
+            )
+            renderer_binding = {"online_renderer": serving_renderer}
         serving_chat_kwargs.update(
             dict(
                 engine_client=engine_client,
                 models=openai_serving_models,
-                online_renderer=online_renderer,
                 return_tokens_as_token_ids=True,
+                **renderer_binding,
             )
         )
         openai_serving_chat = NeMoRLOpenAIServingChat(**serving_chat_kwargs)
@@ -681,6 +752,12 @@ class VllmAsyncGenerationWorkerImpl(
             # If they do not match, the inference will be off policy and destroy training stability.
             assert request.temperature == generation_config["temperature"]
             assert request.top_p == generation_config["top_p"]
+
+            if legacy_vllm_serving and default_chat_template_kwargs:
+                request.chat_template_kwargs = {
+                    **default_chat_template_kwargs,
+                    **(request.chat_template_kwargs or {}),
+                }
 
             try:
                 generator = await openai_serving_chat.create_chat_completion(
@@ -728,9 +805,9 @@ class VllmAsyncGenerationWorkerImpl(
             TokenizeCompletionRequest, NeMoRLTokenizeChatRequest
         ]
 
-        # Tokenize path delegates to OnlineRenderer.preprocess_chat,
-        # where the prefix-token override lives.
-        class NeMoRLServingTokenization(ServingTokenization):
+        # Both supported vLLM serving APIs delegate tokenize through the
+        # renderer subclass above, where the prefix-token override lives.
+        class NeMoRLServingTokenization(ServingTokenizationBase):
             pass
 
         serving_tokenization_kwargs = dict(
@@ -740,14 +817,25 @@ class VllmAsyncGenerationWorkerImpl(
                 "chat_template_content_format"
             ],
             models=serving_chat_kwargs["models"],
-            online_renderer=online_renderer,
         )
+        if legacy_vllm_serving:
+            serving_tokenization_kwargs.update(
+                engine_client=serving_chat_kwargs["engine_client"],
+                openai_serving_render=serving_renderer,
+            )
+        else:
+            serving_tokenization_kwargs["online_renderer"] = serving_renderer
         openai_serving_tokenization = NeMoRLServingTokenization(
             **serving_tokenization_kwargs
         )
 
         @app.post("/tokenize")
         async def tokenize(request: NeMoRLTokenizeRequest, raw_request: Request):
+            if legacy_vllm_serving and default_chat_template_kwargs:
+                request.chat_template_kwargs = {
+                    **default_chat_template_kwargs,
+                    **(request.chat_template_kwargs or {}),
+                }
             generator = await openai_serving_tokenization.create_tokenize(
                 request, raw_request
             )
@@ -795,9 +883,12 @@ class VllmAsyncGenerationWorkerImpl(
                         return False
                 return True
 
-        _getLogger("vllm.entrypoints.openai.chat_completion.serving").addFilter(
-            MaxContextLengthFilter()
+        serving_logger_name = (
+            "vllm.entrypoints.openai.serving_chat"
+            if legacy_vllm_serving
+            else "vllm.entrypoints.openai.chat_completion.serving"
         )
+        _getLogger(serving_logger_name).addFilter(MaxContextLengthFilter())
 
         return app
 
