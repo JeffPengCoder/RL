@@ -44,7 +44,7 @@ class TestPatchTransformersModuleDir:
 
             env_vars = {"OTHER_VAR": "value"}
 
-            with patch.dict(os.environ, {"HF_HOME": tmpdir}):
+            with patch.dict(os.environ, {"HF_HOME": tmpdir}, clear=True):
                 result = patch_transformers_module_dir(env_vars)
 
             # Should add PYTHONPATH with the modules directory
@@ -62,7 +62,7 @@ class TestPatchTransformersModuleDir:
             existing_path = "/some/other/path"
             env_vars = {"PYTHONPATH": existing_path}
 
-            with patch.dict(os.environ, {"HF_HOME": tmpdir}):
+            with patch.dict(os.environ, {"HF_HOME": tmpdir}, clear=True):
                 result = patch_transformers_module_dir(env_vars)
 
             # Should prepend modules_dir to existing PYTHONPATH
@@ -74,7 +74,7 @@ class TestPatchTransformersModuleDir:
             # Don't create the modules directory
             env_vars = {"OTHER_VAR": "value"}
 
-            with patch.dict(os.environ, {"HF_HOME": tmpdir}):
+            with patch.dict(os.environ, {"HF_HOME": tmpdir}, clear=True):
                 result = patch_transformers_module_dir(env_vars)
 
             # Should return unchanged env_vars
@@ -91,7 +91,7 @@ class TestPatchTransformersModuleDir:
 
             env_vars = {}
 
-            with patch.dict(os.environ, {"HF_HOME": hf_home}):
+            with patch.dict(os.environ, {"HF_HOME": hf_home}, clear=True):
                 result = patch_transformers_module_dir(env_vars)
 
             assert result["PYTHONPATH"] == modules_dir
@@ -106,7 +106,7 @@ class TestPatchTransformersModuleDir:
             env_vars = {"OTHER_VAR": "value"}
             original_id = id(env_vars)
 
-            with patch.dict(os.environ, {"HF_HOME": tmpdir}):
+            with patch.dict(os.environ, {"HF_HOME": tmpdir}, clear=True):
                 result = patch_transformers_module_dir(env_vars)
 
             # Should return the same object (modified in place)
@@ -123,7 +123,7 @@ class TestPatchTransformersModuleDir:
 
             env_vars = {}
 
-            with patch.dict(os.environ, {"HF_HOME": tmpdir}):
+            with patch.dict(os.environ, {"HF_HOME": tmpdir}, clear=True):
                 # First call
                 result1 = patch_transformers_module_dir(env_vars)
                 assert result1["PYTHONPATH"] == modules_dir
@@ -151,6 +151,7 @@ class TestPatchTransformersModuleDir:
                     "HF_HOME": hf_home,
                     "HF_MODULES_CACHE": writable_modules,
                 },
+                clear=True,
             ):
                 result = patch_transformers_module_dir(env_vars)
 
@@ -169,7 +170,7 @@ class TestPatchTransformersModuleDir:
 
             env_vars = {}
 
-            with patch.dict(os.environ, {"HF_HOME": tmpdir}):
+            with patch.dict(os.environ, {"HF_HOME": tmpdir}, clear=True):
                 result = patch_transformers_module_dir(env_vars)
 
             assert result == {"PYTHONPATH": modules_dir}
@@ -186,7 +187,9 @@ class TestPatchTransformersModuleDir:
             # Add trailing slash to HF_HOME
             hf_home_with_slash = tmpdir + "/"
 
-            with patch.dict(os.environ, {"HF_HOME": hf_home_with_slash}):
+            with patch.dict(
+                os.environ, {"HF_HOME": hf_home_with_slash}, clear=True
+            ):
                 result = patch_transformers_module_dir(env_vars)
 
             # os.path.join should handle the trailing slash correctly
@@ -206,7 +209,7 @@ class TestPatchTransformersModuleDir:
                 "VAR3": "value3",
             }
 
-            with patch.dict(os.environ, {"HF_HOME": tmpdir}):
+            with patch.dict(os.environ, {"HF_HOME": tmpdir}, clear=True):
                 result = patch_transformers_module_dir(env_vars)
 
             # All original vars should be preserved
