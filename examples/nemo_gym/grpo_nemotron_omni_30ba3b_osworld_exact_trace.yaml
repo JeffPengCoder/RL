@@ -145,7 +145,6 @@ logger:
   tensorboard_enabled: true
   monitor_gpus: false
   wandb:
-    entity: null
     project: grpo-nemotron-omni-osworld
     group: exact-trace
     name: osworld-exact-trace-16step

@@ -111,11 +111,7 @@ logger:
   wandb_enabled: false
   tensorboard_enabled: true
   monitor_gpus: false
-  wandb:
-    entity: null
-    project: null
-    group: null
-    name: null
+  wandb: {}
 
 cluster:
   gpus_per_node: 8
