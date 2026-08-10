@@ -52,6 +52,13 @@ policy:
   make_sequence_length_divisible_by: 16
   router_replay:
     enabled: true
+  # The accepted Nano Omni MBridge wrapper owns sequence packing. NeMo-RL
+  # cannot currently align vLLM routed-expert records with that wrapper's
+  # internally rebuilt token layout, so router replay and delegated sequence
+  # packing are intentionally not combined. Microbatches are size 1 in this
+  # recipe, which also makes cross-sample sequence packing unnecessary.
+  sequence_packing:
+    enabled: false
 
   megatron_cfg:
     tensor_model_parallel_size: 8

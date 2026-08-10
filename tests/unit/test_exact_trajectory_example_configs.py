@@ -33,3 +33,6 @@ def test_exact_trajectory_example_config_passes_runtime_model_validation(
     assert isinstance(resolved_config, dict)
     config = MasterConfig(**resolved_config)
     assert all(value is not None for value in config.logger["wandb"].values())
+    if "osworld_exact_trace" in relative_path:
+        assert config.policy["router_replay"]["enabled"] is True
+        assert config.policy["sequence_packing"]["enabled"] is False
