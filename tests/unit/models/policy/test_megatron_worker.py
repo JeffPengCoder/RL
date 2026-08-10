@@ -46,6 +46,41 @@ from tests.unit.test_utils import SimpleLossFn
 pytestmark = pytest.mark.mcore
 
 
+def test_portable_actor_error_preserves_success_values():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _raise_portable_actor_error,
+    )
+
+    @_raise_portable_actor_error("probe")
+    def succeed(value):
+        return {"value": value}
+
+    assert succeed(7) == {"value": 7}
+
+
+def test_portable_actor_error_exposes_dependency_traceback_as_builtin():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _raise_portable_actor_error,
+    )
+
+    class DependencySpecificError(Exception):
+        pass
+
+    DependencySpecificError.__module__ = "megatron.fake_dependency"
+
+    @_raise_portable_actor_error("get_logprobs")
+    def fail():
+        raise DependencySpecificError("hidden actor detail")
+
+    with pytest.raises(RuntimeError) as error:
+        fail()
+
+    message = str(error.value)
+    assert "megatron.fake_dependency.DependencySpecificError" in message
+    assert "hidden actor detail" in message
+    assert "Traceback (most recent call last)" in message
+
+
 def test_model_owned_packing_capability_is_detected():
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         _model_self_packs_for_cp,
