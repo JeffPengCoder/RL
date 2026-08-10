@@ -391,23 +391,42 @@ def batched_message_log_to_flat_message(
             ]
             result[key] = PackedTensor.flattened_concat(filled_packed_values)
             continue
-        if not values or not isinstance(values[0], Tensor):
+        tensor_values = [value for value in values if isinstance(value, Tensor)]
+        if not tensor_values:
             result[key] = values
             continue
 
+        unexpected_types = {
+            type(value).__name__
+            for value in values
+            if value is not None and not isinstance(value, Tensor)
+        }
+        if unexpected_types:
+            raise TypeError(
+                f"expected Tensor or None for {key!r}, got {sorted(unexpected_types)}"
+            )
+
         # Filter out None values and validate consistency
         values: list[Tensor | None] = cast(list[Tensor | None], values)
-        tensors = cast(list[Tensor], [t for t in values if t is not None])
+        tensors = cast(list[Tensor], tensor_values)
         try:
             _validate_tensor_consistency(tensors)
         except RuntimeError as e:
             e.add_note(f"[key={key!r}]")
             raise
 
-        # Create zero tensors for None values
+        # Preserve trailing modality dimensions for a sample where an optional
+        # dense tensor is absent. A rank-one empty tensor would pad to
+        # ``[max_len]`` and fail to stack with, for example, neighboring
+        # ``pixel_values`` shaped ``[max_len, 52, 6]``.
+        reference = tensors[0]
         filled_values: list[Tensor] = [
             (
-                torch.zeros(0, dtype=tensors[0].dtype, device=tensors[0].device)  # type: ignore
+                torch.zeros(
+                    (0, *reference.shape[1:]),
+                    dtype=reference.dtype,
+                    device=reference.device,
+                )
                 if v is None
                 else v
             )
