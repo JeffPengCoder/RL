@@ -7,7 +7,9 @@
 ```text
 NeMo-RL: feature/gym-osworld
 base: aroshanghias/context-compaction-v2-clean@42a65427dce038f57f7fd8eed6a24f6a8ce72c2b
-Gym: feature/osworld2 (以本仓库 gitlink 为准)
+one-step qualified NeMo-RL: 4ce0a05961ad7b90a4ef669ce3da37c87ce3bb41
+dense-modality qualified NeMo-RL: c1d7b2fc9403fa1b21dfc75dfdd3d70fcd4da1b9
+Gym: feature/osworld2@54056bba8bea857012ef962ea722002d84ceabd4
 Rohit comparison: rohit/gymv-mm-integration@71717873240c99fd1ede2db17480818205766848
 ```
 
@@ -16,16 +18,19 @@ stream reconstruction。Gym 不再提供 `training_mode`、`last`、`all` 或
 `exact_trace` strategy：benchmark 和 training 执行完全相同的 agent prompt/action
 逻辑，差别只在下游 consumer 是否具备训练准入条件。
 
-已经具备的是合同、重建、校验、配置和单元测试。真实 OSWorld VM 上仍应依次完成：
+截至 2026-08-11，合同、重建、校验、配置和单元测试已经具备，前两个真实
+OSWorld VM/GPU gate 也已完成：
 
 ```text
-generation-only trace qualification
-  -> 1-step optimizer smoke
-  -> 16-step fixed-validation run
-  -> checkpoint/resume qualification
+generation-only trace qualification: passed, Job 15436343
+1-step optimizer/checkpoint smoke: passed, Job 15479566
+16-step fixed-validation run: not run on this exact-trace branch
+checkpoint/resume qualification: not run
 ```
 
-在这些 gate 通过前，不应把该分支描述成已完成真实 GPU 端到端验收。
+Job 15479566 的 8 条 rollout reward 全为 0，loss 为 0；它证明 logprob、backward、
+optimizer 和 distributed checkpoint 控制路径可执行，不证明非零梯度或模型提升。
+因此可以说 one-step 执行链路已通过，不能说完整训练效果或生产长跑已经验收。
 
 ## 1. 最初命中的问题：token 2,080 开始前缀不一致
 
@@ -208,7 +213,7 @@ compaction recipe 兼容；OSWorld recipe 不再要求用户设置这个开关�
 2. 通用 `trajectory_transitions` + `trajectory_model_calls` 逐项校验；语义 trajectory
    与 exact generation evidence 不一致时，在 loss 前 fail closed。
 3. OSWorld exact-trace 16-step recipe 与 OpenSandbox overlay。
-4. 固定、无泄漏的 train/validation split 工具，并自动补 contract-v2 caller identity。
+4. 固定、无泄漏的 train/validation split 工具，并自动补通用 `trajectory_identity`。
 5. `HF_MODULES_CACHE` 优先级与 PYTHONPATH 去重，避免完整动态模块位于 writable cache
    时 Ray actor 误绑定不完整 `HF_HOME/modules` seed。
 6. pooled Ray initializer 继承 PYTHONPATH/venv；构造参数包含 trust-remote-code 类时也能
@@ -357,6 +362,11 @@ uv run --locked --extra mcore --extra vllm \
 必须看到 8/8 logical rollouts、current/reference logprob、optimizer、refit、完整
 checkpoint 和正常 driver exit；仅看到 VM 或 vLLM 启动不算训练成功。
 
+已归档的真实 gate 是 Job 15479566：8/8 rollout、current logprobs、`run_backward`、
+65.26 秒 policy training 和 distributed optimizer-state save 全部完成，driver/parent
+为 `COMPLETED 0:0`。最终 `step_1` 有 18 个文件、440,346,575,025 字节。由于 8 条
+reward 全为 0 且 loss 为 0，这个结果不覆盖“非零 learning signal”验收。
+
 ### 10.3 16-step curve
 
 ```bash
@@ -376,6 +386,39 @@ uv run --locked --extra mcore --extra vllm \
 所以训练进程内 validation 默认仍用训练 temperature=1.0。若要比较 temperature=0.1
 或 0.6，应对同一固定验证集启动独立 eval-only replay，并把 checkpoint、task IDs、
 temperature 与样本数一起记录；不能在同一次训练中悄悄改变 sampling contract。
+
+### 10.4 当前 qualification ledger
+
+```text
+Job 15436343
+  exact generation-only
+  435/435 sampled/trainable tokens aligned
+
+Job 15479566
+  exact one-step training
+  8/8 rollouts; logprobs/backward/optimizer/checkpoint completed
+  driver/parent 0:0; step_1 = 18 files / 440,346,575,025 bytes
+  all rewards and loss are zero; no policy-improvement claim
+
+Job 15482734
+  accepted-image dense-modality batch regression gate
+  three batch orderings passed; parent/batch/step 0:0
+  accepted follow-up commit c1d7b2fc9403fa1b21dfc75dfdd3d70fcd4da1b9
+
+Gym 54056bba8
+  evaluator postconfig without an explicit return-code policy preserves
+  upstream OSWorld best-effort behavior; a missing agent-created artifact is
+  scored as reward=0 instead of being mislabeled as an infrastructure mask
+  73 OSWorld client tests passed locally
+```
+
+完整 369-task benchmark 固定使用 one-step gate 对应的 immutable NeMo-RL 4ce0 和
+Gym 1b0，避免中途换源码；它必须在 369 attempted 与 361 no-GDrive 两个视图都完成、
+最后一个 Slurm attempt 已终止且 anomaly sets 为空以后再报告。该 benchmark 不是
+optimizer gate，也不能替代尚未执行的 16-step exact-trace fixed-validation curve。
+Gym 54056bba8 是 benchmark 启动后根据 raw artifacts 定位出的后继修复；它不会被
+热切换进这次固定源码的 benchmark，也不会改写原始 `result.json`。最终报告必须另列
+official-compatible 分类，并用后继源码对命中的 evaluator 样本做 focused rerun。
 
 ## 11. OpenSandbox 的任务、VM 与 proxy 生命周期
 
