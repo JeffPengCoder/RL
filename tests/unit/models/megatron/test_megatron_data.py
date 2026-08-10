@@ -184,6 +184,29 @@ class TestProcessMicrobatch:
         mock_get_masks.assert_called_once()
 
     @patch("nemo_rl.models.megatron.data.get_ltor_masks_and_position_ids")
+    def test_process_microbatch_omits_4d_mask_for_expanded_media_model(
+        self, mock_get_masks
+    ):
+        """Expanded-media models must not receive a causal mask as token validity."""
+        from nemo_rl.models.megatron.data import process_microbatch
+
+        input_ids = torch.tensor([[7, 18, 18, 9]])
+        position_ids = torch.arange(4).unsqueeze(0)
+        causal_mask = torch.triu(torch.ones((1, 1, 4, 4), dtype=torch.bool), diagonal=1)
+        mock_get_masks.return_value = (causal_mask, None, position_ids)
+
+        result = process_microbatch(
+            {"input_ids": input_ids},
+            pack_sequences=False,
+            model_slices_context_parallel_inputs=True,
+            straggler_timer=MagicMock(),
+        )
+
+        assert result.attention_mask is None
+        assert torch.equal(result.position_ids, position_ids)
+        assert "compute_attention_mask" not in mock_get_masks.call_args.kwargs
+
+    @patch("nemo_rl.models.megatron.data.get_ltor_masks_and_position_ids")
     def test_process_microbatch_repairs_routed_experts_padding_without_packing(
         self, mock_get_masks
     ):

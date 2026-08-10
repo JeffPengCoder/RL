@@ -546,6 +546,18 @@ def process_microbatch(
                 eod_mask_loss=False,
                 pad_mask_loss=False,
             )
+            # Canonical expanded-media models inspect ``attention_mask`` while
+            # replacing image placeholders.  Megatron's ordinary decoder mask
+            # is 4-D ([1, 1, S, S]) and is *not* a token-validity mask; passing
+            # it to that boundary broadcasts ``input_ids == image_token`` over
+            # S x S and corrupts the media-placeholder count.  Keep the helper
+            # call for position IDs and compatibility with Megatron versions
+            # that lack ``compute_attention_mask``, then discard only the
+            # incompatible mask for models that own expanded-media insertion.
+            # Their language model uses its implicit causal mask, while right
+            # padding remains excluded by the policy loss mask.
+            if model_slices_context_parallel_inputs:
+                attention_mask = None
             if "mtp_loss_mask" in data_dict:
                 mtp_loss_mask = data_dict["mtp_loss_mask"]
     return ProcessedInputs(
