@@ -363,9 +363,33 @@ def batched_message_log_to_flat_message(
     result = BatchedDataDict()
     for key in all_keys:
         values = [seq.get(key) for seq in sequenced_lists]
-        # if the values are PackedTensors, create a new PackedTensor from the list of values
-        if values and isinstance(values[0], PackedTensor):
-            result[key] = PackedTensor.flattened_concat(values)
+        # A modality may be absent from some samples in the batch. This is
+        # common for agentic rollouts: an environment can fail before the
+        # first screenshot reaches the model while neighboring samples still
+        # contain image tensors. Preserve one packed entry per sample by
+        # replacing a missing modality with an empty PackedTensor. Detect the
+        # type from every value instead of only values[0], so behavior does
+        # not depend on batch order.
+        packed_values = [value for value in values if isinstance(value, PackedTensor)]
+        if packed_values:
+            unexpected_types = {
+                type(value).__name__
+                for value in values
+                if value is not None and not isinstance(value, PackedTensor)
+            }
+            if unexpected_types:
+                raise TypeError(
+                    f"expected PackedTensor or None for {key!r}, got "
+                    f"{sorted(unexpected_types)}"
+                )
+            reference = packed_values[0]
+            filled_packed_values = [
+                value
+                if isinstance(value, PackedTensor)
+                else PackedTensor.empty_like(reference)
+                for value in values
+            ]
+            result[key] = PackedTensor.flattened_concat(filled_packed_values)
             continue
         if not values or not isinstance(values[0], Tensor):
             result[key] = values
