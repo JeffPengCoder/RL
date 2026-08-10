@@ -20,7 +20,7 @@ import threading
 import time
 import uuid
 import warnings
-from typing import Any, AsyncGenerator, Optional, cast
+from typing import Any, AsyncGenerator, Literal, Optional, cast
 
 import ray
 import torch
@@ -55,6 +55,37 @@ from nemo_rl.models.generation.openai_server_utils import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+
+def resolve_http_request_sampling_contract(
+    generation_config: dict[str, Any],
+    rollout_purpose: Literal["training", "evaluation"],
+) -> dict[str, float | int]:
+    """Return the sampling profile allowed at the internal HTTP boundary.
+
+    Training remains strictly on-policy. Evaluation defaults to the same
+    profile for backward compatibility, but a recipe may pin a separate
+    profile under vllm_cfg.http_server_evaluation_sampling.
+    """
+
+    sampling: dict[str, float | int] = {
+        "temperature": generation_config["temperature"],
+        "top_p": generation_config["top_p"],
+        "max_new_tokens": generation_config["max_new_tokens"],
+    }
+    if rollout_purpose == "evaluation":
+        evaluation_sampling = generation_config.get("vllm_cfg", {}).get(
+            "http_server_evaluation_sampling"
+        )
+        if evaluation_sampling is not None:
+            unknown = set(evaluation_sampling) - set(sampling)
+            if unknown:
+                raise ValueError(
+                    "Unknown HTTP evaluation sampling fields: "
+                    + ", ".join(sorted(unknown))
+                )
+            sampling.update(evaluation_sampling)
+    return sampling
 
 
 class VllmAsyncGenerationWorkerImpl(
@@ -626,6 +657,9 @@ class VllmAsyncGenerationWorkerImpl(
             NeMoRLOpenAIChatRequestMixin, ChatCompletionRequest
         ):
             required_prefix_token_ids: Optional[List[int]] = None
+            nemo_rl_rollout_purpose: Literal["training", "evaluation"] = (
+                "training"
+            )
 
         # vLLM 0.25 routes both /v1/chat/completions and /tokenize through
         # OnlineRenderer.preprocess_chat, so the prefix-token override
@@ -748,10 +782,27 @@ class VllmAsyncGenerationWorkerImpl(
             )
             request.top_k = -1
 
-            # The request sampling params need to exactly match those as are set in NeMo RL.
-            # If they do not match, the inference will be off policy and destroy training stability.
-            assert request.temperature == generation_config["temperature"]
-            assert request.top_p == generation_config["top_p"]
+            # Training requests must remain exactly on-policy. The scheduler
+            # may mark generation-only validation requests, which are checked
+            # against a separate pinned evaluation profile rather than being
+            # allowed to bypass sampling validation.
+            expected_sampling = resolve_http_request_sampling_contract(
+                generation_config,
+                request.nemo_rl_rollout_purpose,
+            )
+            assert request.temperature == expected_sampling["temperature"], (
+                "HTTP request temperature violates its NeMo-RL sampling "
+                f"contract for {request.nemo_rl_rollout_purpose}"
+            )
+            assert request.top_p == expected_sampling["top_p"], (
+                "HTTP request top_p violates its NeMo-RL sampling contract "
+                f"for {request.nemo_rl_rollout_purpose}"
+            )
+            if request.max_tokens is not None:
+                assert request.max_tokens <= expected_sampling["max_new_tokens"], (
+                    "HTTP request max_tokens exceeds its NeMo-RL sampling "
+                    f"contract for {request.nemo_rl_rollout_purpose}"
+                )
 
             if legacy_vllm_serving and default_chat_template_kwargs:
                 request.chat_template_kwargs = {

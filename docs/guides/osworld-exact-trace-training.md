@@ -9,7 +9,7 @@ NeMo-RL: feature/gym-osworld
 base: aroshanghias/context-compaction-v2-clean@42a65427dce038f57f7fd8eed6a24f6a8ce72c2b
 one-step qualified NeMo-RL: 4ce0a05961ad7b90a4ef669ce3da37c87ce3bb41
 dense-modality qualified NeMo-RL: c1d7b2fc9403fa1b21dfc75dfdd3d70fcd4da1b9
-Gym: feature/osworld2@54056bba8bea857012ef962ea722002d84ceabd4
+Gym: feature/osworld2@5e084a83a21d72b125be1a340d004a47259167b8
 Rohit comparison: rohit/gymv-mm-integration@71717873240c99fd1ede2db17480818205766848
 ```
 
@@ -204,6 +204,47 @@ Arash 基线仍保留名为 `context_compaction_training` 的内部实现结构�
 compaction recipe 兼容；OSWorld recipe 不再要求用户设置这个开关，NeMo-RL 从
 `trajectory_identity` 自动选择该 physical-trace 数据路径。
 
+### 4.1 Training、训练期 eval 与独立 benchmark
+
+三条执行链不能混为一条：
+
+```text
+standalone benchmark
+  external vLLM -> Gym benchmark runner -> OSWorld
+  不启动 NeMo-RL；请求不带 rollout_purpose
+
+RL training
+  NeMo-RL generation_only=false -> Gym -> OSWorld
+  NeMo-RL 在通用 BaseRunRequest 写 rollout_purpose=training
+  exact trace 进入 loss/backward
+
+training-time evaluation
+  NeMo-RL generation_only=true -> Gym -> OSWorld
+  NeMo-RL 写 rollout_purpose=evaluation
+  只统计 held-out 曲线，不进入 loss/backward
+```
+
+`rollout_purpose` 是 scheduler-owned 的通用请求语义，不是 OSWorld 的训练模式开关；
+所有 Gym agent 都能接收它，默认可以忽略。OSWorld 需要消费它，是因为 parser retry
+会产生额外 policy call：训练 profile 使用 `parse_retries=1`，训练期 evaluation 使用
+`parse_retries=5`。NeMo-RL 内部 vLLM 仍严格校验请求：training 必须匹配 on-policy
+`1.0/1.0/768`；只有 scheduler 标记的 evaluation 才能使用单独固定的
+`0.6/0.95/4096`，不能用 purpose 绕开任意采样参数检查。
+
+Nano Omni 当前 recipe 固定 `chat_template_content_format=string`。实测使用 `openai`
+block-list 格式会让历史 assistant content 在第二轮被模板渲染成 Python list literal，
+模型随后输出同类 list 文本并触发 parser failure。旧的约 50% standalone baseline 同样
+使用 string content format。
+
+独立 benchmark 使用当前 Gym 外部驱动：先由 `gym env start`（或 OSWorld 的
+`benchmarks/osworld/tools/start_control.sh`）启动环境/agent control plane，再运行
+`gym eval run --no-serve`（或 `run_eval.sh`）收集任务。旧的 `ng_run`、
+`ng_collect_rollouts` 和 `run_omni_mini_vllm.sh` 只属于历史复现记录，不能作为新入口。
+不要为了复用 NeMo-RL 的资源启动逻辑而把 benchmark 塞进 one-step GRPO driver。
+训练期 evaluation 可以用较小 held-out 集和较少重复数看趋势；若它的 `max_steps`、
+任务集或 sample 数与正式 benchmark 不同，必须明确标记为 validation curve，不能与
+正式 benchmark 分数直接横比。
+
 ## 5. 本集成分支增加的 NeMo-RL 行为
 
 除 Arash 基线已有的 logical-to-physical 重建外，本分支加入：
@@ -224,6 +265,8 @@ compaction recipe 兼容；OSWorld recipe 不再要求用户设置这个开关�
 9. 自动 HF -> Megatron conversion 只有在完整 metadata 文件存在时才算 cache hit，
    避免把半截 distcp 目录当成成功 checkpoint。
 10. vLLM response 中出现 NaN/Inf 时报告准确 JSON path，而不是在下游得到模糊错误。
+11. scheduler-owned `rollout_purpose`、独立 evaluation sampling contract，以及
+    OSWorld training/evaluation parser-retry profile；standalone benchmark 保持外部入口。
 
 没有纳入 feature branch 的内容包括开发者本机 `.dockerignore` 偏好、临时 source
 overlay、秘密文件和只适用于某个旧 image digest 的 venv 版本检查。这些属于部署

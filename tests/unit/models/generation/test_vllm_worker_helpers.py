@@ -16,10 +16,55 @@
 
 import pytest
 
+from nemo_rl.models.generation.vllm.vllm_worker_async import (
+    resolve_http_request_sampling_contract,
+)
 from nemo_rl.models.generation.vllm.worker_utils import (
     resolve_data_parallel_local_rank,
     resolve_distributed_executor_backend,
 )
+
+
+def test_http_sampling_contract_keeps_training_on_policy() -> None:
+    config = {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "max_new_tokens": 768,
+        "vllm_cfg": {
+            "http_server_evaluation_sampling": {
+                "temperature": 0.6,
+                "top_p": 0.95,
+                "max_new_tokens": 4096,
+            }
+        },
+    }
+
+    assert resolve_http_request_sampling_contract(config, "training") == {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "max_new_tokens": 768,
+    }
+
+
+def test_http_sampling_contract_allows_only_pinned_evaluation_profile() -> None:
+    config = {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "max_new_tokens": 768,
+        "vllm_cfg": {
+            "http_server_evaluation_sampling": {
+                "temperature": 0.6,
+                "top_p": 0.95,
+                "max_new_tokens": 4096,
+            }
+        },
+    }
+
+    assert resolve_http_request_sampling_contract(config, "evaluation") == {
+        "temperature": 0.6,
+        "top_p": 0.95,
+        "max_new_tokens": 4096,
+    }
 
 
 @pytest.mark.parametrize(

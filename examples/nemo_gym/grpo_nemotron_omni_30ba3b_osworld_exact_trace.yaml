@@ -91,11 +91,21 @@ policy:
       enable_prefix_caching: false
       skip_tokenizer_init: false
       logprobs_mode: raw_logprobs
+      # Training remains on-policy at 1.0/1.0/768. NeMo-RL stamps only its
+      # generation-only validation requests so the HTTP server can admit this
+      # separately pinned, benchmark-aligned sampling profile.
+      http_server_evaluation_sampling:
+        temperature: 0.6
+        top_p: 0.95
+        max_new_tokens: 4096
       http_server_serving_chat_kwargs:
         enable_auto_tools: true
         tool_parser: qwen3_coder
         reasoning_parser: nano_v3
-        chat_template_content_format: openai
+        # Nano Omni's template expects flattened string content. Passing the
+        # OpenAI block list makes historical assistant turns render as a
+        # Python-list literal and caused the observed turn-2 parser collapse.
+        chat_template_content_format: string
     vllm_kwargs:
       limit_mm_per_prompt: {image: 3}
       mm_processor_cache_gb: 0
@@ -144,7 +154,14 @@ env:
             coordinate_type: relative
             max_image_history_length: 3
             thinking: true
-            parse_retries: 1
+            # Standalone/evaluation baseline. The scheduler-owned purpose
+            # override keeps exact-trace training to one model call per step.
+            parse_retries: 5
+          agent_kwargs_by_rollout_purpose:
+            training:
+              parse_retries: 1
+            evaluation:
+              parse_retries: 5
 
 logger:
   log_dir: ${oc.env:OSWORLD_LOG_DIR,logs/osworld-exact-trace}

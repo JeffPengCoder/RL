@@ -2006,10 +2006,54 @@ def apply_reward_penalties(
     return counts
 
 
+def _resolve_nemo_gym_sampling(
+    generation_config: GenerationConfig, *, generation_only: bool
+) -> dict[str, float | int]:
+    """Resolve the pinned training or training-time evaluation profile."""
+    sampling: dict[str, float | int] = {
+        "temperature": generation_config["temperature"],
+        "top_p": generation_config["top_p"],
+        "max_new_tokens": generation_config["max_new_tokens"],
+    }
+    if generation_only:
+        vllm_cfg = generation_config.get("vllm_cfg", {})
+        evaluation_sampling = vllm_cfg.get("http_server_evaluation_sampling")
+        if evaluation_sampling is not None:
+            unknown = set(evaluation_sampling) - set(sampling)
+            if unknown:
+                raise ValueError(
+                    "Unknown NeMo-Gym evaluation sampling fields: "
+                    + ", ".join(sorted(unknown))
+                )
+            sampling.update(evaluation_sampling)
+
+    temperature = sampling["temperature"]
+    top_p = sampling["top_p"]
+    max_new_tokens = sampling["max_new_tokens"]
+    if not isinstance(temperature, (int, float)) or temperature < 0:
+        raise ValueError("NeMo-Gym temperature must be a non-negative number")
+    if not isinstance(top_p, (int, float)) or not 0 < top_p <= 1:
+        raise ValueError("NeMo-Gym top_p must be in (0, 1]")
+    if (
+        isinstance(max_new_tokens, bool)
+        or not isinstance(max_new_tokens, int)
+        or max_new_tokens <= 0
+    ):
+        raise ValueError("NeMo-Gym max_new_tokens must be a positive integer")
+    return sampling
+
+
 def _prepare_nemo_gym_rows(
-    rows: list[dict], generation_config: GenerationConfig
+    rows: list[dict],
+    generation_config: GenerationConfig,
+    *,
+    generation_only: bool,
 ) -> None:
-    """Apply NeMo-RL sampling parameters and stable row indices in place."""
+    """Stamp scheduler purpose, sampling parameters and stable row indices."""
+    rollout_purpose = "evaluation" if generation_only else "training"
+    sampling = _resolve_nemo_gym_sampling(
+        generation_config, generation_only=generation_only
+    )
     for row_index, row in enumerate(rows):
         responses_create_params = row.get("responses_create_params")
         if not isinstance(responses_create_params, dict):
@@ -2017,9 +2061,16 @@ def _prepare_nemo_gym_rows(
                 "Each NeMo-Gym row must contain a responses_create_params dict"
             )
 
-        responses_create_params["temperature"] = generation_config["temperature"]
-        responses_create_params["top_p"] = generation_config["top_p"]
-        configured_max_tokens = generation_config["max_new_tokens"]
+        existing_purpose = row.get("rollout_purpose")
+        if existing_purpose is not None and existing_purpose != rollout_purpose:
+            raise ValueError(
+                "NeMo-Gym row rollout_purpose conflicts with the scheduler: "
+                f"row={existing_purpose!r}, scheduler={rollout_purpose!r}"
+            )
+        row["rollout_purpose"] = rollout_purpose
+        responses_create_params["temperature"] = sampling["temperature"]
+        responses_create_params["top_p"] = sampling["top_p"]
+        configured_max_tokens = sampling["max_new_tokens"]
         row_max_tokens = responses_create_params.get("max_output_tokens")
         responses_create_params["max_output_tokens"] = (
             min(row_max_tokens, configured_max_tokens)
@@ -2168,7 +2219,11 @@ async def run_async_nemo_gym_rollout(
     run_rollouts_timer_label = f"{timer_prefix}/run_rollouts"
 
     with timer.time(total_timer_label):
-        _prepare_nemo_gym_rows(nemo_gym_rows, generation_config)
+        _prepare_nemo_gym_rows(
+            nemo_gym_rows,
+            generation_config,
+            generation_only=generation_only,
+        )
         accumulator = _NemoGymStreamAccumulator(
             rows=nemo_gym_rows,
             num_generations=num_generations,

@@ -36,3 +36,23 @@ def test_exact_trajectory_example_config_passes_runtime_model_validation(
     if "osworld_exact_trace" in relative_path:
         assert config.policy["router_replay"]["enabled"] is True
         assert config.policy["sequence_packing"]["enabled"] is False
+        vllm_cfg = config.policy["generation"]["vllm_cfg"]
+        assert (
+            vllm_cfg["http_server_serving_chat_kwargs"][
+                "chat_template_content_format"
+            ]
+            == "string"
+        )
+        assert vllm_cfg["http_server_evaluation_sampling"] == {
+            "temperature": 0.6,
+            "top_p": 0.95,
+            "max_new_tokens": 4096,
+        }
+        agent_cfg = config.env["nemo_gym"]["osworld_simple_agent"][
+            "responses_api_agents"
+        ]["osworld_agent"]
+        assert agent_cfg["agent_kwargs"]["parse_retries"] == 5
+        assert agent_cfg["agent_kwargs_by_rollout_purpose"] == {
+            "training": {"parse_retries": 1},
+            "evaluation": {"parse_retries": 5},
+        }

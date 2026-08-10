@@ -908,6 +908,93 @@ def test_run_async_nemo_gym_rollout_warns_when_max_seq_len_exceeds_engine():
             asyncio.run(_consume_rollout())
 
 
+def test_prepare_nemo_gym_rows_stamps_training_without_eval_overrides() -> None:
+    rows = [
+        {
+            "responses_create_params": {
+                "input": [],
+                "max_output_tokens": 2048,
+            }
+        }
+    ]
+    generation_config = {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "max_new_tokens": 768,
+        "vllm_cfg": {
+            "http_server_evaluation_sampling": {
+                "temperature": 0.6,
+                "top_p": 0.95,
+                "max_new_tokens": 4096,
+            }
+        },
+    }
+
+    rollouts_mod._prepare_nemo_gym_rows(
+        rows, generation_config, generation_only=False
+    )
+
+    assert rows == [
+        {
+            "responses_create_params": {
+                "input": [],
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "max_output_tokens": 768,
+            },
+            "rollout_purpose": "training",
+            "_rowidx": 0,
+        }
+    ]
+
+
+def test_prepare_nemo_gym_rows_uses_pinned_evaluation_profile() -> None:
+    rows = [{"responses_create_params": {"input": []}}]
+    generation_config = {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "max_new_tokens": 768,
+        "vllm_cfg": {
+            "http_server_evaluation_sampling": {
+                "temperature": 0.6,
+                "top_p": 0.95,
+                "max_new_tokens": 4096,
+            }
+        },
+    }
+
+    rollouts_mod._prepare_nemo_gym_rows(
+        rows, generation_config, generation_only=True
+    )
+
+    assert rows[0]["rollout_purpose"] == "evaluation"
+    assert rows[0]["responses_create_params"] == {
+        "input": [],
+        "temperature": 0.6,
+        "top_p": 0.95,
+        "max_output_tokens": 4096,
+    }
+
+
+def test_prepare_nemo_gym_rows_rejects_scheduler_purpose_conflict() -> None:
+    rows = [
+        {
+            "rollout_purpose": "evaluation",
+            "responses_create_params": {"input": []},
+        }
+    ]
+    generation_config = {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "max_new_tokens": 768,
+    }
+
+    with pytest.raises(ValueError, match="conflicts with the scheduler"):
+        rollouts_mod._prepare_nemo_gym_rows(
+            rows, generation_config, generation_only=False
+        )
+
+
 def test_native_rollout_groups_match_whole_batch(monkeypatch):
     """One native batch can be split without changing data or metric semantics."""
 
