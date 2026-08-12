@@ -131,6 +131,10 @@ env:
   should_log_nemo_gym_responses: false
   nemo_gym:
     is_trajectory_collection: false
+    # The cw-dfw launcher prefetches the two Gym server venvs and explicitly
+    # installs OSWorld's opt-in desktop runtime packages before Ray starts.
+    # Reuse that complete, Gym-SHA-scoped venv; a missing venv is still built.
+    skip_venv_if_present: true
     initial_global_config_dict:
       agent_name: osworld_simple_agent
     config_paths:

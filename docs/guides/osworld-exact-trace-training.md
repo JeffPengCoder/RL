@@ -364,6 +364,20 @@ export OPENSANDBOX_API_KEY=<secret>
 export OPENSANDBOX_POOL_REF=osworld-kvm
 ```
 
+在启动 Ray/NeMo-RL 之前，必须先用同一份 Gym 配置预热
+`NEMO_GYM_VENV_DIR`，再显式安装 OSWorld 没有随 Gym 默认环境分发的桌面运行时
+依赖：
+
+```bash
+gym env prefetch
+bash 3rdparty/Gym-workspace/Gym/responses_api_agents/osworld_agent/install_optional_runtime_deps.sh \
+  "${NEMO_GYM_VENV_DIR}/responses_api_agents/osworld_agent/.venv"
+```
+
+recipe 的 `skip_venv_if_present: true` 只复用已经存在且可执行的 venv；首次运行
+仍会创建 venv。生产 launcher 还应在启动 trainer 前执行 Gym 的
+`runtime_dependencies.py check`，不能把仅有 `bin/python` 当作依赖完整的证据。
+
 `NRL_REFIT_BUFFER_SIZE_BYTES` 必须在 collective 的所有 rank 上完全相同。cache 可加速
 重跑，但 cache 不是正确性证据；checkpoint、result/trajectory、resolved config、
 source SHA 和完成 marker 才是。
