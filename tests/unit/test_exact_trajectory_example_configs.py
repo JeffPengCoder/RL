@@ -56,3 +56,14 @@ def test_exact_trajectory_example_config_passes_runtime_model_validation(
             "training": {"parse_retries": 1},
             "evaluation": {"parse_retries": 5},
         }
+        if "opensandbox" in relative_path:
+            assert agent_cfg["sandbox_spec"]["image"] == "busybox:1.36"
+            assert (
+                agent_cfg["sandbox_spec"]["provider_options"][
+                    "skip_health_check"
+                ]
+                is True
+            )
+            assert agent_cfg["sandbox_spec"]["provider_options"]["extensions"][
+                "poolRef"
+            ] == "osworld-kvm"
