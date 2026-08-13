@@ -487,6 +487,13 @@ class AsyncNemoGymRolloutImpl:
         """Build N row dicts from input_sample, applying generation config params."""
         # Build a template row from the input_sample's extra_env_info, applying generation params.
         template_row: dict = copy.deepcopy(input_sample["extra_env_info"])  # type: ignore
+        existing_purpose = template_row.get("rollout_purpose")
+        if existing_purpose is not None and existing_purpose != "training":
+            raise ValueError(
+                "Async NeMo-Gym training row conflicts with the scheduler purpose: "
+                f"row={existing_purpose!r}, scheduler='training'"
+            )
+        template_row["rollout_purpose"] = "training"
 
         # We do not translate max_seq_len into row-level max_tokens here because that would
         # change semantics from "total sequence length" to "max new tokens".

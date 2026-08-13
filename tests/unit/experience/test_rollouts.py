@@ -995,6 +995,51 @@ def test_prepare_nemo_gym_rows_rejects_scheduler_purpose_conflict() -> None:
         )
 
 
+def test_async_rollout_manager_stamps_training_rollout_purpose() -> None:
+    manager = object.__new__(AsyncNemoGymRolloutImpl)
+    manager._num_generations_per_prompt = 2
+    manager._generation_config = {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "max_new_tokens": 768,
+    }
+    input_sample = {
+        "extra_env_info": {
+            "responses_create_params": {
+                "input": [],
+                "max_output_tokens": 2048,
+            }
+        }
+    }
+
+    rows = manager._build_inputs(input_sample)
+
+    assert [row["rollout_purpose"] for row in rows] == ["training", "training"]
+    assert [row["_rowidx"] for row in rows] == [0, 1]
+    assert all(
+        row["responses_create_params"]["max_output_tokens"] == 768 for row in rows
+    )
+
+
+def test_async_rollout_manager_rejects_evaluation_row() -> None:
+    manager = object.__new__(AsyncNemoGymRolloutImpl)
+    manager._num_generations_per_prompt = 1
+    manager._generation_config = {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "max_new_tokens": 768,
+    }
+    input_sample = {
+        "extra_env_info": {
+            "rollout_purpose": "evaluation",
+            "responses_create_params": {"input": []},
+        }
+    }
+
+    with pytest.raises(ValueError, match="conflicts with the scheduler purpose"):
+        manager._build_inputs(input_sample)
+
+
 def test_native_rollout_groups_match_whole_batch(monkeypatch):
     """One native batch can be split without changing data or metric semantics."""
 

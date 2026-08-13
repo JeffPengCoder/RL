@@ -39,6 +39,7 @@ from nemo_rl.environments.nemo_gym import (
     _index_per_turn_images,
     _resolve_images_by_media_id,
     _stamp_trajectory_rollout_ids,
+    _validate_scheduler_rollout_purpose,
     _validate_trajectory_transitions,
     build_reward_component_columns,
     extract_reward_components,
@@ -55,6 +56,25 @@ from tests.unit.models.generation.test_vllm_generation import (
 from tests.unit.models.generation.test_vllm_generation import (
     tokenizer as nemo_gym_tokenizer,  # noqa: F401
 )
+
+
+@pytest.mark.parametrize(
+    ("purpose", "generation_only"),
+    [("training", False), ("evaluation", True)],
+)
+def test_actor_accepts_matching_scheduler_rollout_purpose(
+    purpose: str, generation_only: bool
+) -> None:
+    _validate_scheduler_rollout_purpose(
+        [{"rollout_purpose": purpose}], generation_only=generation_only
+    )
+
+
+@pytest.mark.parametrize("purpose", [None, "training"])
+def test_actor_rejects_lost_or_wrong_evaluation_rollout_purpose(purpose) -> None:
+    row = {} if purpose is None else {"rollout_purpose": purpose}
+    with pytest.raises(ValueError, match="wrong scheduler purpose"):
+        _validate_scheduler_rollout_purpose([row], generation_only=True)
 
 
 def test_extract_reward_components():
@@ -1432,6 +1452,7 @@ def test_nemo_gym_sanity(
     generation_config = nemo_gym_vllm_generation.cfg
     examples = nemo_gym_sanity_test_data["input"]
     for idx, example in enumerate(examples):
+        example["rollout_purpose"] = "training"
         example["responses_create_params"]["temperature"] = generation_config[
             "temperature"
         ]
