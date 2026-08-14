@@ -14,7 +14,7 @@ from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
     [
         "examples/nemo_gym/grpo_nemotron_omni_30ba3b_osworld_exact_trace.yaml",
         "examples/nemo_gym/grpo_nemotron_omni_30ba3b_osworld_opensandbox_exact_trace.yaml",
-        "examples/nemo_gym/grpo_nemotron_omni_30ba3b_scripted_multiturn_cc.yaml",
+        "examples/nemo_gym/grpo_nemotron_omni_30ba3b_osworld_opensandbox_exact_trace_tp8pp2.yaml",
     ],
 )
 def test_exact_trajectory_example_config_passes_runtime_model_validation(
@@ -67,3 +67,8 @@ def test_exact_trajectory_example_config_passes_runtime_model_validation(
             assert agent_cfg["sandbox_spec"]["provider_options"]["extensions"][
                 "poolRef"
             ] == "osworld-kvm"
+        if relative_path.endswith("_tp8pp2.yaml"):
+            assert config.cluster["num_nodes"] == 3
+            assert config.policy["megatron_cfg"]["tensor_model_parallel_size"] == 8
+            assert config.policy["megatron_cfg"]["pipeline_model_parallel_size"] == 2
+            assert config.policy["megatron_cfg"]["context_parallel_size"] == 1

@@ -1,0 +1,23 @@
+# OpenSandbox OSWorld exact-trace recipe with the policy split over two nodes.
+#
+# The TP8/PP1 recipe fits one optimizer step on eight H100s but has no safe
+# activation margin for the observed multimodal batches. Pipeline parallelism
+# reduces the per-GPU policy/optimizer footprint without enabling NeMo-RL
+# sequence packing, which must remain disabled while Nano Omni owns the rebuilt
+# multimodal token layout and router replay consumes vLLM's exact token layout.
+
+defaults: grpo_nemotron_omni_30ba3b_osworld_opensandbox_exact_trace.yaml
+
+policy:
+  megatron_cfg:
+    tensor_model_parallel_size: 8
+    expert_model_parallel_size: 8
+    pipeline_model_parallel_size: 2
+    context_parallel_size: 1
+
+cluster:
+  gpus_per_node: 8
+  # Two policy nodes plus one non-colocated vLLM node.
+  num_nodes: 3
+  training_node_resource: nrl_trainer_node
+  inference_node_resource: nrl_vllm_node
