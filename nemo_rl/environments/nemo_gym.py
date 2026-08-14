@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import hashlib
+import importlib
 import json
 import math
 import os
@@ -77,6 +78,9 @@ DEFAULT_INVALID_TOOL_CALL_PATTERNS = [
 ]
 DEFAULT_THINKING_TAGS = ["<think>", "</think>"]
 
+_NEMO_GYM_EXTRA_ROOTS_ENV = "NEMO_GYM_EXTRA_ROOTS"
+_NEMO_GYM_ALLOWED_COMPONENT_ROOTS_ENV = "NEMO_GYM_ALLOWED_COMPONENT_ROOTS"
+
 _EXACT_TRACE_RESPONSE_PROJECTION_FIELDS = (
     "id",
     "status",
@@ -127,6 +131,86 @@ def get_nemo_gym_venv_dir() -> str | None:
     to /opt).
     """
     return os.environ.get("NEMO_GYM_VENV_DIR")
+
+
+def configure_nemo_gym_component_roots() -> Path:
+    """Pin Gym component discovery to this NeMo-RL checkout's Gym gitlink.
+
+    NeMo-RL can run newer source from a mounted checkout while the container
+    still contains an older ``/opt/nemo-rl`` tree.  The imported ``nemo_gym``
+    package and Gym's component discovery are independent provenance layers,
+    so either can otherwise resolve back to that stale image tree.  Make the
+    checkout paired with this module authoritative for both layers, and ask
+    Gym to reject server paths outside explicitly allowed roots.
+    """
+    nemo_rl_root = Path(__file__).resolve().parents[2]
+    gym_root = nemo_rl_root / "3rdparty" / "Gym-workspace" / "Gym"
+    required_markers = (
+        gym_root / "pyproject.toml",
+        gym_root / "nemo_gym",
+        gym_root / "responses_api_agents",
+        gym_root / "responses_api_models",
+    )
+    missing = [str(path) for path in required_markers if not path.exists()]
+    if missing:
+        raise RuntimeError(
+            "NeMo-RL's paired Gym checkout is incomplete; refusing to discover "
+            f"components from another installation. root={gym_root}, missing={missing}"
+        )
+
+    resolved_gym_root = gym_root.resolve()
+    existing_roots = [
+        Path(value).resolve()
+        for value in os.environ.get(_NEMO_GYM_EXTRA_ROOTS_ENV, "").split(os.pathsep)
+        if value
+    ]
+    ordered_roots = [resolved_gym_root, *existing_roots]
+    deduplicated_roots = list(dict.fromkeys(ordered_roots))
+    serialized_roots = os.pathsep.join(str(path) for path in deduplicated_roots)
+    os.environ[_NEMO_GYM_EXTRA_ROOTS_ENV] = serialized_roots
+    os.environ[_NEMO_GYM_ALLOWED_COMPONENT_ROOTS_ENV] = serialized_roots
+
+    sys.path[:] = [
+        str(resolved_gym_root),
+        *[
+            entry
+            for entry in sys.path
+            if Path(entry or os.curdir).resolve() != resolved_gym_root
+        ],
+    ]
+    importlib.invalidate_caches()
+    loaded_package = sys.modules.get("nemo_gym")
+    if loaded_package is None:
+        loaded_package = importlib.import_module("nemo_gym")
+
+    package_file_value = getattr(loaded_package, "__file__", None)
+    package_file = (
+        Path(package_file_value).resolve() if package_file_value is not None else None
+    )
+    expected_package_root = resolved_gym_root / "nemo_gym"
+    if package_file is None or not package_file.is_relative_to(expected_package_root):
+        print(
+            "NEMO_RL_GYM_RUNTIME_IDENTITY|status=reject|"
+            f"package={package_file or 'none'}|expected_root={expected_package_root}",
+            flush=True,
+        )
+        raise RuntimeError(
+            "The nemo_gym package was imported outside NeMo-RL's paired Gym "
+            "checkout; refusing a mixed source stack. "
+            f"package={package_file}, expected_root={expected_package_root}"
+        )
+
+    print(
+        "NEMO_RL_GYM_COMPONENT_ROOT|"
+        f"authoritative={resolved_gym_root}|allowed_roots={serialized_roots}",
+        flush=True,
+    )
+    print(
+        "NEMO_RL_GYM_RUNTIME_IDENTITY|status=accept|"
+        f"package={package_file}|component_root={resolved_gym_root}",
+        flush=True,
+    )
+    return resolved_gym_root
 
 
 class NemoGymConfig(TypedDict):
@@ -1158,6 +1242,7 @@ class NemoGym(EnvironmentInterface):
         _gym_port_high = self.cfg.get("port_range_high", DEFAULT_GYM_PORT_RANGE_HIGH)
         self.head_server_port = _get_free_port_local(_gym_port_low, _gym_port_high)
 
+        configure_nemo_gym_component_roots()
         from nemo_gym.cli import GlobalConfigDictParserConfig, RunHelper
         from nemo_gym.rollout_collection import RolloutCollectionHelper
         from nemo_gym.server_utils import HEAD_SERVER_KEY_NAME, BaseServerConfig
