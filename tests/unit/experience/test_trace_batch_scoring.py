@@ -19,7 +19,10 @@ from pathlib import Path
 import pytest
 import torch
 
-from nemo_rl.algorithms.advantage_estimator import GRPOAdvantageEstimator
+from nemo_rl.algorithms.advantage_estimator import (
+    AdvEstimatorConfig,
+    GRPOAdvantageEstimator,
+)
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.trace_batch_scoring import (
@@ -85,10 +88,10 @@ def _message_logs(bundle: dict) -> list[list[dict]]:
 
 def _estimator() -> GRPOAdvantageEstimator:
     return GRPOAdvantageEstimator(
-        {
-            "use_leave_one_out_baseline": False,
-            "normalize_rewards": True,
-        },
+        AdvEstimatorConfig(
+            use_leave_one_out_baseline=False,
+            normalize_rewards=True,
+        ),
         ClippedPGLossConfig(),
     )
 

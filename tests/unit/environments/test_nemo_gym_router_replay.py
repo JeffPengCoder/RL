@@ -52,7 +52,7 @@ def test_nemo_gym_postprocess_slices_routed_experts():
 
     result = (
         NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
-            _MockSelf(), nemo_gym_result, _Tokenizer()
+            _MockSelf(), {}, nemo_gym_result, _Tokenizer()
         )
     )
 
@@ -86,7 +86,7 @@ def test_nemo_gym_postprocess_requires_routed_experts_when_configured():
 
     with pytest.raises(ValueError, match="requires NeMo Gym output items"):
         NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
-            _MockSelf(), nemo_gym_result, _Tokenizer()
+            _MockSelf(), {}, nemo_gym_result, _Tokenizer()
         )
 
 
@@ -112,7 +112,7 @@ def test_nemo_gym_postprocess_casts_routed_experts_to_configured_dtype():
 
     result = (
         NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
-            _MockSelf(), nemo_gym_result, _Tokenizer()
+            _MockSelf(), {}, nemo_gym_result, _Tokenizer()
         )
     )
 
