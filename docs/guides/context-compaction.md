@@ -14,15 +14,18 @@ through the Cell 2 OpenSandbox SDK.
 The OSWorld integration, exact state/action/reward evidence contract, and its
 qualification runbook live in
 [`osworld-exact-trace-training.md`](osworld-exact-trace-training.md). That
-integration is wired for a real computer-use qualification but has not yet
-completed the GPU end-to-end gates described there.
+integration's two parent lines have independent GPU validation evidence. The
+combined `3642+` source identity must still pass its own end-to-end gates; a
+parent result is not automatically a qualification of the merge commit.
 
 ## Code and validated runtime
 
-The public draft PRs are:
+The public source lines are:
 
-- NeMo RL: [NVIDIA-NeMo/RL#3642](https://github.com/NVIDIA-NeMo/RL/pull/3642)
-- NeMo Gym: [NVIDIA-NeMo/Gym#2555](https://github.com/NVIDIA-NeMo/Gym/pull/2555)
+- primary NeMo-RL workflow: [NVIDIA-NeMo/RL#3642](https://github.com/NVIDIA-NeMo/RL/pull/3642)
+- exact-trace/runtime capability line: [`JeffPengCoder/RL:feature/gym-osworld`](https://github.com/JeffPengCoder/RL/tree/feature/gym-osworld)
+- combined experiment branch: [`JeffPengCoder/RL:3642+`](https://github.com/JeffPengCoder/RL/tree/3642%2B)
+- pinned Gym producer: [NVIDIA-NeMo/Gym#2554](https://github.com/NVIDIA-NeMo/Gym/pull/2554)
 
 ### Provenance
 
@@ -41,28 +44,27 @@ evaluation pipeline, and validates Context Compaction in a real computer-use
 environment. It does not claim Context Compaction or the initial OSWorld
 environment as new contributions.
 
-The NeMo RL draft pins the matching Gym draft as a submodule. Check out and
-initialize the publication branch with:
+The combined branch pins the reviewed exact-trace Gym source as a submodule.
+Check it out with:
 
 ```bash
-git clone https://github.com/jinglinglingling/RL.git nemo-rl-osworld
+git clone --branch '3642+' --recurse-submodules \
+  https://github.com/JeffPengCoder/RL.git nemo-rl-osworld
 cd nemo-rl-osworld
-git checkout feature/osworld-grpo-training-eval-signed
 git submodule sync --recursive
 git submodule update --init --recursive
 ```
 
-The validated internal runtime is:
+The source/runtime contract is:
 
 | Item | Value |
 |---|---|
-| Slurm account | `coreai_dlalgo_nemorl` |
-| Slurm partition | `batch` |
-| Container | `/lustre/fs1/portfolios/coreai/users/aroshanghias/omni-main-migration/containers/cuda-dl-base-26.03-cuda13.2-devel-ubuntu24.04.sqsh` |
-| Checkpoint | `/lustre/fs1/portfolios/coreai/users/aroshanghias/checkpoints/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16` |
+| Compute | Linux/CUDA GPU nodes capable of running Ray, Megatron, and vLLM |
+| Scheduler | Site-provided; cw-dfw uses a durable `salloc` followed by role-specific `srun` steps |
+| Container | A CUDA-compatible NeMo-RL image or equivalent locked environment |
+| Persistent storage | Shared user-writable storage for source, model, caches, logs, and checkpoints |
 | Public model ID | `nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16` |
-| NeMo Gym submodule | `dbbeaa6883716ba4e80f042c80c4774a5042ea37` |
-| W&B project | `nvidia/nemo-rl-context-compaction` |
+| NeMo Gym submodule | `e191ef90b5175be57f142da451186a14ec530e4a` |
 
 Use writable cache and venv directories belonging to your user. Do not share
 another run's mutable venv directory.

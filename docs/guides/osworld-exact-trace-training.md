@@ -5,11 +5,13 @@
 本集成分支：
 
 ```text
-NeMo-RL: feature/gym-osworld
+NeMo-RL primary parent: NVIDIA-NeMo/RL PR #3642@022269324326b8b2680dca8d7bd7bd78d78d2998
+NeMo-RL capability parent: JeffPengCoder/RL feature/gym-osworld@3095f8519507d7094fc3a840b664143f3c5ca4d2
+NeMo-RL combined branch: JeffPengCoder/RL 3642+
 base: aroshanghias/context-compaction-v2-clean@42a65427dce038f57f7fd8eed6a24f6a8ce72c2b
 one-step qualified NeMo-RL: 4ce0a05961ad7b90a4ef669ce3da37c87ce3bb41
 dense-modality qualified NeMo-RL: c1d7b2fc9403fa1b21dfc75dfdd3d70fcd4da1b9
-Gym: feature/osworld2@5e084a83a21d72b125be1a340d004a47259167b8
+Gym: feature/osworld-exact-trace-training@e191ef90b5175be57f142da451186a14ec530e4a
 Rohit comparison: rohit/gymv-mm-integration@71717873240c99fd1ede2db17480818205766848
 ```
 
@@ -18,14 +20,15 @@ stream reconstruction。Gym 不再提供 `training_mode`、`last`、`all` 或
 `exact_trace` strategy：benchmark 和 training 执行完全相同的 agent prompt/action
 逻辑，差别只在下游 consumer 是否具备训练准入条件。
 
-截至 2026-08-11，合同、重建、校验、配置和单元测试已经具备，前两个真实
-OSWorld VM/GPU gate 也已完成：
+父分支的合同、重建、校验、配置和单元测试已经具备，并完成过以下真实
+OSWorld VM/GPU gate；这些结果是合并输入证据，不等于新的 `3642+` merge SHA 已验收：
 
 ```text
 generation-only trace qualification: passed, Job 15436343
 1-step optimizer/checkpoint smoke: passed, Job 15479566
 16-step fixed-validation run: not run on this exact-trace branch
 checkpoint/resume qualification: not run
+3642+ combined SHA generation/optimizer gates: pending
 ```
 
 Job 15479566 的 8 条 rollout reward 全为 0，loss 为 0；它证明 logprob、backward、
@@ -231,6 +234,25 @@ training-time evaluation
 `1.0/1.0/768`；只有 scheduler 标记的 evaluation 才能使用单独固定的
 `0.6/0.95/4096`，不能用 purpose 绕开任意采样参数检查。
 
+由 NeMo-RL 写这个字段是合理的，因为训练 scheduler 才知道某批 rollout 属于 optimizer
+采样还是训练期 validation；Gym 和 model server 不应从 payload 形状、是否请求 logprob
+或 endpoint 名称猜测。但跨服务合同不应该是模糊的 `is_eval` boolean，而应是可校验的
+`rollout_purpose=training|evaluation`。是否参与 loss 仍由 NeMo-RL 本地的
+`generation_only`/训练控制流决定，不能由 Gym 反向决定。换句话说，这是两个概念：
+
+```text
+rollout_purpose
+  = 本次调用应采用哪一个显式、固定的生成/解析 profile
+
+trainable / generation_only
+  = 返回结果是否允许进入 trainer 的 loss/backward
+```
+
+正常训练和训练期 validation 中两者分别一一对应；若未来增加“采用 training sampling
+但只收集 trace、不做 backward”的 preflight，应在 NeMo-RL API 中显式解耦这两个轴，
+而不是让 Gym 猜测或再增加一个 OSWorld training-mode 开关。独立 benchmark 没有
+NeMo-RL scheduler，因此不要求携带该字段，继续使用 Gym 的 standalone 默认合同。
+
 Nano Omni 当前 recipe 固定 `chat_template_content_format=string`。实测使用 `openai`
 block-list 格式会让历史 assistant content 在第二轮被模板渲染成 Python list literal，
 模型随后输出同类 list 文本并触发 parser failure。旧的约 50% standalone baseline 同样
@@ -250,7 +272,7 @@ block-list 格式会让历史 assistant content 在第二轮被模板渲染成 P
 除 Arash 基线已有的 logical-to-physical 重建外，本分支加入：
 
 1. Gym submodule 固定到可访问的 `JeffPengCoder/Gym`，branch metadata 为
-   `feature/osworld2`，gitlink 是唯一版本权威。
+   `feature/osworld-exact-trace-training`，gitlink 是唯一版本权威。
 2. 通用 `trajectory_transitions` + `trajectory_model_calls` 逐项校验；语义 trajectory
    与 exact generation evidence 不一致时，在 loss 前 fail closed。
 3. OSWorld exact-trace 16-step recipe 与 OpenSandbox overlay。
@@ -298,9 +320,9 @@ successor capacity。
 ## 7. Checkout 与 submodule
 
 ```bash
-git clone --recurse-submodules https://github.com/JeffPengCoder/RL.git nemo-rl
+git clone --branch '3642+' --recurse-submodules \
+  https://github.com/JeffPengCoder/RL.git nemo-rl
 cd nemo-rl
-git switch feature/gym-osworld
 git submodule sync --recursive
 git submodule update --init --recursive
 
