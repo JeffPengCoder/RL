@@ -38,9 +38,7 @@ def test_exact_trajectory_example_config_passes_runtime_model_validation(
         assert config.policy["sequence_packing"]["enabled"] is False
         vllm_cfg = config.policy["generation"]["vllm_cfg"]
         assert (
-            vllm_cfg["http_server_serving_chat_kwargs"][
-                "chat_template_content_format"
-            ]
+            vllm_cfg["http_server_serving_chat_kwargs"]["chat_template_content_format"]
             == "string"
         )
         assert vllm_cfg["http_server_evaluation_sampling"] == {
@@ -59,14 +57,13 @@ def test_exact_trajectory_example_config_passes_runtime_model_validation(
         if "opensandbox" in relative_path:
             assert agent_cfg["sandbox_spec"]["image"] == "busybox:1.36"
             assert (
-                agent_cfg["sandbox_spec"]["provider_options"][
-                    "skip_health_check"
-                ]
+                agent_cfg["sandbox_spec"]["provider_options"]["skip_health_check"]
                 is True
             )
-            assert agent_cfg["sandbox_spec"]["provider_options"]["extensions"][
-                "poolRef"
-            ] == "osworld-kvm"
+            assert (
+                agent_cfg["sandbox_spec"]["provider_options"]["extensions"]["poolRef"]
+                == "osworld-kvm"
+            )
         if relative_path.endswith("_tp8pp2.yaml"):
             assert config.cluster["num_nodes"] == 3
             assert config.policy["megatron_cfg"]["tensor_model_parallel_size"] == 8

@@ -104,9 +104,7 @@ def _steps(
         ordered_pair=ordered_pair,
     )
     generation_ids = (
-        [201, 202, 401, 402, 601]
-        if rewrite
-        else [2001, 2002, 2003, 2004, 2005]
+        [201, 202, 401, 402, 601] if rewrite else [2001, 2002, 2003, 2004, 2005]
     )
     steps = []
     for step_index, (prompt_ids, image_urls, generation_id) in enumerate(
@@ -297,9 +295,7 @@ def test_current_bridge_preserves_same_shape_media_order() -> None:
         ordered_pair=ordered_pair,
     )
     media_assets = gym_result["response"]["media_assets"]
-    turn_three = _postprocess(row, gym_result)["rollout_trace_bundle"]["model_calls"][
-        2
-    ]
+    turn_three = _postprocess(row, gym_result)["rollout_trace_bundle"]["model_calls"][2]
     observed_urls = [
         media_assets[media_id]["source_part"]["image_url"]
         for media_id in turn_three["media_ids"]
