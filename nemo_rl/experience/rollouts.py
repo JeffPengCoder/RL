@@ -2050,6 +2050,7 @@ def _prepare_nemo_gym_rows(
     generation_only: bool,
 ) -> None:
     """Stamp scheduler purpose, sampling parameters and stable row indices."""
+    purpose_metadata_key = "nemo_rl_rollout_purpose"
     rollout_purpose = "evaluation" if generation_only else "training"
     sampling = _resolve_nemo_gym_sampling(
         generation_config, generation_only=generation_only
@@ -2068,6 +2069,23 @@ def _prepare_nemo_gym_rows(
                 f"row={existing_purpose!r}, scheduler={rollout_purpose!r}"
             )
         row["rollout_purpose"] = rollout_purpose
+        metadata = responses_create_params.get("metadata")
+        if metadata is None:
+            metadata = {}
+            responses_create_params["metadata"] = metadata
+        if not isinstance(metadata, dict):
+            raise TypeError("responses_create_params.metadata must be a dict")
+        metadata_purpose = metadata.get(purpose_metadata_key)
+        if metadata_purpose is not None and metadata_purpose != rollout_purpose:
+            raise ValueError(
+                "NeMo-Gym metadata rollout_purpose conflicts with the scheduler: "
+                f"metadata={metadata_purpose!r}, scheduler={rollout_purpose!r}"
+            )
+        # Keep a redundant carrier inside a field understood by every generic
+        # /run schema. Some distributed agent boundaries reconstruct only the
+        # standard responses_create_params model and can discard an otherwise
+        # valid top-level extension. The agent must cross-check both carriers.
+        metadata[purpose_metadata_key] = rollout_purpose
         responses_create_params["temperature"] = sampling["temperature"]
         responses_create_params["top_p"] = sampling["top_p"]
         configured_max_tokens = sampling["max_new_tokens"]
@@ -2078,6 +2096,15 @@ def _prepare_nemo_gym_rows(
             else configured_max_tokens
         )
         row["_rowidx"] = row_index
+
+    print(
+        "NEMO_RL_ROLLOUT_PURPOSE_STAMP|"
+        f"purpose={rollout_purpose}|rows={len(rows)}|"
+        f"temperature={sampling['temperature']}|top_p={sampling['top_p']}|"
+        f"max_new_tokens={sampling['max_new_tokens']}|"
+        "carriers=top_level,metadata",
+        flush=True,
+    )
 
 
 def _tensorize_nemo_gym_result(result: dict) -> None:

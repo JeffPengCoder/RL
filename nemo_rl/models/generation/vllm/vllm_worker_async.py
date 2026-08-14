@@ -657,9 +657,7 @@ class VllmAsyncGenerationWorkerImpl(
             NeMoRLOpenAIChatRequestMixin, ChatCompletionRequest
         ):
             required_prefix_token_ids: Optional[List[int]] = None
-            nemo_rl_rollout_purpose: Literal["training", "evaluation"] = (
-                "training"
-            )
+            nemo_rl_rollout_purpose: Literal["training", "evaluation"] = "training"
 
         # vLLM 0.25 routes both /v1/chat/completions and /tokenize through
         # OnlineRenderer.preprocess_chat, so the prefix-token override
@@ -789,6 +787,17 @@ class VllmAsyncGenerationWorkerImpl(
             expected_sampling = resolve_http_request_sampling_contract(
                 generation_config,
                 request.nemo_rl_rollout_purpose,
+            )
+            print(
+                "NEMO_RL_VLLM_PURPOSE_CONTRACT|"
+                f"purpose={request.nemo_rl_rollout_purpose}|"
+                f"temperature={request.temperature}|"
+                f"expected_temperature={expected_sampling['temperature']}|"
+                f"top_p={request.top_p}|"
+                f"expected_top_p={expected_sampling['top_p']}|"
+                f"max_tokens={request.max_tokens}|"
+                f"expected_max_tokens={expected_sampling['max_new_tokens']}",
+                flush=True,
             )
             assert request.temperature == expected_sampling["temperature"], (
                 "HTTP request temperature violates its NeMo-RL sampling "

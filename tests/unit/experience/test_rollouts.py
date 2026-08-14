@@ -930,9 +930,7 @@ def test_prepare_nemo_gym_rows_stamps_training_without_eval_overrides() -> None:
         },
     }
 
-    rollouts_mod._prepare_nemo_gym_rows(
-        rows, generation_config, generation_only=False
-    )
+    rollouts_mod._prepare_nemo_gym_rows(rows, generation_config, generation_only=False)
 
     assert rows == [
         {
@@ -941,6 +939,7 @@ def test_prepare_nemo_gym_rows_stamps_training_without_eval_overrides() -> None:
                 "temperature": 1.0,
                 "top_p": 1.0,
                 "max_output_tokens": 768,
+                "metadata": {"nemo_rl_rollout_purpose": "training"},
             },
             "rollout_purpose": "training",
             "_rowidx": 0,
@@ -963,9 +962,7 @@ def test_prepare_nemo_gym_rows_uses_pinned_evaluation_profile() -> None:
         },
     }
 
-    rollouts_mod._prepare_nemo_gym_rows(
-        rows, generation_config, generation_only=True
-    )
+    rollouts_mod._prepare_nemo_gym_rows(rows, generation_config, generation_only=True)
 
     assert rows[0]["rollout_purpose"] == "evaluation"
     assert rows[0]["responses_create_params"] == {
@@ -973,6 +970,7 @@ def test_prepare_nemo_gym_rows_uses_pinned_evaluation_profile() -> None:
         "temperature": 0.6,
         "top_p": 0.95,
         "max_output_tokens": 4096,
+        "metadata": {"nemo_rl_rollout_purpose": "evaluation"},
     }
 
 
@@ -990,6 +988,27 @@ def test_prepare_nemo_gym_rows_rejects_scheduler_purpose_conflict() -> None:
     }
 
     with pytest.raises(ValueError, match="conflicts with the scheduler"):
+        rollouts_mod._prepare_nemo_gym_rows(
+            rows, generation_config, generation_only=False
+        )
+
+
+def test_prepare_nemo_gym_rows_rejects_metadata_purpose_conflict() -> None:
+    rows = [
+        {
+            "responses_create_params": {
+                "input": [],
+                "metadata": {"nemo_rl_rollout_purpose": "evaluation"},
+            },
+        }
+    ]
+    generation_config = {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "max_new_tokens": 768,
+    }
+
+    with pytest.raises(ValueError, match="metadata rollout_purpose conflicts"):
         rollouts_mod._prepare_nemo_gym_rows(
             rows, generation_config, generation_only=False
         )

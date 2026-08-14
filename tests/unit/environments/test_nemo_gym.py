@@ -66,14 +66,40 @@ def test_actor_accepts_matching_scheduler_rollout_purpose(
     purpose: str, generation_only: bool
 ) -> None:
     _validate_scheduler_rollout_purpose(
-        [{"rollout_purpose": purpose}], generation_only=generation_only
+        [
+            {
+                "rollout_purpose": purpose,
+                "responses_create_params": {
+                    "metadata": {"nemo_rl_rollout_purpose": purpose}
+                },
+            }
+        ],
+        generation_only=generation_only,
     )
 
 
 @pytest.mark.parametrize("purpose", [None, "training"])
 def test_actor_rejects_lost_or_wrong_evaluation_rollout_purpose(purpose) -> None:
-    row = {} if purpose is None else {"rollout_purpose": purpose}
+    row = (
+        {}
+        if purpose is None
+        else {
+            "rollout_purpose": purpose,
+            "responses_create_params": {
+                "metadata": {"nemo_rl_rollout_purpose": purpose}
+            },
+        }
+    )
     with pytest.raises(ValueError, match="wrong scheduler purpose"):
+        _validate_scheduler_rollout_purpose([row], generation_only=True)
+
+
+def test_actor_rejects_lost_metadata_rollout_purpose() -> None:
+    row = {
+        "rollout_purpose": "evaluation",
+        "responses_create_params": {"metadata": {}},
+    }
+    with pytest.raises(ValueError, match="wrong metadata purpose"):
         _validate_scheduler_rollout_purpose([row], generation_only=True)
 
 
