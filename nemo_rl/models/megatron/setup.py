@@ -544,8 +544,19 @@ def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
         overrides_hash = _get_hf_config_overrides_hash(hf_config_overrides)
         hf_model_subdir = f"{hf_model_subdir}__hfovr_{overrides_hash}"
     pretrained_path = os.path.join(get_megatron_checkpoint_dir(), hf_model_subdir)
-    pt_checkpoint_exists = os.path.exists(pretrained_path) and os.path.exists(
-        os.path.join(pretrained_path, "iter_0000000")
+    # A failed conversion can leave the iteration directory and large distcp
+    # shards behind before Bridge writes its completion metadata. Treating the
+    # directory alone as a cache hit makes every rank skip HF import and then
+    # fail later while loading run_config.yaml.
+    iter_path = os.path.join(pretrained_path, "iter_0000000")
+    pt_checkpoint_exists = all(
+        os.path.isfile(os.path.join(iter_path, required_file))
+        for required_file in (
+            "run_config.yaml",
+            "train_state.pt",
+            "metadata.json",
+            ".metadata",
+        )
     )
     return hf_model_name, pretrained_path, pt_checkpoint_exists
 
@@ -1410,9 +1421,8 @@ def setup_model_and_optimizer(
                 # `.llava_model.language_model`; unwrap that layer first so the
                 # generic `.language_model.decoder.layers` walk below finds the
                 # MoE router.
-                if (
-                    getattr(model_module, "llava_model", None) is not None
-                    and hasattr(model_module.llava_model, "language_model")
+                if getattr(model_module, "llava_model", None) is not None and hasattr(
+                    model_module.llava_model, "language_model"
                 ):
                     model_module = model_module.llava_model
                 if hasattr(model_module, "language_model"):

@@ -1,0 +1,186 @@
+# OSWorld full-trajectory GRPO for Nemotron-3-Nano-Omni.
+#
+# One logical rollout contains every OSWorld model call. Gym exports the exact
+# prompt/action token evidence for each call; NeMo-RL reconstructs one or more
+# prefix-contiguous physical traces while keeping one logical reward/advantage.
+# This default is a 16-step, two-node, non-colocated run (8 GPUs per role).
+
+defaults: grpo_nanov3.yaml
+
+grpo:
+  num_prompts_per_step: 1
+  num_generations_per_prompt: 8
+  num_val_generations_per_prompt: 1
+  max_rollout_turns: 3
+  max_num_epochs: 1
+  max_num_steps: 16
+  val_period: 4
+  val_at_start: true
+  val_at_end: true
+  max_val_samples: null
+  val_batch_size: null
+  overlong_filtering: false
+  # Unsupported after a logical rollout expands into physical traces. Monitor
+  # token_mult_prob_error/context-compaction metrics instead.
+  seq_logprob_error_threshold: null
+  async_grpo:
+    enabled: false
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: ${oc.env:OSWORLD_CHECKPOINT_DIR,results/osworld-exact-trace}
+  save_period: 4
+  keep_top_k: 4
+
+policy:
+  model_name: ${oc.env:NANO_OMNI_MODEL_NAME}
+  is_vlm: true
+  tokenizer:
+    name: ${policy.model_name}
+    # Exact trace uses the generation server's sampled token IDs directly;
+    # trainer-side re-rendering is not the token authority.
+    chat_template_kwargs:
+      enable_thinking: true
+      truncate_history_thinking: false
+  # The trace-aware implementation preserves logical GRPO batch boundaries.
+  # This must equal prompts-per-step * generations-per-prompt.
+  train_global_batch_size: 8
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 32768
+  logprob_chunk_size: null
+  make_sequence_length_divisible_by: 16
+  router_replay:
+    enabled: true
+  # The accepted Nano Omni MBridge wrapper owns sequence packing. NeMo-RL
+  # cannot currently align vLLM routed-expert records with that wrapper's
+  # internally rebuilt token layout, so router replay and delegated sequence
+  # packing are intentionally not combined. Microbatches are size 1 in this
+  # recipe, which also makes cross-sample sequence packing unnecessary.
+  sequence_packing:
+    enabled: false
+
+  megatron_cfg:
+    tensor_model_parallel_size: 8
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 8
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    sequence_parallel: true
+    activation_checkpointing: true
+    radio_force_cpe_eval_mode: true
+    clear_memory_caches_before_refit: true
+    distributed_data_parallel_config:
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+    scheduler:
+      lr_warmup_iters: 0
+
+  generation:
+    max_new_tokens: 768
+    temperature: 1.0
+    top_p: 1.0
+    bad_words: ["<image>", "<img>", "</img>"]
+    vllm_cfg:
+      tensor_parallel_size: 8
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.8
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: true
+      enable_prefix_caching: false
+      skip_tokenizer_init: false
+      logprobs_mode: raw_logprobs
+      # Training remains on-policy at 1.0/1.0/768. NeMo-RL stamps only its
+      # generation-only validation requests so the HTTP server can admit this
+      # separately pinned, benchmark-aligned sampling profile.
+      http_server_evaluation_sampling:
+        temperature: 0.6
+        top_p: 0.95
+        max_new_tokens: 4096
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: qwen3_coder
+        reasoning_parser: nano_v3
+        # Nano Omni's template expects flattened string content. Passing the
+        # OpenAI block list makes historical assistant turns render as a
+        # Python-list literal and caused the observed turn-2 parser collapse.
+        chat_template_content_format: string
+    vllm_kwargs:
+      limit_mm_per_prompt: {image: 3}
+      mm_processor_cache_gb: 0
+      max_num_batched_tokens: ${policy.max_total_sequence_length}
+      mamba_ssm_cache_dtype: float32
+      skip_mm_profiling: true
+      enable_chunked_prefill: false
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 1
+
+data:
+  max_input_seq_length: 32768
+  train:
+    data_path: ${oc.env:OSWORLD_TRAIN_DATA}
+  validation:
+    data_path: ${oc.env:OSWORLD_VALIDATION_DATA}
+
+env:
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: false
+  nemo_gym:
+    is_trajectory_collection: false
+    # The cw-dfw launcher prefetches the two Gym server venvs and explicitly
+    # installs OSWorld's opt-in desktop runtime packages before Ray starts.
+    # Reuse that complete, Gym-SHA-scoped venv; a missing venv is still built.
+    skip_venv_if_present: true
+    initial_global_config_dict:
+      agent_name: osworld_simple_agent
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - responses_api_agents/osworld_agent/configs/osworld_agent.yaml
+    osworld_simple_agent:
+      responses_api_agents:
+        osworld_agent:
+          runner_name: nemotron_v3_nano_omni_agent
+          sandbox_provider: osworld_sandbox
+          concurrency: 2
+          vm_path: ${oc.env:OSWORLD_VM_PATH,""}
+          max_steps: 15
+          max_trajectory_length: 3
+          max_tokens: 768
+          temperature: ${policy.generation.temperature}
+          top_p: ${policy.generation.top_p}
+          sleep_after_execution: 1.5
+          task_timeout: 480
+          agent_kwargs:
+            coordinate_type: relative
+            max_image_history_length: 3
+            thinking: true
+            # Standalone/evaluation baseline. The scheduler-owned purpose
+            # override keeps exact-trace training to one model call per step.
+            parse_retries: 5
+          agent_kwargs_by_rollout_purpose:
+            training:
+              parse_retries: 1
+            evaluation:
+              parse_retries: 5
+
+logger:
+  log_dir: ${oc.env:OSWORLD_LOG_DIR,logs/osworld-exact-trace}
+  wandb_enabled: false
+  tensorboard_enabled: true
+  monitor_gpus: false
+  wandb:
+    project: grpo-nemotron-omni-osworld
+    group: exact-trace
+    name: osworld-exact-trace-16step
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 2
+  # Register these custom resources in Ray to keep heterogeneous hosts in
+  # their intended roles independent of node join order.
+  training_node_resource: nrl_trainer_node
+  inference_node_resource: nrl_vllm_node

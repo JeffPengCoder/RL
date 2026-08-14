@@ -342,6 +342,125 @@ def _install_fake_vllm_openai_modules(monkeypatch):
     return ToolParserManager, ReasoningParserManager, OpenAIServingChat
 
 
+def _install_fake_vllm_020_openai_modules(monkeypatch):
+    """Install the legacy serving symbols exported by the accepted image."""
+    for module_name in (
+        "vllm",
+        "vllm.entrypoints",
+        "vllm.entrypoints.openai",
+        "vllm.entrypoints.openai.chat_completion",
+        "vllm.entrypoints.openai.engine",
+        "vllm.entrypoints.openai.models",
+        "vllm.entrypoints.serve",
+        "vllm.entrypoints.serve.render",
+        "vllm.entrypoints.serve.tokenize",
+        "vllm.reasoning",
+        "vllm.tool_parsers",
+        "vllm.v1",
+        "vllm.v1.engine",
+    ):
+        monkeypatch.setitem(sys.modules, module_name, types.ModuleType(module_name))
+
+    def make_module(name: str, **attrs):
+        module = types.ModuleType(name)
+        for attr_name, attr_value in attrs.items():
+            setattr(module, attr_name, attr_value)
+        monkeypatch.setitem(sys.modules, name, module)
+
+    class BaseModelPath:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class OpenAIServingModels:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.registry = "registry"
+
+    class OpenAIServingRender:
+        instances = []
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.renderer = kwargs["renderer"]
+            self.instances.append(self)
+
+    class OpenAIServingChat:
+        instances = []
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.instances.append(self)
+
+    class OpenAIServingTokenization:
+        instances = []
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.instances.append(self)
+
+    class VLLMValidationError(Exception):
+        pass
+
+    class ToolParserManager:
+        import_tool_parser = MagicMock()
+
+    class ReasoningParserManager:
+        import_reasoning_parser = MagicMock()
+
+    load_chat_template = MagicMock(
+        side_effect=lambda value: None if value is None else f"resolved:{value}"
+    )
+    make_module("vllm.entrypoints.chat_utils", load_chat_template=load_chat_template)
+    make_module(
+        "vllm.entrypoints.openai.chat_completion.protocol",
+        ChatCompletionRequest=type("ChatCompletionRequest", (), {}),
+        ChatCompletionResponse=type("ChatCompletionResponse", (), {}),
+    )
+    make_module(
+        "vllm.entrypoints.openai.chat_completion.serving",
+        OpenAIServingChat=OpenAIServingChat,
+    )
+    make_module(
+        "vllm.entrypoints.openai.engine.protocol",
+        ErrorResponse=type("ErrorResponse", (), {}),
+    )
+    make_module("vllm.entrypoints.openai.models.protocol", BaseModelPath=BaseModelPath)
+    make_module(
+        "vllm.entrypoints.openai.models.serving",
+        OpenAIServingModels=OpenAIServingModels,
+    )
+    make_module(
+        "vllm.entrypoints.serve.tokenize.protocol",
+        TokenizeChatRequest=type("TokenizeChatRequest", (), {}),
+        TokenizeCompletionRequest=type("TokenizeCompletionRequest", (), {}),
+        TokenizeResponse=type("TokenizeResponse", (), {}),
+    )
+    make_module(
+        "vllm.entrypoints.serve.render.serving",
+        OpenAIServingRender=OpenAIServingRender,
+    )
+    make_module(
+        "vllm.entrypoints.serve.tokenize.serving",
+        OpenAIServingTokenization=OpenAIServingTokenization,
+    )
+    make_module("vllm.exceptions", VLLMValidationError=VLLMValidationError)
+    make_module(
+        "vllm.reasoning.abs_reasoning_parsers",
+        ReasoningParserManager=ReasoningParserManager,
+    )
+    make_module(
+        "vllm.tool_parsers.abstract_tool_parser",
+        ToolParserManager=ToolParserManager,
+    )
+    make_module("vllm.v1.engine.async_llm", logger=MagicMock())
+    return (
+        OpenAIServingChat,
+        OpenAIServingRender,
+        OpenAIServingTokenization,
+        load_chat_template,
+    )
+
+
 class _FakeFastAPIApp:
     def __init__(self):
         self.routes = []
@@ -390,6 +509,47 @@ def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch):
     assert openai_serving_chat.instances[0].kwargs["reasoning_parser"] == "nano_v3"
     # make sure that the config attribute does not leak into `http_server_serving_chat_kwargs`
     assert "reasoning_parser_plugin" not in openai_serving_chat.instances[0].kwargs
+
+
+def test_vllm_async_http_server_supports_accepted_vllm_020_image(monkeypatch):
+    (
+        openai_serving_chat,
+        openai_serving_render,
+        openai_serving_tokenization,
+        load_chat_template,
+    ) = _install_fake_vllm_020_openai_modules(monkeypatch)
+
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.cfg = {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "vllm_cfg": {
+            "http_server_serving_chat_kwargs": {
+                "chat_template": "/templates/omni.jinja",
+                "chat_template_kwargs": {"truncate_history_thinking": True},
+            },
+        },
+    }
+    worker.llm = MagicMock(model_config="model-config", renderer="renderer")
+    model_config = MagicMock(served_model_name="served-model", model="model-path")
+    worker.llm_async_engine_args = MagicMock()
+    worker.llm_async_engine_args.create_model_config.return_value = model_config
+
+    app = _FakeFastAPIApp()
+    assert worker._setup_vllm_openai_api_server(app) is app
+
+    load_chat_template.assert_called_once_with("/templates/omni.jinja")
+    chat_kwargs = openai_serving_chat.instances[0].kwargs
+    assert chat_kwargs["chat_template"] == "resolved:/templates/omni.jinja"
+    assert "chat_template_kwargs" not in chat_kwargs
+    assert "openai_serving_render" in chat_kwargs
+    assert "online_renderer" not in chat_kwargs
+    assert openai_serving_render.instances[0].kwargs["model_registry"] == "registry"
+    tokenize_kwargs = openai_serving_tokenization.instances[0].kwargs
+    assert (
+        tokenize_kwargs["openai_serving_render"] is openai_serving_render.instances[0]
+    )
+    assert tokenize_kwargs["engine_client"] is worker.llm
 
 
 def test_nano_v3_reasoning_parser_swaps_reasoning_when_thinking_disabled(

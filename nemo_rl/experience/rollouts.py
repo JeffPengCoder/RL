@@ -2006,10 +2006,55 @@ def apply_reward_penalties(
     return counts
 
 
+def _resolve_nemo_gym_sampling(
+    generation_config: GenerationConfig, *, generation_only: bool
+) -> dict[str, float | int]:
+    """Resolve the pinned training or training-time evaluation profile."""
+    sampling: dict[str, float | int] = {
+        "temperature": generation_config["temperature"],
+        "top_p": generation_config["top_p"],
+        "max_new_tokens": generation_config["max_new_tokens"],
+    }
+    if generation_only:
+        vllm_cfg = generation_config.get("vllm_cfg", {})
+        evaluation_sampling = vllm_cfg.get("http_server_evaluation_sampling")
+        if evaluation_sampling is not None:
+            unknown = set(evaluation_sampling) - set(sampling)
+            if unknown:
+                raise ValueError(
+                    "Unknown NeMo-Gym evaluation sampling fields: "
+                    + ", ".join(sorted(unknown))
+                )
+            sampling.update(evaluation_sampling)
+
+    temperature = sampling["temperature"]
+    top_p = sampling["top_p"]
+    max_new_tokens = sampling["max_new_tokens"]
+    if not isinstance(temperature, (int, float)) or temperature < 0:
+        raise ValueError("NeMo-Gym temperature must be a non-negative number")
+    if not isinstance(top_p, (int, float)) or not 0 < top_p <= 1:
+        raise ValueError("NeMo-Gym top_p must be in (0, 1]")
+    if (
+        isinstance(max_new_tokens, bool)
+        or not isinstance(max_new_tokens, int)
+        or max_new_tokens <= 0
+    ):
+        raise ValueError("NeMo-Gym max_new_tokens must be a positive integer")
+    return sampling
+
+
 def _prepare_nemo_gym_rows(
-    rows: list[dict], generation_config: GenerationConfig
+    rows: list[dict],
+    generation_config: GenerationConfig,
+    *,
+    generation_only: bool,
 ) -> None:
-    """Apply NeMo-RL sampling parameters and stable row indices in place."""
+    """Stamp scheduler purpose, sampling parameters and stable row indices."""
+    purpose_metadata_key = "nemo_rl_rollout_purpose"
+    rollout_purpose = "evaluation" if generation_only else "training"
+    sampling = _resolve_nemo_gym_sampling(
+        generation_config, generation_only=generation_only
+    )
     for row_index, row in enumerate(rows):
         responses_create_params = row.get("responses_create_params")
         if not isinstance(responses_create_params, dict):
@@ -2017,9 +2062,33 @@ def _prepare_nemo_gym_rows(
                 "Each NeMo-Gym row must contain a responses_create_params dict"
             )
 
-        responses_create_params["temperature"] = generation_config["temperature"]
-        responses_create_params["top_p"] = generation_config["top_p"]
-        configured_max_tokens = generation_config["max_new_tokens"]
+        existing_purpose = row.get("rollout_purpose")
+        if existing_purpose is not None and existing_purpose != rollout_purpose:
+            raise ValueError(
+                "NeMo-Gym row rollout_purpose conflicts with the scheduler: "
+                f"row={existing_purpose!r}, scheduler={rollout_purpose!r}"
+            )
+        row["rollout_purpose"] = rollout_purpose
+        metadata = responses_create_params.get("metadata")
+        if metadata is None:
+            metadata = {}
+            responses_create_params["metadata"] = metadata
+        if not isinstance(metadata, dict):
+            raise TypeError("responses_create_params.metadata must be a dict")
+        metadata_purpose = metadata.get(purpose_metadata_key)
+        if metadata_purpose is not None and metadata_purpose != rollout_purpose:
+            raise ValueError(
+                "NeMo-Gym metadata rollout_purpose conflicts with the scheduler: "
+                f"metadata={metadata_purpose!r}, scheduler={rollout_purpose!r}"
+            )
+        # Keep a redundant carrier inside a field understood by every generic
+        # /run schema. Some distributed agent boundaries reconstruct only the
+        # standard responses_create_params model and can discard an otherwise
+        # valid top-level extension. The agent must cross-check both carriers.
+        metadata[purpose_metadata_key] = rollout_purpose
+        responses_create_params["temperature"] = sampling["temperature"]
+        responses_create_params["top_p"] = sampling["top_p"]
+        configured_max_tokens = sampling["max_new_tokens"]
         row_max_tokens = responses_create_params.get("max_output_tokens")
         responses_create_params["max_output_tokens"] = (
             min(row_max_tokens, configured_max_tokens)
@@ -2027,6 +2096,15 @@ def _prepare_nemo_gym_rows(
             else configured_max_tokens
         )
         row["_rowidx"] = row_index
+
+    print(
+        "NEMO_RL_ROLLOUT_PURPOSE_STAMP|"
+        f"purpose={rollout_purpose}|rows={len(rows)}|"
+        f"temperature={sampling['temperature']}|top_p={sampling['top_p']}|"
+        f"max_new_tokens={sampling['max_new_tokens']}|"
+        "carriers=top_level,metadata",
+        flush=True,
+    )
 
 
 def _tensorize_nemo_gym_result(result: dict) -> None:
@@ -2168,7 +2246,11 @@ async def run_async_nemo_gym_rollout(
     run_rollouts_timer_label = f"{timer_prefix}/run_rollouts"
 
     with timer.time(total_timer_label):
-        _prepare_nemo_gym_rows(nemo_gym_rows, generation_config)
+        _prepare_nemo_gym_rows(
+            nemo_gym_rows,
+            generation_config,
+            generation_only=generation_only,
+        )
         accumulator = _NemoGymStreamAccumulator(
             rows=nemo_gym_rows,
             num_generations=num_generations,

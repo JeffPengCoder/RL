@@ -12,15 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import copy
+import functools
 import gc
 import logging
 import os
 import re
 import time
+import traceback
 import warnings
 from collections import OrderedDict, defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from typing import Any, Iterable, Iterator, Optional, TypeVar, cast
+from typing import Any, Callable, Iterable, Iterator, Optional, ParamSpec, TypeVar, cast
 
 log = logging.getLogger(__name__)
 
@@ -112,6 +114,44 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
 )
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
+ActorParams = ParamSpec("ActorParams")
+ActorResult = TypeVar("ActorResult")
+
+
+def _raise_portable_actor_error(
+    operation: str,
+) -> Callable[
+    [Callable[ActorParams, ActorResult]], Callable[ActorParams, ActorResult]
+]:
+    """Convert dependency-specific actor errors into driver-safe exceptions.
+
+    Policy actors run in a Megatron-specific Ray Python environment, while the
+    lightweight driver intentionally need not install Megatron.  Ray otherwise
+    pickles the original exception class; the driver can then fail importing
+    ``megatron`` and hide the actor traceback that matters.  Successful return
+    values are untouched.
+    """
+
+    def decorate(
+        function: Callable[ActorParams, ActorResult],
+    ) -> Callable[ActorParams, ActorResult]:
+        @functools.wraps(function)
+        def wrapped(
+            *args: ActorParams.args, **kwargs: ActorParams.kwargs
+        ) -> ActorResult:
+            try:
+                return function(*args, **kwargs)
+            except Exception as error:
+                error_type = f"{type(error).__module__}.{type(error).__name__}"
+                formatted_traceback = traceback.format_exc()
+                raise RuntimeError(
+                    f"Remote Megatron actor operation {operation!r} failed with "
+                    f"{error_type}: {error}\n{formatted_traceback}"
+                ) from None
+
+        return wrapped
+
+    return decorate
 
 
 def _should_use_router_replay(
@@ -1582,6 +1622,7 @@ class MegatronPolicyWorkerImpl(
         self.optimizer.zero_grad()
         self._train_step_state = None
 
+    @_raise_portable_actor_error("get_logprobs")
     @wrap_with_nvtx_name("megatron_policy_worker/get_logprobs")
     def get_logprobs(
         self,

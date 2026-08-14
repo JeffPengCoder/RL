@@ -23,7 +23,7 @@ from nemo_rl.environments.generation_contract import (
     validate_runtime_generation_contract,
     validate_training_admission_contract,
 )
-from nemo_rl.environments.nemo_gym import _stamp_context_compaction_rollout_ids
+from nemo_rl.environments.nemo_gym import _stamp_trajectory_rollout_ids
 
 
 class _BackendTokenizer:
@@ -233,10 +233,10 @@ def test_rollout_stamp_carries_bound_runtime_contract():
         }
     ]
 
-    _stamp_context_compaction_rollout_ids(
+    _stamp_trajectory_rollout_ids(
         rows,
         rollout_batch_index=99,
         runtime_contract=runtime,
     )
 
-    assert rows[0]["context_compaction_runtime_contract"] == runtime
+    assert rows[0]["trajectory_runtime_contract"] == runtime

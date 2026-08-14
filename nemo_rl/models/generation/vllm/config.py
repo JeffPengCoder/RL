@@ -23,6 +23,14 @@ VllmRefitSelector = Literal["vllm_s3_sparse", "vllm_zmq_sparse", "nixl", "nccl_r
 VLLM_SPARSE_REFIT_TRANSPORTS = frozenset({"vllm_s3_sparse", "vllm_zmq_sparse"})
 
 
+class HttpServerEvaluationSampling(TypedDict):
+    """Allowed sampling parameters for scheduler-marked evaluation calls."""
+
+    temperature: float
+    top_p: float
+    max_new_tokens: int
+
+
 class VllmSpecificArgs(TypedDict):
     tensor_parallel_size: int
     pipeline_parallel_size: int
@@ -62,6 +70,9 @@ class VllmSpecificArgs(TypedDict):
     zmq_refit_server_port: NotRequired[int | None]
     # These kwargs are passed to the vllm.LLM HTTP server Chat Completions endpoint config. Typically this will include things like tool parser, chat template, etc
     http_server_serving_chat_kwargs: NotRequired[dict[str, Any]]
+    # NeMo-Gym training calls must match the on-policy generation settings.
+    # Scheduler-marked evaluation calls may use this separately pinned profile.
+    http_server_evaluation_sampling: NotRequired[HttpServerEvaluationSampling]
     # Miscellaneous top level vLLM HTTP server arguments.
     # A filepath that can be imported to register a vLLM tool parser
     tool_parser_plugin: NotRequired[str]

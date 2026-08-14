@@ -34,6 +34,10 @@ logger = logging.getLogger(__name__)
 class ClusterConfig(TypedDict):
     gpus_per_node: int
     num_nodes: int
+    # Optional Ray custom-resource names used to pin non-colocated training
+    # and inference placement groups to nodes registered for those roles.
+    training_node_resource: NotRequired[str | None]
+    inference_node_resource: NotRequired[str | None]
     # Port range for the distributed master address (TCPStore / NCCL rendezvous)
     # and per-worker available ports used by RayVirtualCluster.  These ports are
     # kept below the OS ephemeral range (32768-60999 on stock Linux) to avoid

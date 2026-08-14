@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import hashlib
+import importlib
 import json
 import math
 import os
@@ -50,6 +51,7 @@ from nemo_rl.environments.generation_contract import (
     bind_runtime_generation_contract,
     build_training_admission_contract,
     canonical_digest,
+    stable_id,
     validate_runtime_generation_contract,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
@@ -76,6 +78,9 @@ DEFAULT_INVALID_TOOL_CALL_PATTERNS = [
 ]
 DEFAULT_THINKING_TAGS = ["<think>", "</think>"]
 
+_NEMO_GYM_EXTRA_ROOTS_ENV = "NEMO_GYM_EXTRA_ROOTS"
+_NEMO_GYM_ALLOWED_COMPONENT_ROOTS_ENV = "NEMO_GYM_ALLOWED_COMPONENT_ROOTS"
+
 _EXACT_TRACE_RESPONSE_PROJECTION_FIELDS = (
     "id",
     "status",
@@ -83,10 +88,14 @@ _EXACT_TRACE_RESPONSE_PROJECTION_FIELDS = (
     "incomplete_details",
     "usage",
     "output",
+    "trajectory_contract",
+    "trajectory_model_calls",
+    "model_call_summaries",
     "context_compaction_contract",
     "chunk_records",
     "boundary_events",
     "guard_records",
+    "trajectory_transitions",
 )
 _MEDIA_PART_TYPES = frozenset({"input_image", "image", "image_url"})
 
@@ -124,6 +133,86 @@ def get_nemo_gym_venv_dir() -> str | None:
     return os.environ.get("NEMO_GYM_VENV_DIR")
 
 
+def configure_nemo_gym_component_roots() -> Path:
+    """Pin Gym component discovery to this NeMo-RL checkout's Gym gitlink.
+
+    NeMo-RL can run newer source from a mounted checkout while the container
+    still contains an older ``/opt/nemo-rl`` tree.  The imported ``nemo_gym``
+    package and Gym's component discovery are independent provenance layers,
+    so either can otherwise resolve back to that stale image tree.  Make the
+    checkout paired with this module authoritative for both layers, and ask
+    Gym to reject server paths outside explicitly allowed roots.
+    """
+    nemo_rl_root = Path(__file__).resolve().parents[2]
+    gym_root = nemo_rl_root / "3rdparty" / "Gym-workspace" / "Gym"
+    required_markers = (
+        gym_root / "pyproject.toml",
+        gym_root / "nemo_gym",
+        gym_root / "responses_api_agents",
+        gym_root / "responses_api_models",
+    )
+    missing = [str(path) for path in required_markers if not path.exists()]
+    if missing:
+        raise RuntimeError(
+            "NeMo-RL's paired Gym checkout is incomplete; refusing to discover "
+            f"components from another installation. root={gym_root}, missing={missing}"
+        )
+
+    resolved_gym_root = gym_root.resolve()
+    existing_roots = [
+        Path(value).resolve()
+        for value in os.environ.get(_NEMO_GYM_EXTRA_ROOTS_ENV, "").split(os.pathsep)
+        if value
+    ]
+    ordered_roots = [resolved_gym_root, *existing_roots]
+    deduplicated_roots = list(dict.fromkeys(ordered_roots))
+    serialized_roots = os.pathsep.join(str(path) for path in deduplicated_roots)
+    os.environ[_NEMO_GYM_EXTRA_ROOTS_ENV] = serialized_roots
+    os.environ[_NEMO_GYM_ALLOWED_COMPONENT_ROOTS_ENV] = serialized_roots
+
+    sys.path[:] = [
+        str(resolved_gym_root),
+        *[
+            entry
+            for entry in sys.path
+            if Path(entry or os.curdir).resolve() != resolved_gym_root
+        ],
+    ]
+    importlib.invalidate_caches()
+    loaded_package = sys.modules.get("nemo_gym")
+    if loaded_package is None:
+        loaded_package = importlib.import_module("nemo_gym")
+
+    package_file_value = getattr(loaded_package, "__file__", None)
+    package_file = (
+        Path(package_file_value).resolve() if package_file_value is not None else None
+    )
+    expected_package_root = resolved_gym_root / "nemo_gym"
+    if package_file is None or not package_file.is_relative_to(expected_package_root):
+        print(
+            "NEMO_RL_GYM_RUNTIME_IDENTITY|status=reject|"
+            f"package={package_file or 'none'}|expected_root={expected_package_root}",
+            flush=True,
+        )
+        raise RuntimeError(
+            "The nemo_gym package was imported outside NeMo-RL's paired Gym "
+            "checkout; refusing a mixed source stack. "
+            f"package={package_file}, expected_root={expected_package_root}"
+        )
+
+    print(
+        "NEMO_RL_GYM_COMPONENT_ROOT|"
+        f"authoritative={resolved_gym_root}|allowed_roots={serialized_roots}",
+        flush=True,
+    )
+    print(
+        "NEMO_RL_GYM_RUNTIME_IDENTITY|status=accept|"
+        f"package={package_file}|component_root={resolved_gym_root}",
+        flush=True,
+    )
+    return resolved_gym_root
+
+
 class NemoGymConfig(TypedDict):
     model_name: str
     base_urls: List[str]
@@ -152,7 +241,7 @@ class NemoGymConfig(TypedDict):
     tokenizer_config: NotRequired[
         Optional[TokenizerConfig]
     ]  # For processor reconstruction inside the actor
-    context_compaction_runtime_contract: NotRequired[
+    trajectory_runtime_contract: NotRequired[
         Optional[Dict[str, Any]]
     ]  # Launcher-owned model/tokenizer/template/processor identity
 
@@ -193,6 +282,8 @@ def _project_semantic_value(value: Any) -> Any:
                 "prompt_token_ids",
                 "generation_token_ids",
                 "generation_log_probs",
+                "sampled_token_ids",
+                "sampled_logprobs",
                 "routed_experts",
             }
             and not (
@@ -202,6 +293,457 @@ def _project_semantic_value(value: Any) -> Any:
             )
         }
     return value
+
+
+def _validate_trajectory_transitions(
+    transitions: Any,
+    *,
+    trajectory_contract: Any,
+    trajectory_model_calls: Any,
+    model_call_summaries: Any,
+    completion_evidence: list[dict[str, Any]],
+    media_assets: Any,
+) -> None:
+    """Validate model-independent env transitions and exact-call references."""
+    if trajectory_contract is None:
+        if (
+            transitions is not None
+            or trajectory_model_calls is not None
+            or model_call_summaries is not None
+        ):
+            raise ValueError("Gym trajectory details require a trajectory_contract")
+        return
+    if not isinstance(trajectory_contract, dict):
+        raise TypeError("trajectory_contract must be a mapping")
+    if (
+        trajectory_contract.get("schema_version") != 2
+        or trajectory_contract.get("mode") != "osworld_semantic_trajectory"
+    ):
+        raise ValueError("Unsupported OSWorld trajectory contract")
+    contract_id = trajectory_contract.get("trajectory_contract_id")
+    contract_without_id = {
+        key: value
+        for key, value in trajectory_contract.items()
+        if key != "trajectory_contract_id"
+    }
+    if contract_id != stable_id("trajectory-contract", contract_without_id):
+        raise ValueError("OSWorld trajectory contract identity is corrupted")
+    for field in (
+        "trajectory_id",
+        "rollout_id",
+        "group_id",
+        "task_id",
+        "model_name",
+    ):
+        if (
+            not isinstance(trajectory_contract.get(field), str)
+            or not (trajectory_contract[field])
+        ):
+            raise ValueError(f"OSWorld trajectory contract has no {field}")
+    if trajectory_contract.get("identity_source") not in {"caller", "derived"}:
+        raise ValueError("OSWorld trajectory contract has invalid identity_source")
+    identity = {
+        field: trajectory_contract[field]
+        for field in (
+            "rollout_id",
+            "group_id",
+            "task_id",
+            "rollout_index",
+            "attempt_index",
+            "identity_source",
+        )
+    }
+    if trajectory_contract["trajectory_id"] != stable_id(
+        "trajectory",
+        identity,
+        trajectory_contract["model_name"],
+    ):
+        raise ValueError("OSWorld semantic trajectory identity is corrupted")
+    for field in (
+        "rollout_index",
+        "attempt_index",
+        "transition_count",
+        "model_call_count",
+    ):
+        value = trajectory_contract.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"OSWorld trajectory contract has invalid {field}")
+    capabilities = trajectory_contract.get("capabilities")
+    if not isinstance(capabilities, dict):
+        raise ValueError("OSWorld trajectory contract has no capabilities")
+    for field in (
+        "semantic_trajectory",
+        "exact_model_call_evidence",
+        "arbitrary_prompt_rewrites",
+        "trainable_token_reconstruction",
+    ):
+        if not isinstance(capabilities.get(field), bool):
+            raise ValueError(f"OSWorld trajectory capability {field!r} must be boolean")
+    if capabilities["semantic_trajectory"] is not True:
+        raise ValueError("OSWorld trajectory contract disables semantic trajectory")
+    exact_evidence = capabilities["exact_model_call_evidence"]
+    if capabilities["arbitrary_prompt_rewrites"] != exact_evidence:
+        raise ValueError("OSWorld trajectory rewrite capability is inconsistent")
+    if capabilities["trainable_token_reconstruction"] != exact_evidence:
+        raise ValueError("OSWorld trajectory reconstruction capability is inconsistent")
+    eligibility = trajectory_contract.get("training_eligibility")
+    if not isinstance(eligibility, dict):
+        raise ValueError("OSWorld trajectory contract has no training eligibility")
+    if eligibility.get("status") not in {"requires_runtime_admission", "ineligible"}:
+        raise ValueError("OSWorld trajectory training eligibility has invalid status")
+    reasons = eligibility.get("incomplete_reasons")
+    if not isinstance(reasons, list) or not all(
+        isinstance(reason, str) and reason for reason in reasons
+    ):
+        raise ValueError("OSWorld trajectory eligibility reasons are invalid")
+    if eligibility["status"] == "requires_runtime_admission" and (
+        not exact_evidence
+        or trajectory_contract.get("identity_source") != "caller"
+        or reasons
+    ):
+        raise ValueError(
+            "OSWorld trajectory claims invalid runtime admission eligibility"
+        )
+
+    if not isinstance(transitions, list):
+        raise TypeError("trajectory_transitions must be a list")
+    if len(transitions) != trajectory_contract["transition_count"]:
+        raise ValueError(
+            "Trajectory transition count does not match its contract: "
+            f"transitions={len(transitions)} "
+            f"contract={trajectory_contract['transition_count']}"
+        )
+    if not isinstance(trajectory_model_calls, list):
+        raise TypeError("trajectory_model_calls must be a list")
+    if len(trajectory_model_calls) != trajectory_contract["model_call_count"]:
+        raise ValueError(
+            "Trajectory model-call count does not match the trajectory contract"
+        )
+
+    if not isinstance(media_assets, dict):
+        raise TypeError("OSWorld trajectory media_assets must be a mapping")
+    for media_id, asset in media_assets.items():
+        if not isinstance(media_id, str) or not isinstance(asset, dict):
+            raise TypeError("OSWorld trajectory media asset is invalid")
+        source_part = asset.get("source_part")
+        if (
+            not isinstance(source_part, dict)
+            or asset.get("media_id") != media_id
+            or asset.get("content_digest") != canonical_digest(source_part)
+            or media_id != f"media-{canonical_digest(source_part)[:24]}"
+        ):
+            raise ValueError(
+                f"OSWorld trajectory media asset {media_id!r} is corrupted"
+            )
+
+    summary_by_id: dict[str, dict[str, Any]] = {}
+    for call_index, model_call in enumerate(trajectory_model_calls):
+        if not isinstance(model_call, dict):
+            raise TypeError(f"trajectory_model_calls[{call_index}] must be a mapping")
+        model_call_id = model_call.get("model_call_id")
+        if not isinstance(model_call_id, str) or not model_call_id:
+            raise ValueError(f"trajectory_model_calls[{call_index}] has no identity")
+        if model_call_id in summary_by_id:
+            raise ValueError(f"Duplicate model-call identity {model_call_id!r}")
+        if model_call.get("turn_id") != call_index + 1:
+            raise ValueError(
+                f"trajectory_model_calls[{call_index}] has invalid turn_id"
+            )
+        environment_step = model_call.get("environment_step")
+        if (
+            isinstance(environment_step, bool)
+            or not isinstance(environment_step, int)
+            or environment_step < 0
+        ):
+            raise ValueError(
+                f"trajectory_model_calls[{call_index}] has invalid environment_step"
+            )
+        parse_attempt = model_call.get("parse_attempt")
+        if (
+            isinstance(parse_attempt, bool)
+            or not isinstance(parse_attempt, int)
+            or parse_attempt <= 0
+        ):
+            raise ValueError(
+                f"trajectory_model_calls[{call_index}] has invalid parse_attempt"
+            )
+        if not isinstance(model_call.get("accepted"), bool):
+            raise TypeError(
+                f"trajectory_model_calls[{call_index}].accepted must be boolean"
+            )
+        if model_call.get("parse_error") is not None and not isinstance(
+            model_call.get("parse_error"), str
+        ):
+            raise TypeError(
+                f"trajectory_model_calls[{call_index}].parse_error must be a string or None"
+            )
+        state = model_call.get("state")
+        action = model_call.get("action")
+        generation_evidence = model_call.get("generation_evidence")
+        if (
+            not isinstance(state, dict)
+            or not isinstance(state.get("prompt_messages"), list)
+            or not isinstance(state.get("media_ids"), list)
+            or not all(
+                isinstance(media_id, str) and media_id in media_assets
+                for media_id in state["media_ids"]
+            )
+        ):
+            raise TypeError(f"trajectory_model_calls[{call_index}].state is invalid")
+        prompt_media_ids = [
+            part["media_id"]
+            for message in state["prompt_messages"]
+            if isinstance(message, dict)
+            for part in (
+                message.get("content")
+                if isinstance(message.get("content"), list)
+                else []
+            )
+            if isinstance(part, dict) and isinstance(part.get("media_id"), str)
+        ]
+        if prompt_media_ids != state["media_ids"]:
+            raise ValueError(
+                f"trajectory_model_calls[{call_index}] prompt media order is invalid"
+            )
+        if (
+            not isinstance(action, dict)
+            or not isinstance(action.get("raw_completion"), str)
+            or not isinstance(action.get("parsed_actions"), list)
+        ):
+            raise TypeError(f"trajectory_model_calls[{call_index}].action is invalid")
+        if not isinstance(generation_evidence, dict) or not isinstance(
+            generation_evidence.get("exact"), bool
+        ):
+            raise TypeError(
+                f"trajectory_model_calls[{call_index}].generation_evidence is invalid"
+            )
+        reward = model_call.get("reward")
+        if (
+            isinstance(reward, bool)
+            or not isinstance(reward, (int, float))
+            or not math.isfinite(float(reward))
+        ):
+            raise TypeError(
+                f"trajectory_model_calls[{call_index}].reward must be finite"
+            )
+        for field in ("done", "eligible"):
+            if not isinstance(model_call.get(field), bool):
+                raise TypeError(
+                    f"trajectory_model_calls[{call_index}].{field} must be boolean"
+                )
+        summary_by_id[model_call_id] = model_call
+    if exact_evidence and any(
+        model_call["generation_evidence"]["exact"] is not True
+        for model_call in trajectory_model_calls
+    ):
+        raise ValueError("Exact OSWorld trajectory contains an inexact model call")
+
+    if model_call_summaries is not None:
+        if not isinstance(model_call_summaries, list) or len(
+            model_call_summaries
+        ) != len(trajectory_model_calls):
+            raise ValueError("Compatibility model-call summaries are inconsistent")
+        for call_index, (summary, model_call) in enumerate(
+            zip(model_call_summaries, trajectory_model_calls)
+        ):
+            if not isinstance(summary, dict):
+                raise TypeError(f"model_call_summaries[{call_index}] must be a mapping")
+            expected = {
+                "model_call_id": model_call["model_call_id"],
+                "turn_id": model_call["turn_id"],
+                "environment_step": model_call["environment_step"],
+                "parse_attempt": model_call["parse_attempt"],
+                "accepted": model_call["accepted"],
+                "parse_error": model_call["parse_error"],
+                "exact_evidence": model_call["generation_evidence"]["exact"],
+            }
+            if summary != expected:
+                raise ValueError(
+                    f"model_call_summaries[{call_index}] disagrees with its record"
+                )
+
+    referenced_call_ids: list[str] = []
+    transition_by_call_id: dict[str, dict[str, Any]] = {}
+    seen_transition_ids: set[str] = set()
+    for transition_index, transition in enumerate(transitions):
+        if not isinstance(transition, dict):
+            raise TypeError(
+                f"trajectory_transitions[{transition_index}] must be a mapping"
+            )
+        transition_id = transition.get("transition_id")
+        if not isinstance(transition_id, str) or not transition_id:
+            raise ValueError(
+                f"trajectory_transitions[{transition_index}] has no identity"
+            )
+        if transition_id in seen_transition_ids:
+            raise ValueError(f"Duplicate trajectory transition {transition_id!r}")
+        seen_transition_ids.add(transition_id)
+        if transition_id != stable_id(
+            "transition",
+            trajectory_contract["trajectory_id"],
+            transition_index,
+        ):
+            raise ValueError(
+                f"trajectory_transitions[{transition_index}] identity is corrupted"
+            )
+        if transition.get("turn_id") != transition_index + 1:
+            raise ValueError(
+                f"trajectory_transitions[{transition_index}] has invalid turn_id"
+            )
+        state = transition.get("state")
+        action = transition.get("action")
+        next_state = transition.get("next_state")
+        if (
+            not isinstance(state, dict)
+            or not isinstance(action, dict)
+            or not isinstance(next_state, dict)
+        ):
+            raise TypeError(
+                f"trajectory_transitions[{transition_index}] requires mapping "
+                "state/action/next_state"
+            )
+        if not isinstance(state.get("observation"), dict) or not isinstance(
+            next_state.get("observation"), dict
+        ):
+            raise TypeError(
+                f"trajectory_transitions[{transition_index}] has invalid observation"
+            )
+        model_call_ids = state.get("model_call_ids")
+        if not isinstance(model_call_ids, list) or not all(
+            isinstance(call_id, str) and call_id for call_id in model_call_ids
+        ):
+            raise TypeError(
+                f"trajectory_transitions[{transition_index}] has invalid model_call_ids"
+            )
+        for model_call_id in model_call_ids:
+            if model_call_id not in summary_by_id:
+                raise ValueError(
+                    f"Trajectory references unknown model call {model_call_id!r}"
+                )
+            if model_call_id in transition_by_call_id:
+                raise ValueError(
+                    f"Model call {model_call_id!r} belongs to multiple transitions"
+                )
+            transition_by_call_id[model_call_id] = transition
+            referenced_call_ids.append(model_call_id)
+            model_call = summary_by_id[model_call_id]
+            if model_call_id != stable_id(
+                "model-call",
+                trajectory_contract["trajectory_id"],
+                transition_index,
+                model_call["parse_attempt"],
+            ):
+                raise ValueError(f"Model call {model_call_id!r} identity is corrupted")
+            for field in ("reward", "done", "eligible"):
+                if model_call[field] != transition[field]:
+                    raise ValueError(
+                        f"Model call {model_call_id!r} {field} disagrees with its transition"
+                    )
+        accepted_model_call_id = action.get("accepted_model_call_id")
+        if (
+            accepted_model_call_id is not None
+            and accepted_model_call_id not in model_call_ids
+        ):
+            raise ValueError(
+                f"trajectory_transitions[{transition_index}] accepts an unreferenced model call"
+            )
+        accepted_call_ids = [
+            model_call_id
+            for model_call_id in model_call_ids
+            if summary_by_id[model_call_id]["accepted"]
+        ]
+        expected_accepted_call_id = accepted_call_ids[-1] if accepted_call_ids else None
+        if (
+            len(accepted_call_ids) > 1
+            or accepted_model_call_id != expected_accepted_call_id
+        ):
+            raise ValueError(
+                f"trajectory_transitions[{transition_index}] has inconsistent accepted model call"
+            )
+        if not isinstance(action.get("raw_completion"), str):
+            raise TypeError(
+                f"trajectory_transitions[{transition_index}].action.raw_completion must be a string"
+            )
+        if not isinstance(action.get("parsed_actions"), list):
+            raise TypeError(
+                f"trajectory_transitions[{transition_index}].action.parsed_actions must be a list"
+            )
+        reward = transition.get("reward")
+        if isinstance(reward, bool) or not isinstance(reward, (int, float)):
+            raise TypeError(
+                f"trajectory_transitions[{transition_index}].reward must be numeric"
+            )
+        if not math.isfinite(float(reward)):
+            raise ValueError(
+                f"trajectory_transitions[{transition_index}].reward must be finite"
+            )
+        if not isinstance(transition.get("done"), bool):
+            raise TypeError(
+                f"trajectory_transitions[{transition_index}].done must be boolean"
+            )
+        if not isinstance(transition.get("eligible"), bool):
+            raise TypeError(
+                f"trajectory_transitions[{transition_index}].eligible must be boolean"
+            )
+    if set(referenced_call_ids) != set(summary_by_id):
+        missing = sorted(set(summary_by_id) - set(referenced_call_ids))
+        raise ValueError(f"Trajectory does not reference model calls: {missing!r}")
+
+    if exact_evidence:
+        evidence_by_call_id: dict[str, dict[str, Any]] = {}
+        for call_index, evidence in enumerate(completion_evidence):
+            model_call_id = evidence.get("model_call_id")
+            if not isinstance(model_call_id, str) or not model_call_id:
+                raise ValueError(
+                    f"completion_evidence[{call_index}] has no model_call_id"
+                )
+            if model_call_id in evidence_by_call_id:
+                raise ValueError(f"Duplicate exact model call {model_call_id!r}")
+            evidence_by_call_id[model_call_id] = evidence
+        if set(evidence_by_call_id) != set(summary_by_id):
+            raise ValueError(
+                "Exact completion evidence does not match trajectory model calls"
+            )
+        for model_call_id, evidence in evidence_by_call_id.items():
+            transition = transition_by_call_id[model_call_id]
+            if evidence.get("eligible") != transition.get("eligible"):
+                raise ValueError(
+                    f"Model call {model_call_id!r} eligibility disagrees with its transition"
+                )
+            model_call = summary_by_id[model_call_id]
+            generation_evidence = model_call["generation_evidence"]
+            expected_arrays = {
+                "prompt_token_ids": evidence.get("prompt_token_ids"),
+                "generation_token_ids": evidence.get("sampled_token_ids"),
+                "generation_log_probs": evidence.get("sampled_logprobs"),
+            }
+            observed_arrays = {
+                field: generation_evidence.get(field) for field in expected_arrays
+            }
+            if observed_arrays != expected_arrays:
+                raise ValueError(
+                    f"Model call {model_call_id!r} generation evidence is inconsistent"
+                )
+            if model_call["state"]["media_ids"] != evidence.get("media_ids"):
+                raise ValueError(
+                    f"Model call {model_call_id!r} media order is inconsistent"
+                )
+            for record_field, evidence_field in (
+                ("environment_step", "environment_step"),
+                ("parse_attempt", "parse_attempt"),
+                ("accepted", "accepted"),
+                ("parse_error", "parse_error"),
+            ):
+                if model_call[record_field] != evidence.get(evidence_field):
+                    raise ValueError(
+                        f"Model call {model_call_id!r} {record_field} is inconsistent"
+                    )
+            if generation_evidence.get("finish_reason") != evidence.get(
+                "finish_reason"
+            ):
+                raise ValueError(
+                    f"Model call {model_call_id!r} finish reason is inconsistent"
+                )
 
 
 def _build_exact_trace_full_result_projection(
@@ -223,7 +765,7 @@ def _build_exact_trace_full_result_projection(
     response_projection = {
         key: (
             _project_semantic_value(response[key])
-            if key == "output"
+            if key in {"output", "trajectory_model_calls"}
             else deepcopy(response[key])
         )
         for key in _EXACT_TRACE_RESPONSE_PROJECTION_FIELDS
@@ -497,62 +1039,53 @@ def _attach_multimodal_data_to_user_message(
         )
 
 
-def _stamp_context_compaction_rollout_ids(
+def _stamp_trajectory_rollout_ids(
     rows: list[dict[str, Any]],
     *,
     rollout_batch_index: int,
     runtime_contract: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """Stamp caller-owned logical rollout IDs before Gym dispatch."""
+    """Stamp caller-owned logical rollout IDs before Gym dispatch.
+
+    New integrations use the model-independent ``trajectory_identity`` object.
+    The flattened context-compaction fields remain readable for the existing
+    Arash recipes, but they are no longer the OSWorld contract boundary.
+    """
     if runtime_contract is not None:
         validate_runtime_generation_contract(runtime_contract)
     stamped_ids: set[str] = set()
     for row in rows:
+        generic_identity = row.get("trajectory_identity")
         contract_version = row.get("context_compaction_contract_version")
-        if contract_version is None:
-            if runtime_contract is not None:
-                raise ValueError(
-                    "Context-compaction training rows require "
-                    "context_compaction_contract_version"
-                )
-            continue
-        if contract_version not in {1, 2}:
+        if generic_identity is not None and contract_version is not None:
             raise ValueError(
-                "Unsupported context compaction row contract version: "
-                f"{contract_version!r}"
+                "Rows must use trajectory_identity or legacy context-compaction "
+                "identity fields, not both"
             )
-        row_index = row.get("_rowidx")
-        group_id = row.get("context_compaction_group_id")
-        if (
-            not isinstance(row_index, int)
-            or not isinstance(group_id, str)
-            or not group_id
-        ):
-            raise ValueError(
-                "Context compaction rows require an integer _rowidx and a "
-                "non-empty context_compaction_group_id"
-            )
-        if contract_version == 1:
-            rollout_id = (
-                f"{group_id}:batch-{rollout_batch_index:06d}:row-{row_index:06d}"
-            )
-        else:
-            task_id = row.get("context_compaction_task_id")
-            rollout_index = row.get("context_compaction_rollout_index")
-            attempt_index = row.get("context_compaction_attempt_index")
+        if generic_identity is not None:
+            if not isinstance(generic_identity, dict):
+                raise TypeError("trajectory_identity must be a mapping")
+            if generic_identity.get("schema_version") != 1:
+                raise ValueError("Unsupported trajectory_identity schema_version")
+            group_id = generic_identity.get("group_id")
+            task_id = generic_identity.get("task_id")
+            rollout_index = generic_identity.get("rollout_index")
+            attempt_index = generic_identity.get("attempt_index")
             if (
-                not isinstance(task_id, str)
+                not isinstance(group_id, str)
+                or not group_id
+                or not isinstance(task_id, str)
                 or not task_id
+                or isinstance(rollout_index, bool)
                 or not isinstance(rollout_index, int)
                 or rollout_index < 0
+                or isinstance(attempt_index, bool)
                 or not isinstance(attempt_index, int)
                 or attempt_index < 0
             ):
                 raise ValueError(
-                    "Version 2 context compaction rows require a non-empty "
-                    "context_compaction_task_id and non-negative integer "
-                    "context_compaction_rollout_index and "
-                    "context_compaction_attempt_index"
+                    "trajectory_identity requires non-empty group_id/task_id and "
+                    "non-negative integer rollout_index/attempt_index"
                 )
             identity = json.dumps(
                 {
@@ -566,12 +1099,106 @@ def _stamp_context_compaction_rollout_ids(
             )
             digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
             rollout_id = f"rollout-{digest[:24]}"
+            generic_identity["rollout_id"] = rollout_id
+        elif contract_version is None:
+            if runtime_contract is not None:
+                raise ValueError(
+                    "Trace-aware training rows require trajectory_identity "
+                    "(or a legacy context_compaction contract)"
+                )
+            continue
+        elif contract_version not in {1, 2}:
+            raise ValueError(
+                "Unsupported context compaction row contract version: "
+                f"{contract_version!r}"
+            )
+        if generic_identity is None:
+            row_index = row.get("_rowidx")
+            group_id = row.get("context_compaction_group_id")
+            if (
+                not isinstance(row_index, int)
+                or not isinstance(group_id, str)
+                or not group_id
+            ):
+                raise ValueError(
+                    "Context compaction rows require an integer _rowidx and a "
+                    "non-empty context_compaction_group_id"
+                )
+            if contract_version == 1:
+                rollout_id = (
+                    f"{group_id}:batch-{rollout_batch_index:06d}:row-{row_index:06d}"
+                )
+            else:
+                task_id = row.get("context_compaction_task_id")
+                rollout_index = row.get("context_compaction_rollout_index")
+                attempt_index = row.get("context_compaction_attempt_index")
+                if (
+                    not isinstance(task_id, str)
+                    or not task_id
+                    or not isinstance(rollout_index, int)
+                    or rollout_index < 0
+                    or not isinstance(attempt_index, int)
+                    or attempt_index < 0
+                ):
+                    raise ValueError(
+                        "Version 2 context compaction rows require a non-empty "
+                        "context_compaction_task_id and non-negative integer "
+                        "context_compaction_rollout_index and "
+                        "context_compaction_attempt_index"
+                    )
+                identity = json.dumps(
+                    {
+                        "task_id": task_id,
+                        "group_id": group_id,
+                        "rollout_index": rollout_index,
+                        "attempt_index": attempt_index,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+                rollout_id = f"rollout-{digest[:24]}"
         if rollout_id in stamped_ids:
             raise ValueError(f"Duplicate context compaction rollout ID {rollout_id!r}")
         stamped_ids.add(rollout_id)
-        row["context_compaction_rollout_id"] = rollout_id
+        if generic_identity is None:
+            row["context_compaction_rollout_id"] = rollout_id
         if runtime_contract is not None:
-            row["context_compaction_runtime_contract"] = runtime_contract
+            row["trajectory_runtime_contract"] = runtime_contract
+
+
+# Compatibility alias for the existing context-compaction tests and callers.
+_stamp_context_compaction_rollout_ids = _stamp_trajectory_rollout_ids
+
+
+def _validate_scheduler_rollout_purpose(
+    rows: list[dict], *, generation_only: bool
+) -> None:
+    """Fail before dispatch if scheduler intent was lost or rewritten."""
+    expected = "evaluation" if generation_only else "training"
+    for row_index, row in enumerate(rows):
+        observed = row.get("rollout_purpose")
+        if observed != expected:
+            raise ValueError(
+                "NeMo-Gym actor received a row with the wrong scheduler purpose: "
+                f"row={row_index}, observed={observed!r}, expected={expected!r}"
+            )
+        responses_create_params = row.get("responses_create_params")
+        metadata = (
+            responses_create_params.get("metadata")
+            if isinstance(responses_create_params, dict)
+            else None
+        )
+        metadata_purpose = (
+            metadata.get("nemo_rl_rollout_purpose")
+            if isinstance(metadata, dict)
+            else None
+        )
+        if metadata_purpose != expected:
+            raise ValueError(
+                "NeMo-Gym actor received a row with the wrong metadata purpose: "
+                f"row={row_index}, observed={metadata_purpose!r}, expected={expected!r}"
+            )
 
 
 @ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
@@ -584,13 +1211,19 @@ class NemoGym(EnvironmentInterface):
         # per rollout call) for full-trajectory multimodal postprocessing.
         self._processor: Optional[Any] = None
         self._rollout_batch_index = 0
-        self._context_compaction_runtime_contract = cfg.get(
-            "context_compaction_runtime_contract"
-        )
-        if self._context_compaction_runtime_contract is not None:
-            validate_runtime_generation_contract(
-                self._context_compaction_runtime_contract
+        self._trajectory_runtime_contract = cfg.get("trajectory_runtime_contract")
+        legacy_runtime_contract = cfg.get("context_compaction_runtime_contract")
+        if (
+            self._trajectory_runtime_contract is not None
+            and legacy_runtime_contract is not None
+        ):
+            raise ValueError(
+                "Configure trajectory_runtime_contract or its legacy alias, not both"
             )
+        if self._trajectory_runtime_contract is None:
+            self._trajectory_runtime_contract = legacy_runtime_contract
+        if self._trajectory_runtime_contract is not None:
+            validate_runtime_generation_contract(self._trajectory_runtime_contract)
         tokenizer_config = cfg.get("tokenizer_config")
         if tokenizer_config:
             from nemo_rl.algorithms.utils import get_tokenizer
@@ -609,6 +1242,7 @@ class NemoGym(EnvironmentInterface):
         _gym_port_high = self.cfg.get("port_range_high", DEFAULT_GYM_PORT_RANGE_HIGH)
         self.head_server_port = _get_free_port_local(_gym_port_low, _gym_port_high)
 
+        configure_nemo_gym_component_roots()
         from nemo_gym.cli import GlobalConfigDictParserConfig, RunHelper
         from nemo_gym.rollout_collection import RolloutCollectionHelper
         from nemo_gym.server_utils import HEAD_SERVER_KEY_NAME, BaseServerConfig
@@ -704,6 +1338,17 @@ Depending on your data shape, you may want to change these values."""
         if not nemo_gym_examples:
             raise ValueError("NeMo-Gym rollout batch must not be empty")
 
+        _validate_scheduler_rollout_purpose(
+            nemo_gym_examples, generation_only=generation_only
+        )
+        rollout_purpose = "evaluation" if generation_only else "training"
+        print(
+            "NEMO_RL_ROLLOUT_PURPOSE_DISPATCH|"
+            f"purpose={rollout_purpose}|rows={len(nemo_gym_examples)}|"
+            f"actor_batch={self._rollout_batch_index}",
+            flush=True,
+        )
+
         from nemo_rl.utils.fastokens import maybe_patch_fastokens
 
         maybe_patch_fastokens(bool(self.cfg.get("use_fastokens")))
@@ -718,20 +1363,17 @@ Depending on your data shape, you may want to change these values."""
         rollout_batch_index = self._rollout_batch_index
         self._rollout_batch_index += 1
         runtime_contract = None
-        if (
-            self._context_compaction_runtime_contract is not None
-            and not generation_only
-        ):
+        if self._trajectory_runtime_contract is not None and not generation_only:
             if generation_policy_version is None:
                 raise ValueError(
                     "Context-compaction training requires a synchronized "
                     "generation_policy_version"
                 )
             runtime_contract = bind_runtime_generation_contract(
-                self._context_compaction_runtime_contract,
+                self._trajectory_runtime_contract,
                 generation_policy_version=generation_policy_version,
             )
-        _stamp_context_compaction_rollout_ids(
+        _stamp_trajectory_rollout_ids(
             nemo_gym_examples,
             rollout_batch_index=rollout_batch_index,
             runtime_contract=runtime_contract,
@@ -813,8 +1455,12 @@ Depending on your data shape, you may want to change these values."""
 
         processor = getattr(self, "_processor", None)
         response = nemo_gym_result["response"]
+        trajectory_contract = response.get("trajectory_contract")
         contract = response.get("context_compaction_contract")
         exact_trace_authority = contract is not None
+        runtime_contract = nemo_gym_row.get("trajectory_runtime_contract")
+        if runtime_contract is None:
+            runtime_contract = nemo_gym_row.get("context_compaction_runtime_contract")
         if exact_trace_authority:
             if not isinstance(contract, dict):
                 raise TypeError("context_compaction_contract must be a mapping")
@@ -826,20 +1472,34 @@ Depending on your data shape, you may want to change these values."""
                 raise ValueError(
                     f"Unsupported context compaction response contract: {contract!r}"
                 )
-            expected_rollout_id = nemo_gym_row.get("context_compaction_rollout_id")
-            if not expected_rollout_id:
+            request_identity = nemo_gym_row.get("trajectory_identity")
+            if request_identity is not None and not isinstance(request_identity, dict):
+                raise TypeError("trajectory_identity must be a mapping")
+            expected_rollout_id = (
+                request_identity.get("rollout_id")
+                if request_identity is not None
+                else nemo_gym_row.get("context_compaction_rollout_id")
+            )
+            if not expected_rollout_id and not generation_only:
                 raise ValueError(
-                    "An exact-trace response requires a caller-stamped "
+                    "Exact-trace training requires a caller-stamped "
                     "context_compaction_rollout_id"
                 )
-            if contract.get("rollout_id") != expected_rollout_id:
+            if (
+                expected_rollout_id
+                and contract.get("rollout_id") != expected_rollout_id
+            ):
                 raise ValueError(
                     "Gym returned evidence for the wrong logical rollout: "
                     f"expected={expected_rollout_id!r}, "
                     f"observed={contract.get('rollout_id')!r}"
                 )
-            expected_group_id = nemo_gym_row.get("context_compaction_group_id")
-            if contract.get("group_id") != expected_group_id:
+            expected_group_id = (
+                request_identity.get("group_id")
+                if request_identity is not None
+                else nemo_gym_row.get("context_compaction_group_id")
+            )
+            if expected_rollout_id and contract.get("group_id") != expected_group_id:
                 raise ValueError(
                     "Gym returned the wrong context compaction group ID: "
                     f"expected={expected_group_id!r}, "
@@ -850,18 +1510,37 @@ Depending on your data shape, you may want to change these values."""
                 ("rollout_index", "context_compaction_rollout_index"),
                 ("attempt_index", "context_compaction_attempt_index"),
             ):
-                if contract.get(contract_field) != nemo_gym_row.get(row_field):
+                expected_value = (
+                    request_identity.get(contract_field)
+                    if request_identity is not None
+                    else nemo_gym_row.get(row_field)
+                )
+                if (
+                    expected_rollout_id
+                    and contract.get(contract_field) != expected_value
+                ):
                     raise ValueError(
                         "Gym returned the wrong context compaction "
                         f"{contract_field}: expected="
-                        f"{nemo_gym_row.get(row_field)!r}, observed="
+                        f"{expected_value!r}, observed="
                         f"{contract.get(contract_field)!r}"
                     )
             if not isinstance(contract.get("generation_contract"), dict):
                 raise ValueError(
                     "Version 2 exact-trace response is missing its generation contract"
                 )
-            runtime_contract = nemo_gym_row.get("context_compaction_runtime_contract")
+            if not generation_only and runtime_contract is None:
+                raise ValueError(
+                    "Exact OSWorld trajectories require trace-aware training "
+                    "with a runtime generation contract"
+                )
+            if runtime_contract is not None and contract.get("identity_source") not in {
+                None,
+                "caller",
+            }:
+                raise ValueError(
+                    "Exact-trace training rejects a Gym-derived rollout identity"
+                )
             training_admission = (
                 build_training_admission_contract(
                     contract["generation_contract"],
@@ -871,6 +1550,11 @@ Depending on your data shape, you may want to change these values."""
                 else None
             )
         else:
+            if runtime_contract is not None:
+                raise ValueError(
+                    "Trace-aware NeMo-RL requires exact model-call authority; "
+                    "Gym returned only semantic trajectory evidence"
+                )
             training_admission = None
 
         initial_input = response.get("agent_input")
@@ -906,6 +1590,50 @@ Depending on your data shape, you may want to change these values."""
                 f"evidence={len(completion_evidence)} "
                 f"calls={len(trainable_output_items)}"
             )
+        _validate_trajectory_transitions(
+            response.get("trajectory_transitions"),
+            trajectory_contract=trajectory_contract,
+            trajectory_model_calls=response.get("trajectory_model_calls"),
+            model_call_summaries=response.get("model_call_summaries"),
+            completion_evidence=completion_evidence,
+            media_assets=response.get("media_assets"),
+        )
+        if trajectory_contract is not None:
+            expected_model_name = self.cfg.get("model_name")
+            if (
+                expected_model_name is not None
+                and trajectory_contract["model_name"] != expected_model_name
+            ):
+                raise ValueError(
+                    "Gym trajectory was generated by the wrong model: "
+                    f"expected={expected_model_name!r}, "
+                    f"observed={trajectory_contract['model_name']!r}"
+                )
+            capabilities = trajectory_contract["capabilities"]
+            if capabilities["exact_model_call_evidence"] != exact_trace_authority:
+                raise ValueError(
+                    "Gym semantic trajectory and exact-trace authority disagree"
+                )
+            if exact_trace_authority:
+                if contract.get("trajectory_contract_id") != trajectory_contract.get(
+                    "trajectory_contract_id"
+                ):
+                    raise ValueError(
+                        "Gym exact evidence references the wrong trajectory contract"
+                    )
+                for field in (
+                    "rollout_id",
+                    "group_id",
+                    "task_id",
+                    "rollout_index",
+                    "attempt_index",
+                    "identity_source",
+                ):
+                    if contract.get(field) != trajectory_contract.get(field):
+                        raise ValueError(
+                            "Gym exact evidence disagrees with semantic trajectory "
+                            f"identity field {field!r}"
+                        )
 
         trace_calls = []
         for call_index, output_item in enumerate(trainable_output_items):
@@ -1025,6 +1753,8 @@ Depending on your data shape, you may want to change these values."""
         rollout_id = (
             contract["rollout_id"]
             if exact_trace_authority
+            else trajectory_contract["rollout_id"]
+            if trajectory_contract is not None
             else completion_evidence[0]["rollout_id"]
             if completion_evidence
             else f"nemo-gym-row-{nemo_gym_row.get('_rowidx', 0)}"
@@ -1045,7 +1775,13 @@ Depending on your data shape, you may want to change these values."""
             calls=trace_calls,
             boundary_events=response.get("boundary_events") or [],
             policy_name=policy_name,
-            group_id=(contract.get("group_id") if exact_trace_authority else None),
+            group_id=(
+                contract.get("group_id")
+                if exact_trace_authority
+                else trajectory_contract.get("group_id")
+                if trajectory_contract is not None
+                else None
+            ),
             source_row_index=nemo_gym_row.get("_rowidx"),
             reward=nemo_gym_result.get("reward"),
             media_assets=media_assets,
@@ -1231,6 +1967,24 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                 output_item_dict["generation_str"] = generation_str
 
         if not nemo_rl_message_log:
+            if generation_only and trajectory_contract is not None:
+                # Closed APIs and benchmark endpoints may expose the semantic
+                # prompt/action trajectory without tokenizer-level evidence.
+                # Keep collection/evaluation usable, but provide no assistant
+                # loss tokens and never admit this shape to training.
+                semantic_placeholder = {
+                    "role": "user",
+                    "content": "",
+                    "token_ids": torch.tensor([], dtype=torch.long),
+                }
+                nemo_gym_result["nemo_rl_trace_bundle"] = trace_bundle
+                return {
+                    "message_log": [semantic_placeholder],
+                    "input_message_log": [semantic_placeholder],
+                    "physical_message_logs": [],
+                    "rollout_trace_bundle": trace_bundle,
+                    "full_result": nemo_gym_result,
+                }
             input_messages = nemo_gym_result["responses_create_params"]["input"]
             try:
                 prompt_token_ids = tokenizer.apply_chat_template(
@@ -1387,7 +2141,7 @@ def spinup_nemo_gym_actor(
     enable_router_replay: bool,
     routed_experts_dtype: str,
     use_fastokens: bool,
-    context_compaction_runtime_contract: Optional[Dict[str, Any]] = None,
+    trajectory_runtime_contract: Optional[Dict[str, Any]] = None,
 ) -> Any:
     """Spin up the NeMo-Gym actor against the given generation server URLs.
 
@@ -1406,7 +2160,7 @@ def spinup_nemo_gym_actor(
             resolved by the caller from the model's expert count.
         use_fastokens: Forwarded from policy.tokenizer.use_fastokens so the rollout actor
             patches its tokenizer consistently with the driver.
-        context_compaction_runtime_contract: Launcher-owned generation identity
+        trajectory_runtime_contract: Launcher-owned generation identity
             bound to a synchronized policy version for exact-trace training.
 
     Returns:
@@ -1419,6 +2173,7 @@ def spinup_nemo_gym_actor(
     invalid_tool_call_patterns = nemo_gym_dict.pop("invalid_tool_call_patterns", None)
     thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
     tokenizer_config = nemo_gym_dict.pop("tokenizer_config", None)
+    nemo_gym_dict.pop("is_trajectory_collection", None)
 
     # Pass prebuilt cache + venv dirs through the global config so the gym reuses
     # image-baked venvs instead of rebuilding them.
@@ -1438,7 +2193,7 @@ def spinup_nemo_gym_actor(
         require_routed_experts=enable_router_replay,
         routed_experts_dtype=routed_experts_dtype,
         use_fastokens=use_fastokens,
-        context_compaction_runtime_contract=context_compaction_runtime_contract,
+        trajectory_runtime_contract=trajectory_runtime_contract,
         initial_global_config_dict=nemo_gym_dict,
     )
 

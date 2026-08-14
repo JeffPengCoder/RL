@@ -20,14 +20,40 @@ from typing import Any, List, Tuple
 import torch
 
 
+_MAX_PACKED_TENSOR_SIZE_BYTES = 5 * 1024**3
+
+
 @lru_cache(maxsize=1)
 def get_target_packed_tensor_size():
+    """Return one packed-buffer size shared by every collective rank.
+
+    A heterogeneous collective must set ``NRL_REFIT_BUFFER_SIZE_BYTES``:
+    deriving the buffer from each rank's local GPU memory can otherwise make
+    producer and consumer execute different collective shapes or counts.
+    """
+    explicit_size = os.getenv("NRL_REFIT_BUFFER_SIZE_BYTES")
+    if explicit_size is not None:
+        try:
+            size_bytes = int(explicit_size)
+        except ValueError as exc:
+            raise ValueError(
+                f"NRL_REFIT_BUFFER_SIZE_BYTES must be an integer, got {explicit_size!r}"
+            ) from exc
+        if not 0 < size_bytes <= _MAX_PACKED_TENSOR_SIZE_BYTES:
+            raise ValueError(
+                "NRL_REFIT_BUFFER_SIZE_BYTES must be in the range "
+                f"[1, {_MAX_PACKED_TENSOR_SIZE_BYTES}], got {size_bytes}"
+            )
+        return size_bytes
+
     memory_ratio = os.getenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "0.02")
     device = torch.device("cuda")
     props = torch.cuda.get_device_properties(device)
     total_memory_bytes = props.total_memory
-    # max size is 5GB
-    target_size = min(int(total_memory_bytes * float(memory_ratio)), 5 * 1024**3)
+    target_size = min(
+        int(total_memory_bytes * float(memory_ratio)),
+        _MAX_PACKED_TENSOR_SIZE_BYTES,
+    )
     return target_size
 
 

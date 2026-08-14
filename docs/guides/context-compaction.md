@@ -11,6 +11,12 @@ multimodal test agent, including 100-turn generation and synchronous and
 asynchronous GRPO training, and with OSWorld running real Ubuntu desktop VMs
 through the Cell 2 OpenSandbox SDK.
 
+The OSWorld integration, exact state/action/reward evidence contract, and its
+qualification runbook live in
+[`osworld-exact-trace-training.md`](osworld-exact-trace-training.md). That
+integration is wired for a real computer-use qualification but has not yet
+completed the GPU end-to-end gates described there.
+
 ## Code and validated runtime
 
 The public draft PRs are:
@@ -233,7 +239,7 @@ model call, never inside a model turn. The materialized view is then frozen for
 the rest of that chunk unless a configured token, image, or vision-token guard
 closes the chunk early. Guard-triggered closes are recorded in the trace.
 
-Training must explicitly opt in:
+The legacy scripted compaction recipe explicitly opts in:
 
 ```yaml
 grpo:
@@ -245,6 +251,12 @@ One logical rollout may become several physical training traces. All physical
 traces retain the rollout's advantage, while loss normalization, scheduler
 progress, and the optimizer boundary continue to use logical-rollout
 semantics.
+
+The OSWorld integration uses the more general `trajectory_identity` data
+contract. NeMo-RL detects that contract and selects the same physical-trace
+trainer automatically; Gym does not receive a training-mode or turn-strategy
+switch. Benchmark/trajectory collection still emits semantic trajectories but
+does not activate runtime training admission.
 
 ## Dummy data
 

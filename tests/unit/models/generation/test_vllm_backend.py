@@ -16,6 +16,7 @@
 # inside the test bodies (which are marked @pytest.mark.vllm). This keeps the
 # module collectable in the non-vllm unit lane, where these tests are deselected.
 
+import builtins
 import contextlib
 import json
 from types import SimpleNamespace
@@ -85,6 +86,34 @@ def _patch_vllm_postload(monkeypatch):
         process_weights,
     )
     return process_weights
+
+
+@pytest.mark.vllm
+def test_load_hf_weights_does_not_import_fp8_for_unquantized_model(monkeypatch):
+    """The ordinary BF16 refit path must not depend on FP8-only vLLM symbols."""
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        VllmInternalWorkerExtension,
+    )
+
+    ext = VllmInternalWorkerExtension.__new__(VllmInternalWorkerExtension)
+    ext.model_runner = SimpleNamespace(
+        vllm_config=SimpleNamespace(quant_config=None),
+    )
+    ext._load_full_hf_weights = MagicMock()
+
+    original_import = builtins.__import__
+
+    def reject_fp8_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "nemo_rl.models.generation.vllm.quantization" and "fp8" in fromlist:
+            raise AssertionError("unquantized refit imported the optional FP8 module")
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", reject_fp8_import)
+
+    weights = [("model.weight", object())]
+    ext._load_hf_weights(weights)
+
+    ext._load_full_hf_weights.assert_called_once_with(weights)
 
 
 def _make_mtp_refit_extension(

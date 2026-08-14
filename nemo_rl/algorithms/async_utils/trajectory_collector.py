@@ -434,10 +434,10 @@ class AsyncTrajectoryCollector:
             # not only to the source prompt. Stamp it even when CC training is
             # disabled so contract-v2 rollout IDs remain unique and stable.
             from nemo_rl.algorithms.grpo import (
-                _assign_context_compaction_generation_replica_indices,
+                _assign_trajectory_generation_replica_indices,
             )
 
-            _assign_context_compaction_generation_replica_indices(
+            _assign_trajectory_generation_replica_indices(
                 repeated_batch,
                 num_generations_per_prompt=num_generations,
             )

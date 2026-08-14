@@ -35,10 +35,12 @@ from nemo_rl.algorithms.grpo import (
     MasterConfig,
     RewardPenaltyConfig,
     RewardScalingConfig,
+    _add_role_node_resource,
+    _auto_enable_trajectory_training,
     _apply_configured_message_level_advantage_penalties,
     _apply_mask_sample_filter,
     _apply_message_level_advantage_penalties,
-    _assign_context_compaction_generation_replica_indices,
+    _assign_trajectory_generation_replica_indices,
     _context_compaction_batch_quantum,
     _dedup_cc_replay_groups,
     _get_grpo_save_state,
@@ -87,6 +89,23 @@ def _mock_policy_generation() -> MagicMock:
     policy_generation.requires_kv_scale_sync = False
     policy_generation.get_logger_metrics.return_value = {}
     return policy_generation
+
+
+def test_add_role_node_resource_creates_and_merges_constraints():
+    assert _add_role_node_resource(None, 2, "nrl_trainer_node") == [
+        {"nrl_trainer_node": 0.001},
+        {"nrl_trainer_node": 0.001},
+    ]
+    assert _add_role_node_resource(
+        [{"nvlink_domain_a": 0.001}], 1, "nrl_vllm_node"
+    ) == [{"nvlink_domain_a": 0.001, "nrl_vllm_node": 0.001}]
+
+
+def test_add_role_node_resource_rejects_invalid_input():
+    with pytest.raises(ValueError, match="must not be empty"):
+        _add_role_node_resource(None, 1, " ")
+    with pytest.raises(ValueError, match="Expected 2"):
+        _add_role_node_resource([{}], 2, "nrl_trainer_node")
 
 
 @patch("nemo_rl.algorithms.grpo.ray")
@@ -199,28 +218,81 @@ def test_initial_policy_generation_stale() -> None:
     assert _initial_policy_generation_stale(generation, completed_steps=0)
 
 
-def test_context_compaction_generation_replicas_receive_unique_stable_indices():
+def test_trajectory_generation_replicas_receive_unique_stable_indices():
     repeated_batch = BatchedDataDict(
         {
             "extra_env_info": [
                 {
-                    "context_compaction_contract_version": 2,
-                    "context_compaction_rollout_index": base_index,
+                    "trajectory_identity": {
+                        "schema_version": 1,
+                        "group_id": "group",
+                        "task_id": f"task-{base_index}",
+                        "rollout_index": base_index,
+                        "attempt_index": 0,
+                    }
                 }
                 for base_index in (4, 4, 7, 7)
             ]
         }
     )
 
-    _assign_context_compaction_generation_replica_indices(
+    _assign_trajectory_generation_replica_indices(
         repeated_batch,
         num_generations_per_prompt=2,
     )
 
     assert [
-        row["context_compaction_rollout_index"]
+        row["trajectory_identity"]["rollout_index"]
         for row in repeated_batch["extra_env_info"]
     ] == [8, 9, 14, 15]
+
+
+def test_trajectory_identity_automatically_selects_trace_training():
+    class _Dataset:
+        def __len__(self):
+            return 1
+
+        def __getitem__(self, index):
+            assert index == 0
+            return {
+                "extra_env_info": {
+                    "trajectory_identity": {
+                        "schema_version": 1,
+                        "group_id": "group",
+                        "task_id": "task",
+                        "rollout_index": 0,
+                        "attempt_index": 0,
+                    }
+                }
+            }
+
+    config = SimpleNamespace(
+        env={"nemo_gym": {}},
+        grpo={"context_compaction_training": {"enabled": False}},
+    )
+
+    _auto_enable_trajectory_training(config, _Dataset())
+
+    assert config.grpo["context_compaction_training"]["enabled"] is True
+
+
+def test_trajectory_collection_does_not_activate_training_admission():
+    class _Dataset:
+        def __len__(self):
+            return 1
+
+        def __getitem__(self, index):
+            assert index == 0
+            return {"extra_env_info": {"trajectory_identity": {}}}
+
+    config = SimpleNamespace(
+        env={"nemo_gym": {"is_trajectory_collection": True}},
+        grpo={"context_compaction_training": {"enabled": False}},
+    )
+
+    _auto_enable_trajectory_training(config, _Dataset())
+
+    assert config.grpo["context_compaction_training"]["enabled"] is False
 
 
 @pytest.fixture
