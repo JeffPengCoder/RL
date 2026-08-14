@@ -122,8 +122,10 @@ def test_configure_nemo_gym_component_roots_pins_paired_checkout(monkeypatch):
     assert os.environ["NEMO_GYM_EXTRA_ROOTS"] == expected
     assert os.environ["NEMO_GYM_ALLOWED_COMPONENT_ROOTS"] == expected
     assert Path(sys.path[0]).resolve() == paired_root
-    assert Path(sys.modules["nemo_gym"].__file__).resolve().is_relative_to(
-        paired_root / "nemo_gym"
+    assert (
+        Path(sys.modules["nemo_gym"].__file__)
+        .resolve()
+        .is_relative_to(paired_root / "nemo_gym")
     )
 
 
