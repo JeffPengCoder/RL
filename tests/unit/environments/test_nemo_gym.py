@@ -46,6 +46,7 @@ from nemo_rl.environments.nemo_gym import (
     setup_nemo_gym_config,
     validate_reward_components_match_scalar,
 )
+from nemo_rl.experience.rollout_identity import scope_trajectory_identities
 from nemo_rl.models.generation.vllm import VllmGeneration
 
 # cluster and tokenizer are fixture imports
@@ -210,6 +211,8 @@ def _test_trajectory_contract(
     model_call_count: int,
     exact: bool = True,
     identity_source: str = "caller",
+    sampling_event_id: str | None = None,
+    source_group_id: str | None = None,
 ) -> dict:
     reasons = []
     status = "requires_runtime_admission"
@@ -227,6 +230,10 @@ def _test_trajectory_contract(
         "attempt_index": 0,
         "identity_source": identity_source,
     }
+    if sampling_event_id is not None:
+        identity["sampling_event_id"] = sampling_event_id
+    if source_group_id is not None:
+        identity["source_group_id"] = source_group_id
     model_name = "test-model"
     contract = {
         "schema_version": 2,
@@ -693,6 +700,8 @@ def test_nemo_gym_postprocess_builds_exact_compacted_trace_bundle():
         rollout_id=rollout_id,
         transition_count=2,
         model_call_count=2,
+        sampling_event_id="sampling-training-001",
+        source_group_id="dataset-group-001",
     )
     model_call_ids = [
         stable_id(
@@ -792,6 +801,8 @@ def test_nemo_gym_postprocess_builds_exact_compacted_trace_bundle():
                 "rollout_index": 3,
                 "attempt_index": 0,
                 "identity_source": "caller",
+                "sampling_event_id": "sampling-training-001",
+                "source_group_id": "dataset-group-001",
                 "trajectory_contract_id": trajectory_contract["trajectory_contract_id"],
                 "generation_contract": _TEST_GENERATION_CONTRACT,
             },
@@ -866,9 +877,20 @@ def test_nemo_gym_postprocess_builds_exact_compacted_trace_bundle():
                     "generation_log_probs": [-0.2],
                 },
             ],
+            "execution_context": {
+                "schema_version": 1,
+                "execution_id": "execution-trace-001",
+                "sampling_event_id": "sampling-training-001",
+                "source_group_id": "dataset-group-001",
+                "rollout_id": rollout_id,
+                "group_id": "group-cc",
+                "task_id": "task-cc",
+            },
         },
         "responses_create_params": {"input": []},
         "reward": 0.75,
+        "_ng_execution_id": "execution-trace-001",
+        "verifier_metadata": {"osworld_execution_id": "execution-trace-001"},
     }
     result_payload["response"]["trajectory_transitions"] = [
         {
@@ -902,12 +924,15 @@ def test_nemo_gym_postprocess_builds_exact_compacted_trace_bundle():
         "_rowidx": 3,
         "trajectory_identity": {
             "schema_version": 1,
+            "sampling_event_id": "sampling-training-001",
+            "source_group_id": "dataset-group-001",
             "rollout_id": rollout_id,
             "group_id": "group-cc",
             "task_id": "task-cc",
             "rollout_index": 3,
             "attempt_index": 0,
         },
+        "_ng_execution_id": "execution-trace-001",
         "trajectory_runtime_contract": _test_runtime_contract(),
     }
 
@@ -942,6 +967,9 @@ def test_nemo_gym_postprocess_builds_exact_compacted_trace_bundle():
     assert bundle["checks"]["ok"]
     assert bundle["rollout_id"] == rollout_id
     assert bundle["group_id"] == "group-cc"
+    assert bundle["sampling_event_id"] == "sampling-training-001"
+    assert bundle["source_group_id"] == "dataset-group-001"
+    assert "execution_id" not in json.dumps(bundle, sort_keys=True)
     assert bundle["source_row_index"] == 3
     assert bundle["reward"] == 0.75
     assert [trace["source_turn_ids"] for trace in bundle["physical_traces"]] == [
@@ -982,6 +1010,9 @@ def test_nemo_gym_postprocess_builds_exact_compacted_trace_bundle():
         < 1.0
     )
     projected_response = result["full_result"]["response"]
+    assert projected_response["execution_context"]["execution_id"] == (
+        "execution-trace-001"
+    )
     projected_transitions = projected_response["trajectory_transitions"]
     assert projected_transitions[0]["action"] == {
         "raw_completion": "turn 1",
@@ -999,6 +1030,66 @@ def test_nemo_gym_postprocess_builds_exact_compacted_trace_bundle():
             "lineage_deltas",
         }
     )
+
+    missing_client_execution_stamp = deepcopy(result_payload)
+    missing_client_execution_stamp.pop("_ng_execution_id")
+    with pytest.raises(
+        ValueError,
+        match="wrong physical execution",
+    ):
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MockSelf(),
+            row,
+            missing_client_execution_stamp,
+            _Tokenizer(),
+            generation_only=True,
+        )
+
+    missing_execution_metadata = deepcopy(result_payload)
+    missing_execution_metadata.pop("verifier_metadata")
+    with pytest.raises(
+        ValueError,
+        match="verifier metadata disagrees",
+    ):
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MockSelf(),
+            row,
+            missing_execution_metadata,
+            _Tokenizer(),
+            generation_only=True,
+        )
+
+    wrong_execution_join = deepcopy(result_payload)
+    wrong_execution_join["response"]["execution_context"]["execution_id"] = (
+        "execution-wrong"
+    )
+    with pytest.raises(
+        ValueError,
+        match="execution_context disagrees with its request",
+    ):
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MockSelf(),
+            row,
+            wrong_execution_join,
+            _Tokenizer(),
+            generation_only=True,
+        )
+
+    wrong_logical_join = deepcopy(result_payload)
+    wrong_logical_join["response"]["execution_context"]["rollout_id"] = (
+        "rollout-wrong"
+    )
+    with pytest.raises(
+        ValueError,
+        match="execution_context disagrees with its request rollout_id",
+    ):
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MockSelf(),
+            row,
+            wrong_logical_join,
+            _Tokenizer(),
+            generation_only=True,
+        )
 
 
 def test_validate_trajectory_transitions_rejects_unknown_model_call_reference():
@@ -1330,8 +1421,28 @@ def test_v2_context_compaction_rollout_ids_are_retry_and_order_stable():
     assert new_attempt[0]["context_compaction_rollout_id"] != by_task["task-a"]
 
 
-def test_generic_trajectory_ids_are_retry_and_order_stable():
+def test_v2_training_identity_must_be_controller_event_scoped():
     rows = [
+        {
+            "_rowidx": 0,
+            "context_compaction_contract_version": 2,
+            "context_compaction_group_id": "group-cc",
+            "context_compaction_task_id": "task-a",
+            "context_compaction_rollout_index": 0,
+            "context_compaction_attempt_index": 0,
+        }
+    ]
+
+    with pytest.raises(ValueError, match="controller event-scoped"):
+        _stamp_trajectory_rollout_ids(
+            rows,
+            rollout_batch_index=4,
+            runtime_contract=_test_runtime_contract(),
+        )
+
+
+def test_generic_trajectory_ids_are_retry_and_order_stable():
+    source_rows = [
         {
             "_rowidx": 19,
             "trajectory_identity": {
@@ -1344,6 +1455,8 @@ def test_generic_trajectory_ids_are_retry_and_order_stable():
         }
         for task_id, rollout_index in (("task-a", 0), ("task-b", 1))
     ]
+    rows = deepcopy(source_rows)
+    scope_trajectory_identities(rows, sampling_event_id="sampling-training-first")
     reordered = [deepcopy(rows[1]), deepcopy(rows[0])]
 
     _stamp_trajectory_rollout_ids(rows, rollout_batch_index=4)
@@ -1359,10 +1472,20 @@ def test_generic_trajectory_ids_are_retry_and_order_stable():
     }
     assert by_task == reordered_by_task
 
-    new_attempt = deepcopy(rows[0])
+    new_attempt = deepcopy(source_rows[0])
     new_attempt["trajectory_identity"]["attempt_index"] = 1
+    scope_trajectory_identities(
+        [new_attempt], sampling_event_id="sampling-training-first"
+    )
     _stamp_trajectory_rollout_ids([new_attempt], rollout_batch_index=4)
     assert new_attempt["trajectory_identity"]["rollout_id"] != by_task["task-a"]
+
+    new_event = deepcopy(source_rows)
+    scope_trajectory_identities(new_event, sampling_event_id="sampling-training-second")
+    _stamp_trajectory_rollout_ids(new_event, rollout_batch_index=4)
+    assert {
+        row["trajectory_identity"]["rollout_id"] for row in new_event
+    }.isdisjoint(by_task.values())
 
 
 def test_index_per_turn_images_preserves_initial_and_observation_order():

@@ -1040,6 +1040,74 @@ def test_async_rollout_manager_stamps_training_rollout_purpose() -> None:
     )
 
 
+def test_async_rollout_manager_scopes_distinct_generation_replicas() -> None:
+    manager = object.__new__(AsyncNemoGymRolloutImpl)
+    manager._num_generations_per_prompt = 2
+    manager._generation_config = {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "max_new_tokens": 768,
+    }
+    input_sample = {
+        "extra_env_info": {
+            "responses_create_params": {"input": []},
+            "trajectory_identity": {
+                "schema_version": 1,
+                "group_id": "dataset-group",
+                "task_id": "task-1",
+                "rollout_index": 3,
+                "attempt_index": 0,
+            },
+        }
+    }
+
+    rows = manager._build_inputs(
+        input_sample,
+        sampling_event_id="sampling-async-training-test",
+    )
+
+    identities = [row["trajectory_identity"] for row in rows]
+    assert [identity["rollout_index"] for identity in identities] == [6, 7]
+    assert len({identity["rollout_id"] for identity in identities}) == 2
+    assert {identity["sampling_event_id"] for identity in identities} == {
+        "sampling-async-training-test"
+    }
+
+
+def test_async_rollout_manager_event_scopes_legacy_v2_replicas() -> None:
+    manager = object.__new__(AsyncNemoGymRolloutImpl)
+    manager._num_generations_per_prompt = 2
+    manager._generation_config = {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "max_new_tokens": 768,
+    }
+    input_sample = {
+        "extra_env_info": {
+            "responses_create_params": {"input": []},
+            "context_compaction_contract_version": 2,
+            "context_compaction_rollout_id": "rollout-static",
+            "context_compaction_group_id": "dataset-group",
+            "context_compaction_task_id": "task-1",
+            "context_compaction_rollout_index": 3,
+            "context_compaction_attempt_index": 0,
+        }
+    }
+
+    rows = manager._build_inputs(
+        input_sample,
+        sampling_event_id="sampling-async-training-legacy-v2",
+    )
+
+    identities = [row["trajectory_identity"] for row in rows]
+    assert [identity["rollout_index"] for identity in identities] == [6, 7]
+    assert len({identity["rollout_id"] for identity in identities}) == 2
+    assert {identity["sampling_event_id"] for identity in identities} == {
+        "sampling-async-training-legacy-v2"
+    }
+    assert all("context_compaction_contract_version" not in row for row in rows)
+
+
 def test_async_rollout_manager_rejects_evaluation_row() -> None:
     manager = object.__new__(AsyncNemoGymRolloutImpl)
     manager._num_generations_per_prompt = 1
@@ -1364,6 +1432,8 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
 
     assert [result.task_index for result in rollout_results] == [11, 10]
     assert captured_groups == [(11, [2, 3]), (10, [0, 1])]
+    assert all("_rowidx" not in row and "rollout_purpose" not in row for row in rows)
+    assert all(row["responses_create_params"] == {} for row in rows)
     assert rollout_results[-1].rollout_metrics["timing/remote"] == 1.0
     assert rollout_results[-1].rollout_metrics["timing/rollout/run_rollouts"] == 4.0
     assert rollout_results[-1].rollout_metrics["timing/rollout/total"] == 4.0
@@ -1681,6 +1751,7 @@ def test_run_async_nemo_gym_rollout(
     # Row 1: no per-agent override — should fall back to max_new_tokens.
     rows[0]["responses_create_params"]["max_output_tokens"] = max_new_tokens + 1
     assert "max_output_tokens" not in rows[1]["responses_create_params"]
+    source_rows = copy.deepcopy(rows)
 
     actual_result = run_nemo_gym_rollout_sync(
         policy_generation=nemo_gym_vllm_generation,
@@ -1692,8 +1763,10 @@ def test_run_async_nemo_gym_rollout(
         log_full_result_tables=True,
         max_rollout_turns=None,
     )
-    for row in rows:
-        assert row["responses_create_params"]["max_output_tokens"] == max_new_tokens
+    # Sampling parameters and event IDs are transport state. The dispatched
+    # copies are clamped, while the reusable source batch remains byte-for-byte
+    # unchanged for later validation/training events.
+    assert rows == source_rows
     actual_result = asdict(actual_result)
     actual_result["final_batch"] = actual_result["final_batch"].get_dict()
     assert len(actual_result["final_batch"]["physical_message_logs"]) == len(rows)

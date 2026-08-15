@@ -27,6 +27,10 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
+from nemo_rl.experience.rollout_identity import (
+    new_sampling_event_id,
+    scope_trajectory_identities,
+)
 from nemo_rl.experience.rollouts import (
     _attach_routed_experts_to_message_log_prefix,
     _dummy_routed_experts_for_tokens,
@@ -452,7 +456,10 @@ class AsyncNemoGymRolloutImpl:
         timer_prefix = "timing/rollout"
         timer.start(f"{timer_prefix}/total")
 
-        rollout_inputs = self._build_inputs(input_sample)
+        rollout_inputs = self._build_inputs(
+            input_sample,
+            sampling_event_id=new_sampling_event_id(purpose="async-training"),
+        )
         completions, prompt_message_log, rollout_metrics = await self._run_rollouts(
             rollout_inputs, timer, timer_prefix
         )
@@ -483,7 +490,12 @@ class AsyncNemoGymRolloutImpl:
             "Please set `max_rollout_turns` to 1."
         )
 
-    def _build_inputs(self, input_sample: DatumSpec) -> list[dict]:
+    def _build_inputs(
+        self,
+        input_sample: DatumSpec,
+        *,
+        sampling_event_id: str | None = None,
+    ) -> list[dict]:
         """Build N row dicts from input_sample, applying generation config params."""
         # Build a template row from the input_sample's extra_env_info, applying generation params.
         template_row: dict = copy.deepcopy(input_sample["extra_env_info"])  # type: ignore
@@ -515,7 +527,45 @@ class AsyncNemoGymRolloutImpl:
         for i in range(self._num_generations_per_prompt):
             row = copy.deepcopy(template_row)
             row["_rowidx"] = i
+            identity = row.get("trajectory_identity")
+            if identity is not None:
+                if not isinstance(identity, dict):
+                    raise TypeError("trajectory_identity must be a mapping")
+                base_rollout_index = identity.get("rollout_index")
+                if (
+                    isinstance(base_rollout_index, bool)
+                    or not isinstance(base_rollout_index, int)
+                    or base_rollout_index < 0
+                ):
+                    raise ValueError(
+                        "trajectory_identity.rollout_index must be a "
+                        "non-negative integer"
+                    )
+                identity["rollout_index"] = (
+                    base_rollout_index * self._num_generations_per_prompt + i
+                )
+                identity.pop("rollout_id", None)
+            elif row.get("context_compaction_contract_version") == 2:
+                base_rollout_index = row.get(
+                    "context_compaction_rollout_index"
+                )
+                if (
+                    isinstance(base_rollout_index, bool)
+                    or not isinstance(base_rollout_index, int)
+                    or base_rollout_index < 0
+                ):
+                    raise ValueError(
+                        "context_compaction_rollout_index must be a "
+                        "non-negative integer"
+                    )
+                row["context_compaction_rollout_index"] = (
+                    base_rollout_index * self._num_generations_per_prompt + i
+                )
+                row.pop("context_compaction_rollout_id", None)
             rows.append(row)
+        if sampling_event_id is None:
+            sampling_event_id = new_sampling_event_id(purpose="async-training")
+        scope_trajectory_identities(rows, sampling_event_id=sampling_event_id)
         return rows
 
     async def _run_rollouts(

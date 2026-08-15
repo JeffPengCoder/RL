@@ -5030,6 +5030,84 @@ class TestValidateFunction:
         assert "accuracy" in val_metrics
         assert "avg_length" in val_metrics
 
+    def test_validate_twice_uses_fresh_event_without_scoping_source_rows(
+        self,
+        mock_grpo_components,
+    ):
+        mock_policy_gen = MagicMock()
+        mock_tokenizer = MagicMock(pad_token_id=0)
+        source_row = {
+            "agent_ref": {"name": "osworld_agent"},
+            "trajectory_identity": {
+                "schema_version": 1,
+                "source_group_id": "dataset-group-001",
+                "task_id": "task-001",
+                "rollout_index": 0,
+                "attempt_index": 0,
+            },
+        }
+        source_batch = BatchedDataDict[DatumSpec](
+            {
+                "message_log": [[{"role": "user", "content": "test"}]],
+                "task_name": ["osworld"],
+                "extra_env_info": [source_row],
+                "total_reward": torch.tensor([1.0]),
+            }
+        )
+        mock_dataloader = MagicMock(spec=StatefulDataLoader)
+        mock_dataloader.__iter__ = MagicMock(
+            side_effect=lambda: iter([source_batch])
+        )
+        mock_config = mock_grpo_components["master_config"]
+        mock_config.grpo.val_batch_size = 1
+        mock_config.grpo.max_val_samples = 1
+        seen_events = []
+
+        def fake_rollout(*, input_batch, sampling_event_id, **kwargs):
+            dispatched_row = input_batch["extra_env_info"][0]
+            assert "sampling_event_id" not in dispatched_row
+            dispatched_row["sampling_event_id"] = sampling_event_id
+            seen_events.append(sampling_event_id)
+            return NemoGymRolloutResult(
+                input_ids=torch.tensor([[1]]),
+                final_batch=input_batch,
+                rollout_metrics={"mean_gen_tokens_per_sample": 1.0},
+                task_index=None,
+            )
+
+        with (
+            patch("nemo_rl.algorithms.grpo._should_use_nemo_gym", return_value=True),
+            patch(
+                "nemo_rl.algorithms.grpo.new_sampling_event_id",
+                side_effect=["sampling-validation-5", "sampling-validation-6"],
+            ),
+            patch(
+                "nemo_rl.algorithms.grpo.run_nemo_gym_rollout_sync",
+                side_effect=fake_rollout,
+            ),
+            patch("nemo_rl.algorithms.grpo.print_message_log_samples"),
+        ):
+            validate(
+                mock_policy_gen,
+                mock_dataloader,
+                mock_tokenizer,
+                None,
+                step=5,
+                master_config=mock_config,
+            )
+            validate(
+                mock_policy_gen,
+                mock_dataloader,
+                mock_tokenizer,
+                None,
+                step=6,
+                master_config=mock_config,
+            )
+
+        assert seen_events == ["sampling-validation-5", "sampling-validation-6"]
+        assert "sampling_event_id" not in source_row
+        assert "sampling_event_id" not in source_batch["extra_env_info"][0]
+
     def test_validate_returns_empty_when_no_dataloader(self, mock_grpo_components):
         """Test that validate returns empty dicts when no dataloader is provided."""
         mock_policy_gen = MagicMock()

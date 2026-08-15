@@ -1816,6 +1816,7 @@ class TestAsyncTrajectoryCollector:
             }
         )
         rollout_calls = 0
+        sampling_event_ids = []
 
         def _rollout_result(task_index):
             return SimpleNamespace(
@@ -1829,6 +1830,7 @@ class TestAsyncTrajectoryCollector:
             assert kwargs["generation_config"]["stop_token_ids"] is None
             assert kwargs["generation_config"]["stop_strings"] is None
             assert kwargs["log_full_result_tables"] is False
+            sampling_event_ids.append(kwargs["sampling_event_id"])
             rollout_calls += 1
             yield _rollout_result(7)
             if rollout_calls == 1:
@@ -1854,6 +1856,8 @@ class TestAsyncTrajectoryCollector:
         )
 
         assert rollout_calls == 2
+        assert len(set(sampling_event_ids)) == 1
+        assert sampling_event_ids[0].startswith("sampling-async-training-")
         assert replay_buffer.add.task_indices == [7, 8]
         assert target_weight not in collector._generating_targets
 

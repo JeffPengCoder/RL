@@ -19,6 +19,7 @@ import warnings
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
+from copy import deepcopy
 from dataclasses import dataclass, fields
 from typing import Any, Callable, Optional, TypeVar, cast
 
@@ -90,6 +91,7 @@ from nemo_rl.experience.interfaces import (
     NEMO_GYM_TASK_INDEX_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
 )
+from nemo_rl.experience.rollout_identity import new_sampling_event_id
 from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
     backfill_missing_routed_experts,
@@ -3370,6 +3372,10 @@ def grpo_train(
                                 if context_compaction_training
                                 else None
                             ),
+                            sampling_event_id=new_sampling_event_id(
+                                purpose="training",
+                                step=total_steps,
+                            ),
                         )
                         input_ids = nemo_gym_rollout_result.input_ids
                         repeated_batch = nemo_gym_rollout_result.final_batch
@@ -4367,6 +4373,10 @@ def validate(
         max_batches = (
             master_config.grpo.max_val_samples // master_config.grpo.val_batch_size
         )
+        validation_sampling_event_id = new_sampling_event_id(
+            purpose="validation",
+            step=step,
+        )
         for batch_idx, val_batch in enumerate(val_dataloader):
             if batch_idx >= max_batches:
                 break
@@ -4376,6 +4386,12 @@ def validate(
             # Use async rollouts when enabled by config/backend defaults.
             # We cascade NeMo-Gym first since NeMo-Gym also uses async rollouts.
             if _should_use_nemo_gym(master_config):
+                # StatefulDataLoader may yield the same nested row objects on a
+                # later validate() call. Sampling identity is event-scoped and
+                # must never be written back into those reusable source rows.
+                source_extra_env_info = val_batch["extra_env_info"]
+                val_batch = BatchedDataDict(dict(val_batch))
+                val_batch["extra_env_info"] = deepcopy(source_extra_env_info)
                 generation_config = master_config.policy["generation"]
                 nemo_gym_rollout_result = run_nemo_gym_rollout_sync(
                     policy_generation=policy_generation,
@@ -4397,6 +4413,7 @@ def validate(
                         master_config.env
                     ),
                     generation_only=True,
+                    sampling_event_id=validation_sampling_event_id,
                 )
                 val_batch = nemo_gym_rollout_result.final_batch
                 gen_metrics = nemo_gym_rollout_result.rollout_metrics

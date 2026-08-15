@@ -36,6 +36,7 @@ from nemo_rl.experience.interfaces import (
     NEMO_GYM_TASK_INDEX_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
 )
+from nemo_rl.experience.rollout_identity import new_sampling_event_id
 from nemo_rl.experience.rollouts import (
     RolloutGroupResult,
     run_async_multi_turn_rollout_groups,
@@ -441,6 +442,14 @@ class AsyncTrajectoryCollector:
                 repeated_batch,
                 num_generations_per_prompt=num_generations,
             )
+            sampling_event_id = (
+                new_sampling_event_id(
+                    purpose="async-training",
+                    step=generation_weight_version,
+                )
+                if use_nemo_gym
+                else None
+            )
 
             def _run_rollout_batch() -> None:
                 asyncio.run(
@@ -450,6 +459,7 @@ class AsyncTrajectoryCollector:
                         target_weight_version=reserved_target,
                         num_generations=num_generations,
                         use_nemo_gym=use_nemo_gym,
+                        sampling_event_id=sampling_event_id,
                     )
                 )
 
@@ -754,6 +764,7 @@ class AsyncTrajectoryCollector:
         num_generations: int,
         use_nemo_gym: bool,
         task_index_to_group_index: dict[int, int],
+        sampling_event_id: str | None = None,
     ) -> AsyncGenerator[RolloutGroupResult, None]:
         """Yield prompt groups from either backend through one result type."""
         if use_nemo_gym:
@@ -797,6 +808,7 @@ class AsyncTrajectoryCollector:
                     ).get("enabled", False)
                     else None
                 ),
+                sampling_event_id=sampling_event_id,
             ):
                 task_index = rollout_result.task_index
                 if task_index is None:
@@ -831,6 +843,7 @@ class AsyncTrajectoryCollector:
         target_weight_version: int,
         num_generations: int,
         use_nemo_gym: bool,
+        sampling_event_id: str | None = None,
     ) -> None:
         """Own one target reservation while collecting its rollout batch."""
         worker_start = time.perf_counter()
@@ -841,6 +854,7 @@ class AsyncTrajectoryCollector:
                 target_weight_version=target_weight_version,
                 num_generations=num_generations,
                 use_nemo_gym=use_nemo_gym,
+                sampling_event_id=sampling_event_id,
             )
         except Exception as error:
             self._efficiency_timer.record(
@@ -994,6 +1008,7 @@ class AsyncTrajectoryCollector:
         target_weight_version: int,
         num_generations: int,
         use_nemo_gym: bool,
+        sampling_event_id: str | None = None,
     ) -> None:
         """Run one backend batch and enqueue every completed prompt group."""
         collection_started_at = time.perf_counter()
@@ -1002,6 +1017,11 @@ class AsyncTrajectoryCollector:
                 "Rollout batch size must be divisible by a positive num_generations"
             )
         expected_prompt_groups = repeated_batch.size // num_generations
+        if use_nemo_gym and sampling_event_id is None:
+            sampling_event_id = new_sampling_event_id(
+                purpose="async-training",
+                step=generation_weight_version,
+            )
         expected_group_indices = set(range(expected_prompt_groups))
         task_index_to_group_index = (
             self._build_task_index_map(repeated_batch, num_generations)
@@ -1022,6 +1042,7 @@ class AsyncTrajectoryCollector:
                     num_generations=num_generations,
                     use_nemo_gym=use_nemo_gym,
                     task_index_to_group_index=task_index_to_group_index,
+                    sampling_event_id=sampling_event_id,
                 ):
                     group_index = rollout_result.group_index
                     if group_index not in expected_group_indices:

@@ -49,6 +49,10 @@ from nemo_rl.environments.interfaces import (
 from nemo_rl.environments.nemo_gym import DEFAULT_THINKING_TAGS
 from nemo_rl.experience.interfaces import NEMO_GYM_TASK_INDEX_KEY
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
+from nemo_rl.experience.rollout_identity import (
+    new_sampling_event_id,
+    scope_trajectory_identities,
+)
 from nemo_rl.models.generation.interfaces import (
     ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
     GenerationConfig,
@@ -2048,10 +2052,13 @@ def _prepare_nemo_gym_rows(
     generation_config: GenerationConfig,
     *,
     generation_only: bool,
+    sampling_event_id: str | None = None,
 ) -> None:
-    """Stamp scheduler purpose, sampling parameters and stable row indices."""
+    """Stamp scheduler intent, event identity, sampling and stable row indices."""
     purpose_metadata_key = "nemo_rl_rollout_purpose"
     rollout_purpose = "evaluation" if generation_only else "training"
+    if sampling_event_id is None:
+        sampling_event_id = new_sampling_event_id(purpose=rollout_purpose)
     sampling = _resolve_nemo_gym_sampling(
         generation_config, generation_only=generation_only
     )
@@ -2097,9 +2104,12 @@ def _prepare_nemo_gym_rows(
         )
         row["_rowidx"] = row_index
 
+    scope_trajectory_identities(rows, sampling_event_id=sampling_event_id)
+
     print(
         "NEMO_RL_ROLLOUT_PURPOSE_STAMP|"
         f"purpose={rollout_purpose}|rows={len(rows)}|"
+        f"sampling_event_id={sampling_event_id}|"
         f"temperature={sampling['temperature']}|top_p={sampling['top_p']}|"
         f"max_new_tokens={sampling['max_new_tokens']}|"
         "carriers=top_level,metadata",
@@ -2139,6 +2149,7 @@ async def run_async_nemo_gym_rollout(
     returns_entire_batch: bool = False,
     generation_only: bool = False,
     generation_policy_version: str | None = None,
+    sampling_event_id: str | None = None,
 ) -> AsyncGenerator[NemoGymRolloutResult, None]:
     """Stream complete NeMo-Gym prompt groups in group-completion order.
 
@@ -2173,6 +2184,9 @@ async def run_async_nemo_gym_rollout(
             to training (used by validation and generation qualification).
         generation_policy_version: Synchronized policy identity required by
             exact-trace training contracts.
+        sampling_event_id: Controller-owned identity for this logical sampling
+            decision. Stream retries must reuse it. Direct callers may omit it,
+            in which case this function allocates a fresh event.
 
     Yields:
         ``NemoGymRolloutResult`` objects in prompt-group completion order. Rows
@@ -2193,7 +2207,9 @@ async def run_async_nemo_gym_rollout(
     # We accept max_seq_len for API parity with the other rollout paths, but NeMo-Gym
     # still relies on the underlying model server's configured context/window limits.
     # We leverage the same `extra_env_info` key as `run_async_multi_turn_rollout`.
-    nemo_gym_rows = input_batch["extra_env_info"]
+    # Scheduler identity and sampling parameters are transport state, not
+    # dataset state. Never stamp them into a reusable dataloader batch.
+    nemo_gym_rows = copy.deepcopy(input_batch["extra_env_info"])
 
     # Handle generation parameters up front so we don't hide anything inside here to avoid being unintuitive to the user.
     # NeMo-Gym policy is "What you see is what you get".
@@ -2244,12 +2260,17 @@ async def run_async_nemo_gym_rollout(
     timer_prefix = "timing/rollout"
     total_timer_label = f"{timer_prefix}/total"
     run_rollouts_timer_label = f"{timer_prefix}/run_rollouts"
+    if sampling_event_id is None:
+        sampling_event_id = new_sampling_event_id(
+            purpose="evaluation" if generation_only else "training"
+        )
 
     with timer.time(total_timer_label):
         _prepare_nemo_gym_rows(
             nemo_gym_rows,
             generation_config,
             generation_only=generation_only,
+            sampling_event_id=sampling_event_id,
         )
         accumulator = _NemoGymStreamAccumulator(
             rows=nemo_gym_rows,
@@ -2345,6 +2366,7 @@ def run_nemo_gym_rollout_sync(
     mask_env_flagged_samples: bool = True,
     generation_only: bool = False,
     generation_policy_version: str | None = None,
+    sampling_event_id: str | None = None,
 ) -> NemoGymRolloutResult:
     """Run and return one complete NeMo-Gym batch synchronously.
 
@@ -2402,6 +2424,7 @@ def run_nemo_gym_rollout_sync(
             returns_entire_batch=True,
             generation_only=generation_only,
             generation_policy_version=generation_policy_version,
+            sampling_event_id=sampling_event_id,
         ):
             pass
         if rollout_result is None:

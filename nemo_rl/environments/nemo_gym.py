@@ -56,6 +56,7 @@ from nemo_rl.environments.generation_contract import (
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym_trace import build_rollout_trace_bundle
+from nemo_rl.experience.rollout_identity import event_group_id, logical_rollout_id
 from nemo_rl.models.policy import TokenizerConfig
 from nemo_rl.utils.routed_experts_codec import decode_routed_experts
 from nemo_rl.utils.timer import Timer
@@ -96,6 +97,7 @@ _EXACT_TRACE_RESPONSE_PROJECTION_FIELDS = (
     "boundary_events",
     "guard_records",
     "trajectory_transitions",
+    "execution_context",
 )
 _MEDIA_PART_TYPES = frozenset({"input_image", "image", "image_url"})
 
@@ -1087,18 +1089,51 @@ def _stamp_trajectory_rollout_ids(
                     "trajectory_identity requires non-empty group_id/task_id and "
                     "non-negative integer rollout_index/attempt_index"
                 )
-            identity = json.dumps(
-                {
-                    "task_id": task_id,
-                    "group_id": group_id,
-                    "rollout_index": rollout_index,
-                    "attempt_index": attempt_index,
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
-            rollout_id = f"rollout-{digest[:24]}"
+            sampling_event_id = generic_identity.get("sampling_event_id")
+            source_group_id = generic_identity.get("source_group_id")
+            if (sampling_event_id is None) != (source_group_id is None):
+                raise ValueError(
+                    "trajectory_identity sampling_event_id and source_group_id "
+                    "must be present together"
+                )
+            if sampling_event_id is not None:
+                expected_group_id = event_group_id(
+                    sampling_event_id=sampling_event_id,
+                    source_group_id=source_group_id,
+                )
+                if group_id != expected_group_id:
+                    raise ValueError(
+                        "Controller-scoped trajectory_identity has the wrong "
+                        f"group_id: expected={expected_group_id!r}, "
+                        f"observed={group_id!r}"
+                    )
+                rollout_id = logical_rollout_id(
+                    sampling_event_id=sampling_event_id,
+                    source_group_id=source_group_id,
+                    task_id=task_id,
+                    rollout_index=rollout_index,
+                    attempt_index=attempt_index,
+                )
+                observed_rollout_id = generic_identity.get("rollout_id")
+                if observed_rollout_id != rollout_id:
+                    raise ValueError(
+                        "Controller-scoped trajectory_identity has the wrong "
+                        f"rollout_id: expected={rollout_id!r}, "
+                        f"observed={observed_rollout_id!r}"
+                    )
+            else:
+                identity = json.dumps(
+                    {
+                        "task_id": task_id,
+                        "group_id": group_id,
+                        "rollout_index": rollout_index,
+                        "attempt_index": attempt_index,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+                rollout_id = f"rollout-{digest[:24]}"
             generic_identity["rollout_id"] = rollout_id
         elif contract_version is None:
             if runtime_contract is not None:
@@ -1111,6 +1146,11 @@ def _stamp_trajectory_rollout_ids(
             raise ValueError(
                 "Unsupported context compaction row contract version: "
                 f"{contract_version!r}"
+            )
+        elif contract_version == 2 and runtime_contract is not None:
+            raise ValueError(
+                "Legacy context-compaction v2 training rows must be normalized "
+                "to controller event-scoped trajectory_identity before dispatch"
             )
         if generic_identity is None:
             row_index = row.get("_rowidx")
@@ -1455,6 +1495,73 @@ Depending on your data shape, you may want to change these values."""
 
         processor = getattr(self, "_processor", None)
         response = nemo_gym_result["response"]
+        expected_execution_id = nemo_gym_row.get("_ng_execution_id")
+        observed_execution_id = nemo_gym_result.get("_ng_execution_id")
+        response_trajectory_contract = response.get("trajectory_contract")
+        verifier_metadata = nemo_gym_result.get("verifier_metadata")
+        is_osworld_response = (
+            isinstance(response_trajectory_contract, dict)
+            and response_trajectory_contract.get("mode")
+            == "osworld_semantic_trajectory"
+        ) or (
+            isinstance(response.get("id"), str)
+            and response["id"].startswith("osworld-")
+        )
+        if (
+            (expected_execution_id is None) != (observed_execution_id is None)
+            or observed_execution_id != expected_execution_id
+        ):
+            raise ValueError(
+                "Gym returned the wrong physical execution: "
+                f"expected={expected_execution_id!r}, "
+                f"observed={observed_execution_id!r}"
+            )
+        if expected_execution_id is not None and is_osworld_response:
+            execution_context = response.get("execution_context")
+            if (
+                not isinstance(execution_context, dict)
+                or execution_context.get("execution_id") != expected_execution_id
+            ):
+                raise ValueError(
+                    "Gym response execution_context disagrees with its request"
+                )
+            if (
+                not isinstance(verifier_metadata, dict)
+                or verifier_metadata.get("osworld_execution_id")
+                != expected_execution_id
+            ):
+                raise ValueError(
+                    "Gym verifier metadata disagrees with its request execution"
+                )
+            request_identity = nemo_gym_row.get("trajectory_identity")
+            if isinstance(request_identity, dict):
+                for field in (
+                    "sampling_event_id",
+                    "source_group_id",
+                    "rollout_id",
+                    "group_id",
+                    "task_id",
+                ):
+                    if execution_context.get(field) != request_identity.get(field):
+                        raise ValueError(
+                            "Gym response execution_context disagrees with its "
+                            f"request {field}"
+                        )
+            if isinstance(response_trajectory_contract, dict):
+                for field in (
+                    "sampling_event_id",
+                    "source_group_id",
+                    "rollout_id",
+                    "group_id",
+                    "task_id",
+                ):
+                    if execution_context.get(field) != response_trajectory_contract.get(
+                        field
+                    ):
+                        raise ValueError(
+                            "Gym response execution_context disagrees with its "
+                            f"trajectory contract {field}"
+                        )
         trajectory_contract = response.get("trajectory_contract")
         contract = response.get("context_compaction_contract")
         exact_trace_authority = contract is not None
@@ -1509,11 +1616,13 @@ Depending on your data shape, you may want to change these values."""
                 ("task_id", "context_compaction_task_id"),
                 ("rollout_index", "context_compaction_rollout_index"),
                 ("attempt_index", "context_compaction_attempt_index"),
+                ("sampling_event_id", None),
+                ("source_group_id", None),
             ):
                 expected_value = (
                     request_identity.get(contract_field)
                     if request_identity is not None
-                    else nemo_gym_row.get(row_field)
+                    else nemo_gym_row.get(row_field) if row_field is not None else None
                 )
                 if (
                     expected_rollout_id
@@ -1628,6 +1737,8 @@ Depending on your data shape, you may want to change these values."""
                     "rollout_index",
                     "attempt_index",
                     "identity_source",
+                    "sampling_event_id",
+                    "source_group_id",
                 ):
                     if contract.get(field) != trajectory_contract.get(field):
                         raise ValueError(
@@ -1779,6 +1890,20 @@ Depending on your data shape, you may want to change these values."""
                 contract.get("group_id")
                 if exact_trace_authority
                 else trajectory_contract.get("group_id")
+                if trajectory_contract is not None
+                else None
+            ),
+            sampling_event_id=(
+                contract.get("sampling_event_id")
+                if exact_trace_authority
+                else trajectory_contract.get("sampling_event_id")
+                if trajectory_contract is not None
+                else None
+            ),
+            source_group_id=(
+                contract.get("source_group_id")
+                if exact_trace_authority
+                else trajectory_contract.get("source_group_id")
                 if trajectory_contract is not None
                 else None
             ),
