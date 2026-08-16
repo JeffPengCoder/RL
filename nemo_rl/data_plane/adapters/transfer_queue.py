@@ -23,11 +23,12 @@ business logic. Backend init is lifted from
 from __future__ import annotations
 
 import ipaddress
+import json
 import os
 import socket
 import subprocess
 import time
-from importlib import resources
+from importlib import metadata, resources
 from typing import Any
 
 import torch
@@ -106,99 +107,53 @@ def _connect_existing() -> None:
     tq.init()
 
 
-_TQ_RUNTIME_ENV_PATCHED = False
+_EXPECTED_TRANSFER_QUEUE_COMMIT = "b266d39a15aae114730de36cf8317b6285436f7f"
 
 
-def _resolve_tq_pin() -> str:
-    """Return the ``TransferQueue`` requirement string from nemo-rl metadata.
+def validate_baked_transfer_queue() -> dict[str, str]:
+    """Verify this process uses the lock-pinned, image-installed TQ build.
 
-    Single source of truth is ``pyproject.toml`` — we read it back via
-    ``importlib.metadata.requires`` so the runtime_env injection cannot
-    drift from the dependency declaration.
+    Ray runtime-env pip installation is intentionally forbidden: it performs
+    network/package mutation after image qualification and may give controller,
+    storage, rollout, and trainer actors different code. Every process instead
+    validates the immutable distribution baked from the root lock.
     """
-    from importlib.metadata import requires
-
-    for req in requires("nemo-rl") or []:
-        spec = req.split(";")[0].strip()
-        if spec.lower().startswith("transferqueue"):
-            return spec
-    raise RuntimeError(
-        "Could not resolve TransferQueue dependency from nemo-rl metadata. "
-        "Check pyproject.toml under [project.dependencies]."
-    )
-
-
-def _patch_tq_actor_runtime_env() -> None:
-    """Inject a per-actor ``runtime_env`` pin into TQ's actor ``.options()``.
-
-    TQ spawns ``SimpleStorageUnit`` and ``TransferQueueController`` via
-    ``Cls.options(...).remote(...)`` without a runtime_env, so they
-    inherit the job-level env. In a multi-node container deployment
-    where each node has its own ``/opt/nemo_rl_venv``, the driver's
-    ``uv sync`` only updates ray-head's venv and a worker-node actor
-    fails with ``ModuleNotFoundError``. This monkey-patch makes Ray
-    pip-install TQ into a per-actor runtime_env on first spawn (cached
-    per-node by Ray afterwards). Idempotent. Couples us to TQ's internal
-    class layout — if TQ restructures, this becomes a no-op with a
-    logged warning and we fall back to per-node ``uv sync``.
-
-    The pin is sourced from nemo-rl's installed metadata via
-    :func:`_resolve_tq_pin` so it cannot drift from ``pyproject.toml``.
-
-    TODO(zhiyul): remove this patch once the nightly container image
-    is published with ``TransferQueue`` baked in via ``pyproject.toml``.
-    When every node starts from that image, the base env already has TQ
-    and Ray actors inherit it — this injection then becomes pure
-    overhead (Ray builds a redundant per-actor pip env on top of the
-    container's existing TQ install). Drop the call from
-    ``TQDataPlaneClient.__init__`` and delete this function.
-    """
-    global _TQ_RUNTIME_ENV_PATCHED
-    if _TQ_RUNTIME_ENV_PATCHED:
-        return
-
-    runtime_env = {"pip": [_resolve_tq_pin()]}
-
-    def _install(cls) -> bool:
-        if not hasattr(cls, "options"):
-            return False
-        original = cls.options
-
-        def patched(*args, **kwargs):
-            kwargs.setdefault("runtime_env", runtime_env)
-            return original(*args, **kwargs)
-
-        cls.options = patched  # type: ignore[method-assign]
-        return True
-
-    patched_any = False
     try:
-        from transfer_queue.storage.simple_backend import SimpleStorageUnit
-
-        patched_any |= _install(SimpleStorageUnit)
-    except ImportError:
-        pass
-    try:
-        from transfer_queue.controller import TransferQueueController
-
-        patched_any |= _install(TransferQueueController)
-    except ImportError:
-        pass
-
-    if not patched_any:
-        # Soft-fail: TQ may have moved its actor classes. The driver will
-        # still work; multi-node TQ may need the per-node `uv sync` workaround.
-        import warnings
-
-        warnings.warn(
-            "Could not patch TQ actor classes for runtime_env injection. "
-            "Multi-node TQ may fail with ModuleNotFoundError: 'transfer_queue' "
-            "on worker nodes. Workaround: run `uv sync` inside each node's "
-            "container before the driver runs.",
-            RuntimeWarning,
-            stacklevel=2,
+        dist = metadata.distribution("TransferQueue")
+    except metadata.PackageNotFoundError as exc:
+        raise RuntimeError(
+            "TransferQueue is absent from this process. Install the root lock on "
+            "every Ray node; runtime_env pip fallback is disabled."
+        ) from exc
+    direct_url_raw = dist.read_text("direct_url.json")
+    if not direct_url_raw:
+        raise RuntimeError(
+            "TransferQueue distribution has no direct_url.json provenance; "
+            "cannot prove the lock-pinned commit"
         )
-    _TQ_RUNTIME_ENV_PATCHED = True
+    try:
+        direct_url = json.loads(direct_url_raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("TransferQueue direct_url.json is malformed") from exc
+    vcs_info = direct_url.get("vcs_info")
+    commit_id = vcs_info.get("commit_id") if isinstance(vcs_info, dict) else None
+    if commit_id != _EXPECTED_TRANSFER_QUEUE_COMMIT:
+        raise RuntimeError(
+            "TransferQueue commit mismatch: expected "
+            f"{_EXPECTED_TRANSFER_QUEUE_COMMIT}, observed {commit_id!r}"
+        )
+    module_path = os.path.realpath(tq.__file__)
+    distribution_root = os.path.realpath(str(dist.locate_file("")))
+    if os.path.commonpath([module_path, distribution_root]) != distribution_root:
+        raise RuntimeError(
+            "transfer_queue imported outside its qualified distribution root: "
+            f"module={module_path!r}, distribution={distribution_root!r}"
+        )
+    return {
+        "version": dist.version,
+        "commit_id": commit_id,
+        "module_path": module_path,
+    }
 
 
 def _init_tq(cfg: DataPlaneConfig) -> None:
@@ -291,11 +246,6 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
         raise ValueError(f"unknown TQ backend: {backend!r}")
 
     conf = OmegaConf.merge(base, overlay)
-
-    # Inject runtime_env into TQ's actor spawn so SimpleStorageUnit /
-    # TransferQueueController land on workers with transfer_queue available
-    # — see _patch_tq_actor_runtime_env() docstring for the why.
-    _patch_tq_actor_runtime_env()
 
     # pyrefly: ignore  # bad-argument-type
     tq.init(conf=conf)
@@ -428,6 +378,12 @@ class TQDataPlaneClient(DataPlaneClient):
         # unifies the schema/data shapes for 1D fields.
         self._promote_1d = cfg["backend"] == "mooncake_cpu"
 
+        # No NeMo-RL process may repair a missing/mismatched package with
+        # runtime pip. Every process constructing this adapter validates its
+        # image-installed distribution. TQ's own controller/storage actors do
+        # not construct this adapter, so deployment qualification must probe
+        # their imported distribution independently.
+        self.transfer_queue_provenance = validate_baked_transfer_queue()
         if bootstrap:
             _init_tq(cfg)
         else:
@@ -464,6 +420,14 @@ class TQDataPlaneClient(DataPlaneClient):
         # (``0@field`` at the Mooncake storage layer). Mooncake does not
         # support upsert, so repeated schema warmups can collide with
         # stale metadata from a previous registration.
+        self.ensure_partition_fields(partition_id, fields)
+
+    def ensure_partition_fields(
+        self,
+        partition_id: str,
+        fields: list[str],
+    ) -> None:
+        """Warm field names without resetting live keys or consumer state."""
         if not fields:
             return
         schema_key = (

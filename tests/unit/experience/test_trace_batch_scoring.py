@@ -26,6 +26,7 @@ from nemo_rl.algorithms.advantage_estimator import (
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.trace_batch_scoring import (
+    attach_precomputed_trace_logprobs,
     prepare_trace_batch_for_scoring,
     score_prepared_trace_batch,
 )
@@ -346,6 +347,50 @@ def test_policy_and_reference_outputs_are_attached_to_exact_physical_rows():
         torch.count_nonzero(train_data["reference_policy_logprobs"][~effective_mask])
         == 0
     )
+
+
+def test_precomputed_tq_columns_share_legacy_scoring_validation():
+    prepared = _prepared_compacted_batch()
+    shape = prepared["logprob_data"]["input_ids"].shape
+    policy_values = torch.full(shape, -1.0)
+    reference_values = torch.full(shape, -2.0)
+    policy_values[~prepared["logprob_data"]["token_mask"].bool()] = float("nan")
+    reference_values[~prepared["logprob_data"]["token_mask"].bool()] = float("inf")
+
+    scored = attach_precomputed_trace_logprobs(
+        prepared,
+        policy_output={"logprobs": policy_values},
+        reference_output={"reference_logprobs": reference_values},
+    )
+
+    train_data = scored["train_data"]
+    effective_mask = train_data["token_mask"].bool() & (
+        train_data["sample_mask"].bool().unsqueeze(-1)
+    )
+    assert torch.all(train_data["prev_logprobs"][effective_mask] == -1.0)
+    assert torch.all(train_data["reference_policy_logprobs"][effective_mask] == -2.0)
+    assert torch.count_nonzero(train_data["prev_logprobs"][~effective_mask]) == 0
+    assert (
+        torch.count_nonzero(train_data["reference_policy_logprobs"][~effective_mask])
+        == 0
+    )
+
+
+def test_skipped_precomputed_columns_reject_unexpected_worker_output():
+    prepared = _prepared_compacted_batch()
+
+    with pytest.raises(ValueError, match="must not provide"):
+        attach_precomputed_trace_logprobs(
+            prepared,
+            policy_output={
+                "logprobs": torch.zeros_like(
+                    prepared["logprob_data"]["input_ids"]
+                ).float()
+            },
+            reference_output=None,
+            skip_policy_logprobs=True,
+            skip_reference_logprobs=True,
+        )
 
 
 def test_skipped_workers_produce_zero_placeholders_without_calls():

@@ -20,11 +20,14 @@ Runs on CPU (gloo) so it stays in the no-GPU Tier 1 lane.
 from __future__ import annotations
 
 import os
+from datetime import timedelta
 
+import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data_plane.worker_mixin import _broadcast_batched_data_dict
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
@@ -45,6 +48,15 @@ def _worker(rank: int, world_size: int, tmp_init_file: str, q):
                 {
                     "input_ids": torch.arange(12, dtype=torch.long).reshape(3, 4),
                     "input_lengths": torch.tensor([4, 3, 2], dtype=torch.int32),
+                    "pixel_values": PackedTensor(
+                        [
+                            torch.arange(4, dtype=torch.float32).reshape(1, 2, 2),
+                            None,
+                            torch.arange(8, dtype=torch.float32).reshape(2, 2, 2),
+                        ],
+                        dim_to_pack=0,
+                        pad_to_max_shape=True,
+                    ),
                     "scalar_meta": "step_42",
                 }
             )
@@ -60,6 +72,24 @@ def _worker(rank: int, world_size: int, tmp_init_file: str, q):
         )
         assert torch.equal(
             out["input_lengths"], torch.tensor([4, 3, 2], dtype=torch.int32)
+        )
+        packed = out["pixel_values"]
+        assert out["input_ids"].device.type == "cpu"
+        assert torch.equal(
+            out["input_ids"],
+            torch.arange(12, dtype=torch.long).reshape(3, 4),
+        )
+        assert isinstance(packed, PackedTensor)
+        assert packed.dim_to_pack == 0
+        assert packed.pad_to_max_shape is True
+        assert torch.equal(
+            packed.tensors[0],
+            torch.arange(4, dtype=torch.float32).reshape(1, 2, 2),
+        )
+        assert packed.tensors[1] is None
+        assert torch.equal(
+            packed.tensors[2],
+            torch.arange(8, dtype=torch.float32).reshape(2, 2, 2),
         )
         assert out["scalar_meta"] == "step_42"
         q.put((rank, "ok"))
@@ -99,3 +129,80 @@ def test_get_replica_group_default_is_none():
         pass
 
     assert _Stub()._get_replica_group() is None
+
+
+def _nccl_worker(rank: int, world_size: int, tmp_init_file: str, q) -> None:
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        backend="nccl",
+        init_method=f"file://{tmp_init_file}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=60),
+    )
+    try:
+        data = (
+            BatchedDataDict(
+                {
+                    "input_ids": torch.arange(12, dtype=torch.long).reshape(3, 4),
+                    "pixel_values": PackedTensor(
+                        [
+                            torch.arange(4, dtype=torch.bfloat16).reshape(1, 2, 2),
+                            None,
+                            torch.arange(8, dtype=torch.bfloat16).reshape(2, 2, 2),
+                        ],
+                        dim_to_pack=0,
+                        pad_to_max_shape=True,
+                    ),
+                }
+            )
+            if rank == 0
+            else None
+        )
+        out = _broadcast_batched_data_dict(
+            data,
+            is_leader=(rank == 0),
+            src=0,
+            group=dist.group.WORLD,
+        )
+        packed = out["pixel_values"]
+        assert isinstance(packed, PackedTensor)
+        assert packed.tensors[1] is None
+        assert torch.equal(
+            packed.tensors[0],
+            torch.arange(4, dtype=torch.bfloat16).reshape(1, 2, 2),
+        )
+        assert torch.equal(
+            packed.tensors[2],
+            torch.arange(8, dtype=torch.bfloat16).reshape(2, 2, 2),
+        )
+        q.put((rank, "ok"))
+    except Exception as exc:  # pragma: no cover - surfaced in parent process
+        q.put((rank, f"err: {type(exc).__name__}: {exc}"))
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.device_count() < 2,
+    reason="requires two CUDA devices for the real NCCL replica path",
+)
+def test_leader_broadcast_round_trip_nccl_two_gpu(tmp_path) -> None:
+    """Exercise the same tensor-only transport used by TP/CP/PP siblings."""
+    init_file = str(tmp_path / "nccl-init")
+    ctx = mp.get_context("spawn")
+    q = ctx.Queue()
+    procs = [
+        ctx.Process(target=_nccl_worker, args=(rank, 2, init_file, q))
+        for rank in range(2)
+    ]
+    for proc in procs:
+        proc.start()
+    for proc in procs:
+        proc.join(timeout=90)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=10)
+        assert proc.exitcode == 0, f"NCCL worker exited with {proc.exitcode}"
+    results = sorted([q.get(timeout=5) for _ in range(2)])
+    assert results == [(0, "ok"), (1, "ok")], results

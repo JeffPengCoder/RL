@@ -195,24 +195,6 @@ class TestModelForward:
 
         assert mock_model.call_args.kwargs["attention_mask"] is None
 
-    def test_legacy_nemotron_omni_type_is_expanded_media_authority(self):
-        """Accepted Bridge builds need not expose the newer capability flag."""
-        from megatron.bridge.models.nemotron_omni.modeling_nemotron_omni import (
-            NemotronOmniModel,
-        )
-        from nemo_rl.models.megatron.train import (
-            _model_uses_expanded_media_token_validity,
-        )
-
-        class LegacyNemotronOmniModel(NemotronOmniModel):
-            model_slices_context_parallel_inputs = False
-
-        legacy_model = object.__new__(LegacyNemotronOmniModel)
-        torch.nn.Module.__init__(legacy_model)
-
-        assert _model_uses_expanded_media_token_validity(legacy_model)
-
-
 class TestApplyTemperatureScaling:
     """Tests for apply_temperature_scaling function."""
 

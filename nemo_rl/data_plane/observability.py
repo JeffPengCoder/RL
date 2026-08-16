@@ -249,6 +249,13 @@ class MetricsDataPlaneClient(DataPlaneClient):
             n_keys=int(num_samples),
         )
 
+    def ensure_partition_fields(self, partition_id, fields):
+        self._run(
+            "ensure_fields",
+            partition_id,
+            lambda: self._inner.ensure_partition_fields(partition_id, fields),
+        )
+
     def claim_meta(
         self,
         partition_id,

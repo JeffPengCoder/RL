@@ -44,8 +44,10 @@ def client(request) -> DataPlaneClient:
 
 
 def test_factory_disabled_raises():
-    """Factory has no NoOp fallback — disabled config must not reach it.
-    The legacy trainer (grpo.grpo_train) never calls the factory at all."""
+    """Reject disabled data-plane configuration.
+
+    The factory has no NoOp fallback, and the legacy trainer never calls it.
+    """
     with pytest.raises(ValueError):
         build_data_plane_client({"enabled": False, "impl": "transfer_queue"})
 
@@ -69,6 +71,29 @@ def test_register_put_get_clear(client: DataPlaneClient):
     client.clear_samples(sample_ids=None, partition_id="p")
     with pytest.raises(KeyError):
         client.get_samples(sample_ids=keys, partition_id="p", select_fields=["x"])
+
+
+def test_ensure_partition_fields_preserves_live_rows(client: DataPlaneClient):
+    client.register_partition(
+        partition_id="p",
+        fields=["x"],
+        num_samples=1,
+        consumer_tasks=["read"],
+    )
+    client.put_samples(
+        sample_ids=["a"],
+        partition_id="p",
+        fields=TensorDict({"x": torch.tensor([1])}, batch_size=[1]),
+    )
+
+    client.ensure_partition_fields("p", ["x", "media_values"])
+
+    out = client.get_samples(
+        sample_ids=["a"],
+        partition_id="p",
+        select_fields=["x"],
+    )
+    assert torch.equal(out["x"], torch.tensor([1]))
 
 
 def test_claim_meta_advances_consumption(client: DataPlaneClient):

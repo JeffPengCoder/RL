@@ -61,7 +61,11 @@ from nemo_rl.algorithms.grpo import (
     refit_policy_generation,
     validate,
 )
-from nemo_rl.algorithms.grpo_sync import _train_fields_for_step, grpo_train_sync
+from nemo_rl.algorithms.grpo_sync import (
+    _train_fields_for_step,
+    grpo_train_sync,
+    validate_sync,
+)
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
@@ -602,6 +606,13 @@ def test_context_compaction_training_config_accepts_initial_supported_subset():
     _validate_context_compaction_training_config(_context_compaction_master_config())
 
 
+def test_context_compaction_training_config_accepts_sync_tq_transport():
+    config = _context_compaction_master_config()
+    config.data_plane = {"enabled": True}
+
+    _validate_context_compaction_training_config(config)
+
+
 def test_context_compaction_training_config_accepts_async_replay():
     config = _context_compaction_master_config()
     config.grpo["async_grpo"]["enabled"] = True
@@ -706,10 +717,6 @@ def test_context_compaction_training_config_accepts_async_replay():
         (
             lambda cfg: cfg.policy["dtensor_cfg"].update(enabled=True),
             "Megatron policy backend",
-        ),
-        (
-            lambda cfg: setattr(cfg, "data_plane", {"enabled": True}),
-            "data-plane",
         ),
     ],
 )
@@ -2415,6 +2422,67 @@ def mock_sync_grpo_infrastructure(policy):
     policy.tq_partition_id = 0
 
     return stack
+
+
+def test_validate_sync_marks_nemo_gym_rollout_as_generation_only() -> None:
+    """Sync validation must reach Gym as evaluation, never training."""
+    val_batch = BatchedDataDict({"placeholder": ["row"]})
+    rollout_actor = MagicMock()
+    meta = MagicMock()
+    rollout_actor.rollout_to_tq.remote.return_value = (
+        meta,
+        {
+            "total_reward": torch.tensor([1.0]),
+            "turn_roles": [["user", "assistant"]],
+            "turn_contents": [["prompt", "answer"]],
+        },
+        {"mean_gen_tokens_per_sample": 4.0},
+        None,
+    )
+    policy = MagicMock()
+    val_task_to_env = {"nemo_gym": MagicMock()}
+    master_config = SimpleNamespace(
+        grpo=SimpleNamespace(
+            val_period=1,
+            max_val_samples=1,
+            val_batch_size=1,
+        ),
+        env={"nemo_gym": {}},
+        logger={"num_val_samples_to_print": 0},
+    )
+
+    with (
+        patch("nemo_rl.algorithms.grpo_sync.ray.get", side_effect=lambda ref: ref),
+        patch("nemo_rl.algorithms.grpo_sync._should_use_nemo_gym", return_value=True),
+        patch(
+            "nemo_rl.algorithms.grpo_sync.new_sampling_event_id",
+            return_value="validation-event",
+        ) as new_event,
+        patch("nemo_rl.algorithms.grpo_sync.print_message_log_samples"),
+        patch("nemo_rl.algorithms.grpo_sync.torch.cuda.empty_cache"),
+    ):
+        validate_sync(
+            rollout_actor=rollout_actor,
+            policy=policy,
+            val_dataloader=[val_batch],
+            val_task_to_env=val_task_to_env,
+            step=4,
+            master_config=master_config,
+        )
+
+    rollout_actor.rollout_to_tq.remote.assert_called_once_with(
+        val_batch,
+        partition_id="val",
+        generation_only=True,
+        generation_policy_version=None,
+        sampling_event_id="validation-event",
+        first_iter=False,
+        finish_generation=False,
+        task_to_env_override=val_task_to_env,
+        carry_keys=["total_reward", "turn_roles", "turn_contents"],
+    )
+    new_event.assert_called_once_with(purpose="validation", step=4)
+    policy.finish_step.assert_called_once_with(meta)
 
 
 @pytest.mark.parametrize(
@@ -5055,9 +5123,7 @@ class TestValidateFunction:
             }
         )
         mock_dataloader = MagicMock(spec=StatefulDataLoader)
-        mock_dataloader.__iter__ = MagicMock(
-            side_effect=lambda: iter([source_batch])
-        )
+        mock_dataloader.__iter__ = MagicMock(side_effect=lambda: iter([source_batch]))
         mock_config = mock_grpo_components["master_config"]
         mock_config.grpo.val_batch_size = 1
         mock_config.grpo.max_val_samples = 1

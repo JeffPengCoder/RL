@@ -37,7 +37,11 @@ import torch
 from nemo_rl.data.llm_message_utils import attach_message_log_view
 from nemo_rl.data_plane.codec import materialize, pack_jagged_fields
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
-from nemo_rl.data_plane.schema import GLOBAL_FORWARD_PAD_SEQLEN, Layout
+from nemo_rl.data_plane.schema import (
+    GLOBAL_FORWARD_PAD_SEQLEN,
+    PACKED_TENSOR_WIRE_SCHEMA_KEY,
+    Layout,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 TOKEN_ALIGNED_FIELDS = frozenset(
@@ -99,6 +103,20 @@ def read_columns(
         pad_value_dict=pad_value_dict,
         pad_to_seqlen=pad_to_seqlen,
     )
+    if PACKED_TENSOR_WIRE_SCHEMA_KEY in (meta.extra_info or {}):
+        # Keep the core data-plane import surface lightweight. The media
+        # module pulls processor dependencies and is only needed for a batch
+        # that explicitly carries a PackedTensor authority.
+        from nemo_rl.data_plane.packed_tensor_wire import (
+            decode_packed_tensor_wire,
+            packed_tensor_schema_from_extra_info,
+        )
+
+        decode_packed_tensor_wire(
+            data,
+            schema=packed_tensor_schema_from_extra_info(meta.extra_info),
+            sample_ids=meta.sample_ids,
+        )
     attach_message_log_view(data)
     return data
 
@@ -187,12 +205,37 @@ def kv_first_write(
             f"kv_first_write: tags ({len(tags)}) must match batch size ({n})"
         )
     lengths = final_batch_cpu["input_lengths"]
+    extras = dict(extra_info or {})
+    expected_packed_schema = extras.get(PACKED_TENSOR_WIRE_SCHEMA_KEY)
+    from nemo_rl.data.multimodal_utils import PackedTensor
+
+    contains_packed_tensor = any(
+        isinstance(value, PackedTensor) for value in final_batch_cpu.values()
+    )
+    packed_wire: dict[str, torch.Tensor] = {}
+    packed_schema = None
+    if expected_packed_schema is not None or contains_packed_tensor:
+        from nemo_rl.data_plane.packed_tensor_wire import encode_packed_tensor_wire
+
+        packed_wire, packed_schema = encode_packed_tensor_wire(
+            final_batch_cpu,
+            sample_ids=sample_ids,
+            expected_schema=expected_packed_schema,
+        )
+    if packed_schema is not None:
+        extras[PACKED_TENSOR_WIRE_SCHEMA_KEY] = packed_schema
+    elif expected_packed_schema is not None:
+        raise ValueError(
+            "kv_first_write received a PackedTensor schema without media payload"
+        )
+
     fields: dict[str, torch.Tensor | np.ndarray] = {
         k: v
         for k, v in final_batch_cpu.items()
         if isinstance(v, torch.Tensor)
         or (isinstance(v, np.ndarray) and v.dtype == object)
     }
+    fields.update(packed_wire)
     td = pack_jagged_fields(
         fields,
         lengths=lengths,
@@ -205,7 +248,6 @@ def kv_first_write(
         tags=tags,
     )
 
-    extras = dict(extra_info or {})
     if pad_to_multiple > 1:
         extras["pad_to_multiple"] = int(pad_to_multiple)
     return KVBatchMeta(

@@ -2282,9 +2282,6 @@ def _validate_context_compaction_training_config(
     dtensor_enabled = bool(policy_config.get("dtensor_cfg", {}).get("enabled"))
     if not megatron_enabled or dtensor_enabled:
         errors.append("the initial implementation requires the Megatron policy backend")
-    if (master_config.data_plane or {}).get("enabled", False):
-        errors.append("the data-plane/TQ training path is not supported")
-
     logical_rollout_count = _config_value(
         grpo_config, "num_prompts_per_step"
     ) * _config_value(grpo_config, "num_generations_per_prompt")

@@ -71,23 +71,13 @@ PostProcessingFunction = Union[
 
 
 def _model_uses_expanded_media_token_validity(model: Any) -> bool:
-    """Whether a model interprets a 2-D attention mask as media-token validity.
-
-    Older accepted Nemotron Omni Bridge builds predate the explicit
-    ``model_slices_context_parallel_inputs`` capability, so the concrete model
-    type is the compatibility authority.  The attribute keeps newer Bridge
-    builds and wrappers extensible without broadening this to unrelated VLMs.
-    """
-    from megatron.bridge.models.nemotron_omni.modeling_nemotron_omni import (
-        NemotronOmniModel,
-    )
+    """Whether a model interprets a 2-D attention mask as media-token validity."""
     from megatron.core.utils import unwrap_model
 
     unwrapped = unwrap_model(model)
     chunks = unwrapped if isinstance(unwrapped, (list, tuple)) else [unwrapped]
     return any(
-        isinstance(chunk, NemotronOmniModel)
-        or bool(getattr(chunk, "model_slices_context_parallel_inputs", False))
+        bool(getattr(chunk, "model_slices_context_parallel_inputs", False))
         for chunk in chunks
     )
 

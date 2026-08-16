@@ -89,6 +89,29 @@ def test_register_and_clear_recorded(wrapped_client):
     assert ops.count("clear") == 1
 
 
+def test_ensure_fields_is_observable_and_preserves_live_rows(wrapped_client):
+    client, events = wrapped_client
+    client.register_partition(
+        partition_id="p", fields=["x"], num_samples=1, consumer_tasks=["read"]
+    )
+    client.put_samples(
+        sample_ids=["a"],
+        partition_id="p",
+        fields=TensorDict({"x": torch.tensor([7])}, batch_size=[1]),
+    )
+    client.ensure_partition_fields("p", ["x", "media_values"])
+
+    out = client.get_samples(
+        sample_ids=["a"],
+        partition_id="p",
+        select_fields=["x"],
+    )
+    assert torch.equal(out["x"], torch.tensor([7]))
+    ensure_events = [event for event in events if event["op"] == "ensure_fields"]
+    assert len(ensure_events) == 1
+    assert ensure_events[0]["status"] == "ok"
+
+
 def test_error_status_recorded_and_reraised(wrapped_client):
     """Decorator does NOT swallow errors — re-raise after recording."""
     client, events = wrapped_client
@@ -145,9 +168,10 @@ def test_factory_wraps_when_observability_enabled():
 
 
 def test_observability_records_realistic_rollout_put() -> None:
-    """Metrics middleware records put-bytes correctly when the put carries a
-    realistic rollout-shaped batch (bf16 logprobs, int32 masks, int64 ids)."""
+    """Record put-byte metrics for rollout-shaped batches.
 
+    The batch carries bf16 logprobs, int32 masks, and int64 ids.
+    """
     inner = NoOpDataPlaneClient()
     seen: list[dict] = []
     client = MetricsDataPlaneClient(inner, on_event=seen.append)

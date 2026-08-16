@@ -17,6 +17,7 @@ from copy import deepcopy
 import pytest
 
 from nemo_rl.environments.generation_contract import (
+    RUNTIME_GENERATION_CONTRACT_SCHEMA_VERSION,
     bind_runtime_generation_contract,
     build_training_admission_contract,
     build_runtime_generation_contract,
@@ -73,6 +74,7 @@ def _build_contract(
     *,
     policy_kwargs=None,
     server_kwargs=None,
+    serving_behavior=None,
 ):
     policy_kwargs = policy_kwargs or {
         "enable_thinking": True,
@@ -94,8 +96,9 @@ def _build_contract(
                 "precision": "bf16",
                 "logprobs_mode": "raw_logprobs",
                 "http_server_serving_chat_kwargs": {
-                    "chat_template_kwargs": server_kwargs,
+                    "default_chat_template_kwargs": server_kwargs,
                     "reasoning_parser": "nano_v3",
+                    **(serving_behavior or {}),
                 },
             },
             "vllm_kwargs": {
@@ -111,6 +114,7 @@ def test_runtime_generation_contract_is_stable_and_complete():
     second = _build_contract()
 
     assert first == second
+    assert first["schema_version"] == RUNTIME_GENERATION_CONTRACT_SCHEMA_VERSION
     assert first["training_eligible"]
     assert first["incomplete_reasons"] == []
     validate_runtime_generation_contract(first)
@@ -132,6 +136,25 @@ def test_runtime_generation_contract_records_template_mismatch_as_diagnostic():
     validate_runtime_generation_contract(contract)
 
 
+@pytest.mark.parametrize(
+    ("field", "changed_value"),
+    [
+        ("enable_auto_tools", False),
+        ("exclude_tools_when_tool_choice_none", True),
+        ("trust_request_chat_template", True),
+    ],
+)
+def test_runtime_generation_contract_fingerprints_prompt_behavior(
+    field: str, changed_value: bool
+):
+    baseline = _build_contract()
+    changed = _build_contract(serving_behavior={field: changed_value})
+
+    assert changed["template_contract_id"] != baseline["template_contract_id"]
+    assert changed["runtime_contract_id"] != baseline["runtime_contract_id"]
+    validate_runtime_generation_contract(changed)
+
+
 def test_runtime_generation_contract_detects_definition_corruption():
     contract = _build_contract()
     corrupted = deepcopy(contract)
@@ -139,6 +162,16 @@ def test_runtime_generation_contract_detects_definition_corruption():
 
     with pytest.raises(ValueError, match="processor_contract_id"):
         validate_runtime_generation_contract(corrupted)
+
+
+def test_runtime_generation_contract_rejects_pre_prompt_behavior_schema():
+    contract = _build_contract()
+    contract["schema_version"] = 1
+
+    with pytest.raises(
+        ValueError, match="Unsupported runtime generation contract schema"
+    ):
+        validate_runtime_generation_contract(contract)
 
 
 def _gym_generation_contract() -> dict:
@@ -225,11 +258,13 @@ def test_rollout_stamp_carries_bound_runtime_contract():
     rows = [
         {
             "_rowidx": 0,
-            "context_compaction_contract_version": 2,
-            "context_compaction_group_id": "group",
-            "context_compaction_task_id": "task",
-            "context_compaction_rollout_index": 0,
-            "context_compaction_attempt_index": 0,
+            "trajectory_identity": {
+                "schema_version": 1,
+                "group_id": "group",
+                "task_id": "task",
+                "rollout_index": 0,
+                "attempt_index": 0,
+            },
         }
     ]
 

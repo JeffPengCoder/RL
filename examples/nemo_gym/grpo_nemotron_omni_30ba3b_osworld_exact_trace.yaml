@@ -131,6 +131,10 @@ env:
   should_log_nemo_gym_responses: false
   nemo_gym:
     is_trajectory_collection: false
+    # The Gym actor needs the trainer-mounted writable packaging cache. Keep
+    # it off the dedicated vLLM node even though all three nodes join Ray.
+    ray_actor_resources:
+      nrl_trainer_node: 0.001
     # The cw-dfw launcher prefetches the two Gym server venvs and explicitly
     # installs OSWorld's opt-in desktop runtime packages before Ray starts.
     # Reuse that complete, Gym-SHA-scoped venv; a missing venv is still built.

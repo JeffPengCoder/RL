@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 
-RUNTIME_GENERATION_CONTRACT_SCHEMA_VERSION = 1
+RUNTIME_GENERATION_CONTRACT_SCHEMA_VERSION = 2
 _RUNTIME_COMPONENT_FIELDS = (
     "model_contract_id",
     "tokenizer_contract_id",
@@ -173,7 +173,7 @@ def _template_definition(
     serving_config = generation_config.get("vllm_cfg") or {}
     serving_kwargs = serving_config.get("http_server_serving_chat_kwargs") or {}
     server_template = serving_kwargs.get("chat_template")
-    server_template_kwargs = serving_kwargs.get("chat_template_kwargs") or {}
+    server_template_kwargs = serving_kwargs.get("default_chat_template_kwargs") or {}
 
     return (
         {
@@ -190,6 +190,15 @@ def _template_definition(
             ),
             "serving_chat_template_content_format": serving_kwargs.get(
                 "chat_template_content_format", "auto"
+            ),
+            "serving_enable_auto_tools": bool(
+                serving_kwargs.get("enable_auto_tools", True)
+            ),
+            "serving_exclude_tools_when_tool_choice_none": bool(
+                serving_kwargs.get("exclude_tools_when_tool_choice_none", False)
+            ),
+            "serving_trust_request_chat_template": bool(
+                serving_kwargs.get("trust_request_chat_template", False)
             ),
             "reasoning_parser": serving_kwargs.get("reasoning_parser"),
             "reasoning_parser_plugin": serving_config.get("reasoning_parser_plugin"),

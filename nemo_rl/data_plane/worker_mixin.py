@@ -34,6 +34,13 @@ import torch
 FetchPolicy = Literal["auto", "independent", "leader_broadcast"]
 
 from nemo_rl.data.llm_message_utils import attach_message_log_view
+from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.data_plane.packed_tensor_wire import (
+    decode_packed_tensor_wire,
+    packed_tensor_broadcast_components,
+    packed_tensor_from_broadcast_components,
+    packed_tensor_schema_from_extra_info,
+)
 from nemo_rl.data_plane.schema import (
     ELEM_COUNTS_PER_GB,
     GLOBAL_FORWARD_PAD_SEQLEN,
@@ -56,6 +63,7 @@ def _broadcast_batched_data_dict(
     is_leader: bool,
     src: int,
     group: Any,
+    packed_tensor_wire_schema: Optional[dict[str, Any]] = None,
 ) -> BatchedDataDict[Any]:
     """Broadcast a BatchedDataDict from ``src`` to all ranks in ``group``.
 
@@ -69,8 +77,13 @@ def _broadcast_batched_data_dict(
     # device from the group backend so CPU TQ outputs are moved to GPU
     # before NCCL broadcast.
     backend = torch.distributed.get_backend(group)
-    bcast_device: Any = torch.cuda.current_device() if backend == "nccl" else "cpu"
+    bcast_device = (
+        torch.device("cuda", torch.cuda.current_device())
+        if backend == "nccl"
+        else torch.device("cpu")
+    )
 
+    packed_components: dict[str, tuple[torch.Tensor, ...]] = {}
     if is_leader:
         assert data is not None, "leader must provide non-None data"
         descriptor: list[Any] = []
@@ -78,6 +91,24 @@ def _broadcast_batched_data_dict(
             if isinstance(v, torch.Tensor):
                 descriptor.append(
                     (k, "tensor", str(v.dtype), tuple(v.shape), str(v.device))
+                )
+            elif isinstance(v, PackedTensor):
+                schema, components = packed_tensor_broadcast_components(
+                    k,
+                    v,
+                    expected_schema=packed_tensor_wire_schema,
+                )
+                packed_components[k] = components
+                component_descriptor = [
+                    (
+                        str(component.dtype),
+                        tuple(component.shape),
+                        str(component.device),
+                    )
+                    for component in components
+                ]
+                descriptor.append(
+                    (k, "packed_tensor", schema, component_descriptor)
                 )
             else:
                 descriptor.append((k, "raw", v))
@@ -98,7 +129,7 @@ def _broadcast_batched_data_dict(
             dtype_str, shape, src_device = entry[2], entry[3], entry[4]
             if is_leader:
                 tensor = out[key]
-                if tensor.device.type != torch.device(bcast_device).type:
+                if tensor.device.type != bcast_device.type:
                     tensor = tensor.to(bcast_device)
                     out[key] = tensor
             else:
@@ -106,13 +137,42 @@ def _broadcast_batched_data_dict(
                 tensor = torch.empty(shape, dtype=dtype, device=bcast_device)
                 out[key] = tensor
             torch.distributed.broadcast(tensor, src=src, group=group)
-            # Restore non-leader tensors to the leader's source device
-            # so downstream code sees the same layout pre-broadcast.
-            if (
-                not is_leader
-                and torch.device(src_device).type != torch.device(bcast_device).type
-            ):
+            # Restore every replica, including the leader, to the declared
+            # source device so TP/CP/PP siblings see one identical layout.
+            if torch.device(src_device).type != bcast_device.type:
                 out[key] = tensor.to(src_device)
+        elif kind == "packed_tensor":
+            schema = entry[2]
+            component_descriptor = entry[3]
+            components: list[torch.Tensor] = []
+            leader_components = packed_components.get(key)
+            for component_index, (dtype_str, shape, src_device) in enumerate(
+                component_descriptor
+            ):
+                if is_leader:
+                    assert leader_components is not None
+                    component = leader_components[component_index]
+                    if component.device.type != bcast_device.type:
+                        component = component.to(bcast_device)
+                else:
+                    dtype = getattr(torch, dtype_str.split(".")[-1])
+                    component = torch.empty(
+                        shape,
+                        dtype=dtype,
+                        device=bcast_device,
+                    )
+                if component.numel() > 0:
+                    torch.distributed.broadcast(component, src=src, group=group)
+                if torch.device(src_device).type != bcast_device.type:
+                    component = component.to(src_device)
+                components.append(component)
+            logical_key, packed = packed_tensor_from_broadcast_components(
+                schema,
+                tuple(components),  # type: ignore[arg-type]
+            )
+            if logical_key != key:
+                raise ValueError("PackedTensor replica descriptor changed its key")
+            out[key] = packed
         else:
             if not is_leader:
                 out[key] = entry[2]
@@ -134,12 +194,6 @@ class TQWorkerMixin:
 
         Called once by the driver after worker construction. Idempotent.
         """
-        if getattr(self, "model_slices_context_parallel_inputs", False):
-            raise NotImplementedError(
-                "TransferQueue/SingleController does not yet support models that "
-                "insert media before context-parallel input selection. Use the "
-                "synchronous NeMo-RL policy path for Nemotron Omni."
-            )
         if self._dp_client is not None:
             return
         from nemo_rl.data_plane import build_data_plane_client
@@ -217,7 +271,6 @@ class TQWorkerMixin:
             raise ValueError(f"unknown fetch_policy: {fetch_policy!r}")
 
         from nemo_rl.data_plane import materialize
-
         pad_value_dict = self._pad_value_dict()
         replica_group = (
             self._get_replica_group()
@@ -236,6 +289,7 @@ class TQWorkerMixin:
             is_leader = self._is_replica_leader()
             leader = torch.distributed.get_global_rank(replica_group, 0)
             if is_leader:
+                packed_schema = packed_tensor_schema_from_extra_info(meta.extra_info)
                 td = self._require_dp_client().get_samples(
                     sample_ids=meta.sample_ids,
                     partition_id=meta.partition_id,
@@ -247,13 +301,20 @@ class TQWorkerMixin:
                     pad_value_dict=pad_value_dict,
                     pad_to_seqlen=pad_to_seqlen,
                 )
+                decode_packed_tensor_wire(
+                    data,
+                    schema=packed_schema,
+                    sample_ids=meta.sample_ids,
+                )
             else:
+                packed_schema = packed_tensor_schema_from_extra_info(meta.extra_info)
                 data = None
             data = _broadcast_batched_data_dict(
                 data,
                 is_leader=is_leader,
                 src=leader,
                 group=replica_group,
+                packed_tensor_wire_schema=packed_schema,
             )
             # Reconstruct message_log after broadcast so the views alias
             # the per-rank local ``input_ids`` rather than the leader's.
@@ -262,11 +323,15 @@ class TQWorkerMixin:
                 stage=meta.task_name or "unknown",
                 keys=meta.sample_ids,
                 data=data,
+                media_wire_schema_id=(
+                    packed_schema or {}
+                ).get("wire_schema_id"),
             )
             if preprocess is not None:
                 data = preprocess(self, data)
             return data
 
+        packed_schema = packed_tensor_schema_from_extra_info(meta.extra_info)
         td = self._require_dp_client().get_samples(
             sample_ids=meta.sample_ids,
             partition_id=meta.partition_id,
@@ -278,11 +343,17 @@ class TQWorkerMixin:
             pad_value_dict=pad_value_dict,
             pad_to_seqlen=pad_to_seqlen,
         )
+        decode_packed_tensor_wire(
+            data,
+            schema=packed_schema,
+            sample_ids=meta.sample_ids,
+        )
         attach_message_log_view(data)
         trace_tq_fetch_payload(
             stage=meta.task_name or "unknown",
             keys=meta.sample_ids,
             data=data,
+            media_wire_schema_id=(packed_schema or {}).get("wire_schema_id"),
         )
         if preprocess is not None:
             data = preprocess(self, data)
@@ -416,6 +487,7 @@ class TQWorkerMixin:
         *,
         result_key: str,
         tq_field: str,
+        effective_token_mask: Optional[torch.Tensor] = None,
     ) -> None:
         """Single chokepoint for ``*_presharded`` write-backs.
 
@@ -427,6 +499,9 @@ class TQWorkerMixin:
             result: Worker output containing ``result_key``.
             result_key: Key into ``result`` for the tensor to write back.
             tq_field: Field name on the TQ side.
+            effective_token_mask: Optional exact action-token mask. When
+                provided, non-finite eligible values fail and all ineligible
+                positions are canonicalized to zero before the first TQ put.
         """
         if self._dp_client is None:
             return
@@ -449,6 +524,23 @@ class TQWorkerMixin:
                 f"result[{result_key!r}] has batch dim {val.shape[0]} "
                 f"but meta.sample_ids has {len(meta.sample_ids)}."
             )
+        if effective_token_mask is not None:
+            if effective_token_mask.shape != val.shape:
+                raise ValueError(
+                    "_write_back_result_field: effective token mask shape "
+                    f"{tuple(effective_token_mask.shape)} does not match "
+                    f"result[{result_key!r}] shape {tuple(val.shape)}."
+                )
+            effective_token_mask = effective_token_mask.to(
+                device=val.device,
+                dtype=torch.bool,
+            )
+            if not torch.isfinite(val[effective_token_mask]).all():
+                raise ValueError(
+                    f"_write_back_result_field: result[{result_key!r}] has "
+                    "non-finite values on eligible action tokens."
+                )
+            val = torch.where(effective_token_mask, val, torch.zeros_like(val))
         self._write_back(meta, {tq_field: val.detach().to("cpu")})
 
     @wrap_with_nvtx_name("policy_worker/train_presharded")
@@ -459,17 +551,20 @@ class TQWorkerMixin:
         eval_mode: bool = False,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
+        scheduler_step_increment: Optional[int] = None,
     ) -> dict[str, Any]:
         """Per-rank training entrypoint. Fetch → packing prep → delegate."""
         data = self._fetch(meta)
         data = self._attach_or_repack_pack_metadata(data, meta)
-        return self.train(  # type: ignore[attr-defined]
-            data,
-            loss_fn=loss_fn,
-            eval_mode=eval_mode,
-            gbs=gbs,
-            mbs=mbs,
-        )
+        train_kwargs = {
+            "loss_fn": loss_fn,
+            "eval_mode": eval_mode,
+            "gbs": gbs,
+            "mbs": mbs,
+        }
+        if scheduler_step_increment is not None:
+            train_kwargs["scheduler_step_increment"] = scheduler_step_increment
+        return self.train(data, **train_kwargs)  # type: ignore[attr-defined]
 
     @wrap_with_nvtx_name("policy_worker/get_logprobs_presharded")
     def get_logprobs_presharded(
@@ -497,6 +592,9 @@ class TQWorkerMixin:
             result,
             result_key="logprobs",
             tq_field="prev_logprobs",
+            effective_token_mask=(
+                data["token_mask"].bool() & data["sample_mask"].bool().unsqueeze(-1)
+            ),
         )
         del result
 
@@ -522,6 +620,9 @@ class TQWorkerMixin:
             result,
             result_key="reference_logprobs",
             tq_field="reference_policy_logprobs",
+            effective_token_mask=(
+                data["token_mask"].bool() & data["sample_mask"].bool().unsqueeze(-1)
+            ),
         )
         del result
 

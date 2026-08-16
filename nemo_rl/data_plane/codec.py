@@ -41,7 +41,7 @@ import numpy as np
 import torch
 from tensordict import TensorDict, TensorDictBase
 
-from nemo_rl.data_plane.schema import Layout
+from nemo_rl.data_plane.schema import Layout, PACKED_TENSOR_WIRE_FIELD_PREFIX
 
 if TYPE_CHECKING:
     # Type-only import. At runtime, BatchedDataDict is loaded lazily
@@ -170,7 +170,13 @@ def pack_jagged_fields(
             # round-trips intact.
             packed[k] = v
         elif isinstance(v, torch.Tensor):
-            if lengths is not None and k in token_aligned_fields:
+            if v.is_nested:
+                # PackedTensor media values are already one jagged flattened
+                # row per sample. Re-packing them against token lengths would
+                # corrupt the independent media axis, while ``contiguous`` is
+                # unnecessary for a jagged nested tensor.
+                packed[k] = v.detach()
+            elif lengths is not None and k in token_aligned_fields:
                 packed[k] = pack_per_token_field(v, lengths)
             else:
                 packed[k] = v.detach().contiguous()
@@ -330,6 +336,7 @@ def materialize(
             and isinstance(padded, torch.Tensor)
             and padded.dim() >= 2
             and padded.shape[1] < pad_to_seqlen
+            and not key.startswith(PACKED_TENSOR_WIRE_FIELD_PREFIX)
         ):
             pad_spec = [0, 0] * (padded.dim() - 2) + [
                 0,

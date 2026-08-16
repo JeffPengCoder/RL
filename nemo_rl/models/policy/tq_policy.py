@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import warnings
 from collections import defaultdict
+from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import replace
 from typing import Any, Optional
@@ -40,6 +41,11 @@ import ray
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.data_plane import DataPlaneConfig, KVBatchMeta, build_data_plane_client
 from nemo_rl.data_plane.column_io import read_columns, round_up, write_columns
+from nemo_rl.data_plane.packed_tensor_wire import (
+    extend_fields_with_packed_tensor_wire,
+    packed_tensor_schema_from_extra_info,
+    validate_packed_tensor_wire_schema,
+)
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
 from nemo_rl.data_plane.schema import (
     DP_TRAIN_FIELDS,
@@ -146,6 +152,7 @@ class TQPolicy(Policy):
         self,
         num_samples: int,
         group_size: Optional[int] = None,
+        packed_tensor_wire_schema: Optional[Mapping[str, Any]] = None,
     ) -> None:
         """Register the per-step TQ partition.
 
@@ -155,18 +162,53 @@ class TQPolicy(Policy):
         only the subset they have, consumers fetch via ``select_fields``.
 
         Args:
-            num_samples: Expected total samples this step.
+            num_samples: Declared total samples this step. The current TQ
+                adapter uses registration for schema warm-up; callers must
+                still validate returned metadata cardinality explicitly.
             group_size: GRPO group size for balanced sampling; ``None`` disables grouping.
+            packed_tensor_wire_schema: Optional controller-admitted media
+                schema. Exact trace knows this after actor preparation but
+                before the first TQ put, so all synthetic fields are warmed
+                from one driver thread.
         """
+        fields = fields_with_optional_routed_experts(
+            DP_TRAIN_FIELDS,
+            enabled=self._router_replay_enabled,
+        )
+        fields = extend_fields_with_packed_tensor_wire(
+            fields,
+            validate_packed_tensor_wire_schema(packed_tensor_wire_schema)
+            if packed_tensor_wire_schema is not None
+            else None,
+        )
         self.dp_client.register_partition(
             partition_id=self.tq_partition_id,
-            fields=fields_with_optional_routed_experts(
-                DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
-            ),
+            fields=fields,
             num_samples=num_samples,
             consumer_tasks=["prev_lp", "ref_lp", "train"],
             grpo_group_size=group_size,
         )
+
+    def ensure_step_schema(self, meta: KVBatchMeta) -> None:
+        """Warm any post-rollout media fields before ordinary TQ consumers.
+
+        Ordinary TQ registers before rollout and therefore cannot know the
+        processor-owned PackedTensor keys. Its first put is serialized; once
+        it returns, this driver-only warmup closes the field map before any
+        prev/ref/train retrieve can race it. Exact trace instead supplies the
+        schema directly to :meth:`prepare_step` before commit.
+        """
+        schema = packed_tensor_schema_from_extra_info(meta.extra_info)
+        if schema is None:
+            return
+        fields = extend_fields_with_packed_tensor_wire(
+            fields_with_optional_routed_experts(
+                DP_TRAIN_FIELDS,
+                enabled=self._router_replay_enabled,
+            ),
+            schema,
+        )
+        self.dp_client.ensure_partition_fields(meta.partition_id, fields)
 
     def prepare_val_partition(
         self, num_samples: int, *, partition_id: str = "val"
@@ -280,21 +322,26 @@ class TQPolicy(Policy):
     ) -> None:
         """Shared body of get_logprobs_from_meta / get_reference_policy_logprobs_from_meta.
 
-        Logprob workers need only LP_SEED_FIELDS — narrow the meta's
-        field list so ``_fetch`` doesn't pull rollout-only payload (e.g.
-        multimodal). The same shape is used for both prev_lp and ref_lp.
+        Logprob workers need LP_SEED_FIELDS plus the exact PackedTensor
+        synthetic columns declared in ``meta.extra_info``. Other rollout-only
+        payload stays excluded. The same shape is used for prev_lp and ref_lp.
         Workers compute the per-token tensor and commit it to TQ via the
         leader-rank ``_write_back_result_field``; the Ray return is
         always None, so this dispatcher just waits for completion.
         """
         self._stamp_pad_seqlen(meta)
         spa, dba = self._packing_args("logprob_mb_tokens")
+        lp_fields = fields_with_optional_routed_experts(
+            LP_SEED_FIELDS,
+            enabled=self._router_replay_enabled and include_router_replay,
+        )
+        lp_fields = extend_fields_with_packed_tensor_wire(
+            lp_fields,
+            packed_tensor_schema_from_extra_info(meta.extra_info),
+        )
         lp_meta = replace(
             meta,
-            fields=fields_with_optional_routed_experts(
-                LP_SEED_FIELDS,
-                enabled=self._router_replay_enabled and include_router_replay,
-            ),
+            fields=lp_fields,
             task_name=task_name,
         )
         with timer.time(f"{timer_prefix}/shard_meta") if timer else nullcontext():
@@ -363,6 +410,7 @@ class TQPolicy(Policy):
         eval_mode: bool = False,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
+        scheduler_step_increment: Optional[int] = None,
         timer: Optional[Timer] = None,
         train_fields: tuple[str, ...] = DP_TRAIN_FIELDS,
     ) -> dict[str, Any]:
@@ -379,6 +427,9 @@ class TQPolicy(Policy):
             meta: Full-step ``KVBatchMeta`` (consumed by all DP ranks).
             gbs: Global batch size; defaults to ``cfg["train_global_batch_size"]``.
             mbs: Micro batch size; defaults to ``cfg["train_micro_batch_size"]``.
+            scheduler_step_increment: Logical sample count for the LR scheduler.
+                Exact-trace batches set this to the logical rollout count while
+                ``gbs`` remains the larger padded physical row count.
             timer: Optional timer for nested ``policy_training/*`` measurements.
             train_fields: TQ columns workers fetch this step; defaults to the
                 full ``DP_TRAIN_FIELDS`` schema. Caller may narrow it to drop
@@ -390,6 +441,8 @@ class TQPolicy(Policy):
         """
         batch_size = gbs or self.cfg["train_global_batch_size"]
         micro_batch_size = mbs or self.cfg["train_micro_batch_size"]
+        if scheduler_step_increment is not None and scheduler_step_increment <= 0:
+            raise ValueError("scheduler_step_increment must be positive")
 
         self._stamp_pad_seqlen(meta)
         spa, dba = self._packing_args("train_mb_tokens")
@@ -397,11 +450,17 @@ class TQPolicy(Policy):
         # default ``DP_TRAIN_FIELDS``) must be in TQ before this call — written
         # by workers + driver delta-writes. Caller may narrow to drop columns
         # skipped this step (e.g. ``prev_logprobs`` under force_on_policy_ratio).
+        resolved_train_fields = fields_with_optional_routed_experts(
+            train_fields,
+            enabled=self._router_replay_enabled,
+        )
+        resolved_train_fields = extend_fields_with_packed_tensor_wire(
+            resolved_train_fields,
+            packed_tensor_schema_from_extra_info(meta.extra_info),
+        )
         train_meta = replace(
             meta,
-            fields=fields_with_optional_routed_experts(
-                train_fields, enabled=self._router_replay_enabled
-            ),
+            fields=resolved_train_fields,
             task_name="train",
         )
         with timer.time("policy_training/shard_meta") if timer else nullcontext():
@@ -442,6 +501,11 @@ class TQPolicy(Policy):
                     "eval_mode": eval_mode,
                     "gbs": batch_size,
                     "mbs": micro_batch_size,
+                    **(
+                        {"scheduler_step_increment": scheduler_step_increment}
+                        if scheduler_step_increment is not None
+                        else {}
+                    ),
                 },
             )
         results = self.worker_group.get_all_worker_results(futures)
@@ -521,11 +585,17 @@ class TQPolicy(Policy):
         """
         self._stamp_pad_seqlen(meta)
         spa, dba = self._packing_args("train_mb_tokens")
+        split_train_fields = fields_with_optional_routed_experts(
+            DP_TRAIN_FIELDS,
+            enabled=self._router_replay_enabled,
+        )
+        split_train_fields = extend_fields_with_packed_tensor_wire(
+            split_train_fields,
+            packed_tensor_schema_from_extra_info(meta.extra_info),
+        )
         train_meta = replace(
             meta,
-            fields=fields_with_optional_routed_experts(
-                DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
-            ),
+            fields=split_train_fields,
             task_name="train",
         )
         with timer.time("policy_training/shard_meta") if timer else nullcontext():

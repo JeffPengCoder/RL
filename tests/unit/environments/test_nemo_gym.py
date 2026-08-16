@@ -29,7 +29,11 @@ from nemo_rl.algorithms.grpo import MasterConfig
 from nemo_rl.distributed.ray_actor_environment_registry import (
     get_actor_python_env,
 )
-from nemo_rl.environments.generation_contract import canonical_digest, stable_id
+from nemo_rl.environments.generation_contract import (
+    RUNTIME_GENERATION_CONTRACT_SCHEMA_VERSION,
+    canonical_digest,
+    stable_id,
+)
 from nemo_rl.environments.nemo_gym import (
     NemoGym,
     NemoGymConfig,
@@ -279,7 +283,7 @@ def _test_runtime_contract() -> dict:
         ),
     }
     return {
-        "schema_version": 1,
+        "schema_version": RUNTIME_GENERATION_CONTRACT_SCHEMA_VERSION,
         **component_ids,
         "runtime_contract_id": stable_id(
             "generation-runtime-contract",

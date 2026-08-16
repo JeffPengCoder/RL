@@ -2616,6 +2616,13 @@ def _postprocess_single_nemo_gym_group(
             # expansion happens later in the driver.
             "physical_message_logs": [r["physical_message_logs"] for r in results],
             "rollout_trace_bundle": [r["rollout_trace_bundle"] for r in results],
+            # Physical execution identity is observability-only.  Keep it in a
+            # rollout-aligned sidecar instead of the semantic trace bundle so
+            # retries/executions cannot perturb trace planning or digests.
+            "rollout_execution_context": [
+                (r["full_result"].get("response") or {}).get("execution_context")
+                for r in results
+            ],
             # length is used downstream for mean_prompt_length
             "length": torch.tensor(
                 [len(r["input_message_log"][0]["token_ids"]) for r in results]
