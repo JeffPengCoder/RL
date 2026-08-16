@@ -1153,6 +1153,26 @@ def test_validate_trajectory_transitions_rejects_unknown_model_call_reference():
         )
 
 
+def test_validate_trajectory_transitions_accepts_event_scoped_identity():
+    contract = _test_trajectory_contract(
+        rollout_id="rollout-event-scoped",
+        transition_count=0,
+        model_call_count=0,
+        exact=False,
+        sampling_event_id="sampling-training-001",
+        source_group_id="dataset-group-001",
+    )
+
+    _validate_trajectory_transitions(
+        [],
+        trajectory_contract=contract,
+        trajectory_model_calls=[],
+        model_call_summaries=[],
+        completion_evidence=[],
+        media_assets={},
+    )
+
+
 def test_nemo_gym_postprocess_exact_authority_rejects_missing_evidence():
     class _Tokenizer:
         def batch_decode(self, batch):

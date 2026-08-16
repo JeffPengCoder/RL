@@ -355,6 +355,24 @@ def _validate_trajectory_transitions(
             "identity_source",
         )
     }
+    sampling_event_id = trajectory_contract.get("sampling_event_id")
+    source_group_id = trajectory_contract.get("source_group_id")
+    if (sampling_event_id is None) != (source_group_id is None):
+        raise ValueError(
+            "OSWorld trajectory sampling_event_id and source_group_id "
+            "must be present together"
+        )
+    if sampling_event_id is not None:
+        if not isinstance(sampling_event_id, str) or not sampling_event_id:
+            raise ValueError("OSWorld trajectory has invalid sampling_event_id")
+        if not isinstance(source_group_id, str) or not source_group_id:
+            raise ValueError("OSWorld trajectory has invalid source_group_id")
+        identity.update(
+            {
+                "sampling_event_id": sampling_event_id,
+                "source_group_id": source_group_id,
+            }
+        )
     if trajectory_contract["trajectory_id"] != stable_id(
         "trajectory",
         identity,
