@@ -64,7 +64,7 @@ def main() -> None:
 
     from nemo_rl.models.generation.vllm.patches import ensure_vllm_source_compat
 
-    # Must run before vLLM pulls in tool_parsers (openai<2.25 NamespaceTool compat).
+    # Apply NeMo-RL's model-loader compatibility patch before importing vLLM.
     ensure_vllm_source_compat()
 
     from vllm import LLM, SamplingParams

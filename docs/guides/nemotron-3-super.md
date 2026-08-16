@@ -22,19 +22,11 @@ docker buildx build \
 FROM nvcr.io/nvidia/nemo-rl:v0.7.0
 
 ARG NEMO_GYM_CUDA=cu130
-ARG NEMO_GYM_VLLM_VERSION=0.20.0
-ARG WHEEL_ARCH=x86_64
 RUN <<'RUNEOF' bash -exu -o pipefail
 cd /opt/nemo-rl
-GYM_VLLM_OVERRIDE=/opt/nemo-rl/.gym-vllm-override.txt
-printf 'vllm @ https://github.com/vllm-project/vllm/releases/download/v%s/vllm-%s+%s-cp38-abi3-manylinux_2_35_%s.whl\n' \
-    "${NEMO_GYM_VLLM_VERSION}" "${NEMO_GYM_VLLM_VERSION}" "${NEMO_GYM_CUDA}" "${WHEEL_ARCH}" > "${GYM_VLLM_OVERRIDE}"
-
 UV_TORCH_BACKEND="${NEMO_GYM_CUDA}" \
-UV_OVERRIDE="${GYM_VLLM_OVERRIDE}" \
 UV_LINK_MODE=symlink uv run python examples/nemo_gym/prefetch_venvs.py \
     examples/nemo_gym/prefetch_super_all_envs.yaml
-rm -f "${GYM_VLLM_OVERRIDE}"
 RUNEOF
 EOF
 ```

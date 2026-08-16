@@ -4,9 +4,7 @@ source $SCRIPT_DIR/common.env
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=4
-# enforce_eager WAR (vLLM 0.20.0) makes generation ~9 min/step, so 30 steps can't fit one
-# 4h Slurm job. Chain 2 resumable runs (NUM_RUNS=ceil(30/15)=2). Revert to 30 after vLLM 0.21 bump.
-STEPS_PER_RUN=15
+STEPS_PER_RUN=30
 MAX_STEPS=30
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
 NUM_MINUTES=240

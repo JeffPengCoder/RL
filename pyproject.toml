@@ -28,7 +28,7 @@ dependencies = [
   "torch==2.11.0",
   "triton; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "colored==2.2.3",
-  "ray[default]>=2.55.1",
+  "ray[default]>=2.56.1",
   "wandb>=0.28.0",
   "numpy",
   "datasets>=4.0.0",
@@ -138,6 +138,9 @@ automodel = [
 ]
 vllm = [
   "cuda-python",
+  # vLLM 0.25.1 imports NamespaceTool, which was added in openai 2.25.
+  # This belongs to the vLLM worker environment, not the Gym server environment.
+  "openai>=2.25.0",
   "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@67fc64863d43521080bf2005e6528d0fceee9510",
   # deep_ep also needs libibverbs-dev
   # sudo apt-get update
@@ -363,10 +366,11 @@ override-dependencies = [
   "timm<=1.0.22",
   "nvidia-modelopt[torch]>=0.44.0a0",
   "torch==2.11.0",
-  # sglang has conflicting llguidance versions than vllm, so enforcing vllm's version since it's newer
-  "llguidance>=1.3.0,<1.4.0",
-  # Override setuptools range in other dependencies to address CVE GHSA-58pv-8j8x-9vj2
-  "setuptools>=80.10.2",
+  # Resolve llguidance inside the mutually exclusive vLLM and SGLang role
+  # forks. A global override would silently force one role's API onto the
+  # other (vLLM 0.25.1 requires the 1.7 family).
+  # Keep the security floor while respecting vLLM 0.25.1's <81 ceiling.
+  "setuptools>=80.10.2,<81.0.0",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@29d31c095796f3c8ece47ee9cdcc167051bbeed9 ; platform_machine == 'x86_64'",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@a48493600c4886c1b297aaa78db0e1ebc2d8dd6c ; platform_machine == 'aarch64'",
   # Relax megatron-core workspace member's opentelemetry-api ceiling (<1.34) for protobuf 6.x compat with ray
@@ -378,8 +382,8 @@ override-dependencies = [
   "xgrammar>=0.2.1,<1.0.0",
   # tensorrt-llm 1.3.0rc21 pins apache-tvm-ffi==0.1.6, but the xgrammar the
   # line above selects needs >=0.1.9, and the xgrammar releases that would
-  # accept 0.1.6 ship no cp313 wheels. Take the newer one, as with llguidance
-  # above; without this the trtllm extra is unsatisfiable on vLLM 0.25.1.
+  # accept 0.1.6 ship no cp313 wheels. Without this, the trtllm extra is
+  # unsatisfiable with the selected xgrammar release.
   "apache-tvm-ffi>=0.1.9",
   # Override dependencies to address CVEs
   "mlflow>=3.13.0",
@@ -391,11 +395,11 @@ override-dependencies = [
   "pytest>=9.0.3",
   "langchain>=0.3.28",      # Address CVE-2025-65106
   "langchain-core>=0.3.80", # Address CVE-2025-65106
-  # TransferQueue (data-plane extra) pins numpy<2.0.0; megatron-core needs
-  # numpy>=2.1.0 via onnx → ml-dtypes. Override globally so the data-plane
-  # extra composes with mcore/automodel without version-mirroring TQ's
-  # requirements.txt. Forward-compatible across TQ minor bumps.
-  "numpy>=2.1.0",
+  # TransferQueue currently declares numpy<2.0.0 while megatron-core needs
+  # numpy>=2.1.0 via onnx -> ml-dtypes. The selected Numba 0.65 runtime also
+  # rejects numpy>=2.5 at import time, so keep the tested shared intersection
+  # until TransferQueue's metadata catches up with its NumPy-2 runtime tests.
+  "numpy>=2.1.0,<2.5.0",
   # av (PyAV) carries CVE-bundled codec libs (libx264, libx265, libopenh264, libmp3lame).
   # It is only needed by megatron-bridge's optional WAN diffusion path, which installs it
   # at test time via scripts/install_diffusion_deps.sh. Exclude from the shipped container.
@@ -491,6 +495,31 @@ conflicts = [
   [
     { extra = "trtllm" },
     { extra = "mcore" },
+  ],
+  # The NeMo vLLM worker and Gym are separate runtime roles. The worker's
+  # OpenAI SDK floor conflicts with Gym's core upper bound, and Gym's optional
+  # local-vLLM stack also pins different Transformers, FlashInfer, or CUTLASS
+  # families than the NeMo backend extras below. Resolve them in separate
+  # workspace forks and install them into separate role environments.
+  [
+    { package = "nemo-gym" },
+    { package = "nemo-rl", extra = "vllm" },
+  ],
+  [
+    { package = "nemo-gym", extra = "vllm" },
+    { package = "nemo-rl", extra = "sglang" },
+  ],
+  [
+    { package = "nemo-gym", extra = "vllm" },
+    { package = "nemo-rl", extra = "mcore" },
+  ],
+  [
+    { package = "nemo-gym", extra = "vllm" },
+    { package = "nemo-rl", extra = "trtllm" },
+  ],
+  [
+    { package = "nemo-gym", extra = "vllm" },
+    { package = "nemo-rl", extra = "automodel" },
   ],
 ]
 

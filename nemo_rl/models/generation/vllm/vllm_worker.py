@@ -16,7 +16,6 @@ import copy
 import gc
 import logging
 import os
-import sys
 from typing import Any, Optional, cast
 
 import ray
@@ -322,13 +321,7 @@ class BaseVllmGenerationWorker:
         self.is_model_owner = bundle_indices is not None
         self._extra_env_vars = extra_env_vars
 
-        # Store the Python executable being used by this worker
-        self.py_executable = sys.executable
-
-        _apply_vllm_patches(
-            self.py_executable,
-            extra_env_vars=extra_env_vars,
-        )
+        _apply_vllm_patches(extra_env_vars=extra_env_vars)
 
         # Skip model loading if we're not the model owner
         if not self.is_model_owner:
