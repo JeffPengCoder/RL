@@ -327,22 +327,22 @@ def _validated_logprobs(
     return torch.where(effective_token_mask, value, torch.zeros_like(value))
 
 
-def score_prepared_trace_batch(
+def attach_precomputed_trace_logprobs(
     preparation: TraceScoringPreparation,
     *,
-    policy: _TraceLogprobPolicy,
-    timer: Any | None = None,
+    policy_output: Mapping[str, Any] | None,
+    reference_output: Mapping[str, Any] | None,
     skip_policy_logprobs: bool = False,
     skip_reference_logprobs: bool = False,
 ) -> TraceScoringResult:
-    """Call logprob workers on exact rows and validate their returned alignment.
+    """Validate and attach logprobs transported outside the legacy driver.
 
-    The caller remains responsible for worker mode transitions. This function
-    does not compute ratios, loss, gradients, or optimizer/scheduler state.
+    Legacy workers return these columns directly. TQ workers write the same
+    columns under physical-row IDs and the rollout actor reads them back for
+    validation. Sharing this function keeps both transports on one exact-trace
+    mask/alignment contract.
     """
-    materialization = preparation["materialization"]
-    train_data = materialization["train_data"]
-    logprob_data = preparation["logprob_data"]
+    train_data = preparation["materialization"]["train_data"]
     expected_shape = train_data["input_ids"].shape
     effective_token_mask = train_data["token_mask"].bool() & (
         train_data["sample_mask"].bool().unsqueeze(-1)
@@ -357,26 +357,30 @@ def score_prepared_trace_batch(
         )
 
     if skip_policy_logprobs:
+        if policy_output is not None:
+            raise ValueError("Skipped policy logprobs must not provide worker output")
         prev_logprobs = torch.zeros_like(train_data["generation_logprobs"])
     else:
-        output = policy.get_logprobs(logprob_data, timer=timer)
-        if not isinstance(output, Mapping):
+        if not isinstance(policy_output, Mapping):
             raise TypeError("Policy logprob worker output must be a mapping")
         prev_logprobs = _validated_logprobs(
-            output,
+            policy_output,
             key="logprobs",
             expected_shape=expected_shape,
             effective_token_mask=effective_token_mask,
         )
 
     if skip_reference_logprobs:
+        if reference_output is not None:
+            raise ValueError(
+                "Skipped reference logprobs must not provide worker output"
+            )
         reference_logprobs = torch.zeros_like(prev_logprobs)
     else:
-        output = policy.get_reference_policy_logprobs(logprob_data, timer=timer)
-        if not isinstance(output, Mapping):
+        if not isinstance(reference_output, Mapping):
             raise TypeError("Reference logprob worker output must be a mapping")
         reference_logprobs = _validated_logprobs(
-            output,
+            reference_output,
             key="reference_logprobs",
             expected_shape=expected_shape,
             effective_token_mask=effective_token_mask,
@@ -388,3 +392,41 @@ def score_prepared_trace_batch(
         "preparation": preparation,
         "train_data": train_data,
     }
+
+
+def score_prepared_trace_batch(
+    preparation: TraceScoringPreparation,
+    *,
+    policy: _TraceLogprobPolicy,
+    timer: Any | None = None,
+    skip_policy_logprobs: bool = False,
+    skip_reference_logprobs: bool = False,
+) -> TraceScoringResult:
+    """Call logprob workers on exact rows and validate their returned alignment.
+
+    The caller remains responsible for worker mode transitions. This function
+    does not compute ratios, loss, gradients, or optimizer/scheduler state.
+    """
+    logprob_data = preparation["logprob_data"]
+    policy_output: Mapping[str, Any] | None = None
+    if skip_policy_logprobs:
+        pass
+    else:
+        policy_output = policy.get_logprobs(logprob_data, timer=timer)
+
+    reference_output: Mapping[str, Any] | None = None
+    if skip_reference_logprobs:
+        pass
+    else:
+        reference_output = policy.get_reference_policy_logprobs(
+            logprob_data,
+            timer=timer,
+        )
+
+    return attach_precomputed_trace_logprobs(
+        preparation,
+        policy_output=policy_output,
+        reference_output=reference_output,
+        skip_policy_logprobs=skip_policy_logprobs,
+        skip_reference_logprobs=skip_reference_logprobs,
+    )

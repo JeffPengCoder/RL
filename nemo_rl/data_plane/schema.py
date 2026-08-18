@@ -23,6 +23,8 @@ MICRO_BATCH_INDICES = "micro_batch_indices"
 MICRO_BATCH_LENGTHS = "micro_batch_lengths"
 ELEM_COUNTS_PER_GB = "elem_counts_per_gb"
 GLOBAL_FORWARD_PAD_SEQLEN = "global_forward_pad_seqlen"
+PACKED_TENSOR_WIRE_SCHEMA_KEY = "nrl_packed_tensor_wire_v1"
+PACKED_TENSOR_WIRE_FIELD_PREFIX = "__nrl_packed_tensor_v1_"
 
 # Skeleton field names from `shard_meta_for_dp`.
 INPUT_IDS = "input_ids"

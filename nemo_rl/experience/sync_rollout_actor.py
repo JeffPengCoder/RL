@@ -43,8 +43,14 @@ import numpy as np
 import ray
 import torch
 
-from nemo_rl.data_plane.column_io import kv_first_write
+from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.data_plane.column_io import kv_first_write, read_columns, write_columns
 from nemo_rl.data_plane.interfaces import KVBatchMeta
+from nemo_rl.data_plane.packed_tensor_wire import (
+    PACKED_TENSOR_WIRE_SCHEMA_KEY,
+    describe_packed_tensor_wire,
+    packed_tensor_schema_from_extra_info,
+)
 from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
@@ -134,12 +140,21 @@ class SyncRolloutActor:
         from nemo_rl.data_plane import build_data_plane_client
 
         self._dp_client = build_data_plane_client(dp_cfg, bootstrap=False)
+        # Exact-trace uses a two-phase prepare/register/commit protocol because
+        # its physical row count is unknown until rollout materialization. One
+        # actor owns at most one plan, and retains it after commit so a lost RPC
+        # response can be retried without another rollout or duplicate put.
+        self._exact_trace_pending: dict[str, Any] | None = None
+        self._exact_trace_failed_identity: dict[str, Any] | None = None
 
     def rollout_to_tq(
         self,
         input_batch: BatchedDataDict[Any],
         *,
         partition_id: str,
+        generation_only: bool,
+        generation_policy_version: str | None,
+        sampling_event_id: str,
         group_size: int = 1,
         first_iter: bool = True,
         finish_generation: bool = True,
@@ -180,6 +195,16 @@ class SyncRolloutActor:
         Args:
             input_batch: Per-step prompt batch (already repeat-interleaved).
             partition_id: TQ partition target.
+            generation_only: Scheduler-owned rollout intent. Validation must
+                pass ``True`` so NeMo-Gym selects its evaluation purpose and
+                sampling profile; training must pass ``False``. This is
+                required instead of defaulted so new controller call sites
+                cannot silently turn evaluation into training traffic.
+            generation_policy_version: Controller-owned policy identity for
+                exact-trace admission. Validation passes ``None``; training
+                passes the synchronized policy step.
+            sampling_event_id: Controller-owned identity for this sampling
+                decision. A caller retry must reuse the same value.
             group_size: Rollouts per original prompt. One uid is minted
                 per prompt; bulk keys are ``f"{uid}_g{i}"`` where ``i``
                 ranges over the per-prompt expansion (group × rollout
@@ -263,6 +288,9 @@ class SyncRolloutActor:
                 else None,
                 reward_penalty_config=cfg.reward_penalties,
                 thinking_tags=get_nemo_gym_thinking_tags(cfg.env),
+                generation_only=generation_only,
+                generation_policy_version=generation_policy_version,
+                sampling_event_id=sampling_event_id,
             )
             final_batch, rollout_metrics = r.final_batch, r.rollout_metrics
         else:
@@ -315,7 +343,7 @@ class SyncRolloutActor:
         if ROUTED_EXPERTS_FIELD in flat:
             bulk_batch[ROUTED_EXPERTS_FIELD] = flat[ROUTED_EXPERTS_FIELD]
         for k, v in flat.get_multimodal_dict(as_tensors=False).items():
-            if isinstance(v, torch.Tensor):
+            if isinstance(v, (torch.Tensor, PackedTensor)):
                 bulk_batch[k] = v
         # ``content`` (raw assistant text per sample) — rides TQ as a
         # NonTensorStack so the driver can fetch it back at jsonl time
@@ -335,7 +363,11 @@ class SyncRolloutActor:
         # decomposed fields above (per-row pickle of dict-with-tensors
         # would smuggle aliased views into the wire).
         for k, v in fb.items():
-            if isinstance(v, torch.Tensor) or k in bulk_batch or k == "message_log":
+            if (
+                isinstance(v, torch.Tensor)
+                or k in bulk_batch
+                or k in {"message_log", "rollout_execution_context"}
+            ):
                 continue
             bulk_batch[k] = (
                 v
@@ -417,8 +449,523 @@ class SyncRolloutActor:
             gen_metrics = None
         return meta, BatchedDataDict(driver_carry), rollout_metrics, gen_metrics
 
+    def prepare_pending_exact_trace(
+        self,
+        input_batch: BatchedDataDict[Any],
+        *,
+        generation_policy_version: str,
+        sampling_event_id: str,
+        group_size: int,
+        batch_quantum: int,
+        optimizer_step_id: str,
+        first_iter: bool = True,
+        finish_generation: bool = True,
+    ) -> tuple[dict[str, Any], dict[str, Any], Optional[dict[str, Any]]]:
+        """Roll out and materialize one exact physical batch without TQ I/O.
+
+        A retry with the same controller identity returns the already prepared
+        plan. A different event is rejected while a plan is pending. The
+        controller must register ``summary['total_row_count']`` with
+        ``group_size=None`` before calling :meth:`commit_pending_exact_trace`.
+        """
+        from nemo_rl.algorithms.grpo import (
+            _create_advantage_estimator,
+            _should_use_nemo_gym,
+            extract_initial_prompt_messages,
+        )
+        from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
+        from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
+        from nemo_rl.experience.rollouts import backfill_missing_routed_experts
+        from nemo_rl.experience.sync_exact_trace import (
+            build_exact_trace_pending_identity,
+            summarize_exact_trace_plan,
+        )
+        from nemo_rl.experience.trace_batch_scoring import (
+            prepare_trace_batch_for_scoring,
+        )
+
+        pending_identity = build_exact_trace_pending_identity(
+            sampling_event_id=sampling_event_id,
+            generation_policy_version=generation_policy_version,
+            optimizer_step_id=optimizer_step_id,
+            logical_rollout_count=int(input_batch.size),
+            group_size=group_size,
+        )
+        pending = self._exact_trace_pending
+        failed_identity = self._exact_trace_failed_identity
+        if failed_identity is not None:
+            if failed_identity["pending_handle"] == pending_identity["pending_handle"]:
+                raise RuntimeError(
+                    "The non-idempotent NeMo-Gym /run for this sampling event "
+                    "already failed after dispatch; refusing an implicit replay"
+                )
+            raise RuntimeError(
+                "SyncRolloutActor retains a failed exact-trace sampling event; "
+                "abort it explicitly before starting a new event"
+            )
+        if pending is not None:
+            if pending["pending_identity"] != pending_identity:
+                raise RuntimeError(
+                    "SyncRolloutActor already owns a different exact-trace "
+                    f"pending plan {pending['pending_identity']['pending_handle']!r}"
+                )
+            return (
+                pending["controller_summary"],
+                pending["rollout_metrics"],
+                pending["generation_logger_metrics"],
+            )
+
+        cfg = self.master_config
+        if not _should_use_nemo_gym(cfg):
+            raise ValueError("Exact-trace TQ training requires NeMo-Gym rollouts")
+        if self.policy_generation is not None:
+            if first_iter and hasattr(self.policy_generation, "snapshot_step_metrics"):
+                self.policy_generation.snapshot_step_metrics()
+            self.policy_generation.clear_logger_metrics()
+
+        rollout_succeeded = False
+        try:
+            # Publish a fail-closed identity before the first call that may
+            # dispatch the non-idempotent Gym /run. It stays live until the
+            # fully materialized pending state is published below, covering
+            # finish-generation and logger-metric postprocessing failures too.
+            self._exact_trace_failed_identity = pending_identity
+            result = run_nemo_gym_rollout_sync(
+                policy_generation=self.policy_generation,
+                input_batch=input_batch,
+                tokenizer=self.tokenizer,
+                task_to_env=self.task_to_env,
+                greedy=False,
+                max_seq_len=None,
+                max_rollout_turns=None,
+                generation_config=cfg.policy["generation"],
+                log_full_result_tables=should_log_nemo_gym_full_result_tables(
+                    wandb_enabled=cfg.logger["wandb_enabled"],
+                    wandb_config=cfg.logger["wandb"],
+                ),
+                effort_config=EffortLevelsConfig.model_validate(
+                    cfg.env["nemo_gym"].get("effort_levels")
+                )
+                if "nemo_gym" in cfg.env
+                and cfg.env["nemo_gym"].get("effort_levels") is not None
+                else None,
+                reward_penalty_config=cfg.reward_penalties,
+                thinking_tags=get_nemo_gym_thinking_tags(cfg.env),
+                generation_only=False,
+                generation_policy_version=generation_policy_version,
+                sampling_event_id=sampling_event_id,
+            )
+            fb = result.final_batch.to("cpu")
+            rollout_metrics = result.rollout_metrics
+
+            # Prompt identity and router replay must be made complete before
+            # the exact materializer compares the logical and physical views.
+            backfill_missing_routed_experts(fb["message_log"])
+            physical_message_logs = fb.get("physical_message_logs")
+            if not isinstance(physical_message_logs, list):
+                raise TypeError(
+                    "Exact-trace rollout did not return physical_message_logs"
+                )
+            for rollout_logs in physical_message_logs:
+                if not isinstance(rollout_logs, list):
+                    raise TypeError("Physical message logs are not rollout-aligned")
+                backfill_missing_routed_experts(rollout_logs)
+
+            prompt_logs = extract_initial_prompt_messages(
+                fb["message_log"],
+                fb["length"],
+            )
+            prompt_flat, _ = batched_message_log_to_flat_message(
+                prompt_logs,
+                pad_value_dict={"token_ids": self.tokenizer.pad_token_id},
+            )
+            prompt_ids = prompt_flat["token_ids"]
+            preparation = prepare_trace_batch_for_scoring(
+                fb,
+                prompt_ids=prompt_ids,
+                advantage_estimator=_create_advantage_estimator(cfg),
+                expected_rollouts_per_group=group_size,
+                batch_quantum=batch_quantum,
+                optimizer_step_id=optimizer_step_id,
+                pad_token_id=self.tokenizer.pad_token_id,
+                make_sequence_length_divisible_by=cfg.policy[
+                    "make_sequence_length_divisible_by"
+                ],
+                training_admission=True,
+            )
+            plan = preparation["plan"]
+            plan_summary = summarize_exact_trace_plan(
+                plan,
+                pending_identity=pending_identity,
+                bundles=fb["rollout_trace_bundle"],
+                execution_contexts=fb["rollout_execution_context"],
+            )
+            train_data = preparation["materialization"]["train_data"]
+            train_data.to("cpu")
+
+            unsupported_fields = [
+                key
+                for key, value in train_data.items()
+                if not isinstance(value, (torch.Tensor, PackedTensor))
+            ]
+            if unsupported_fields:
+                raise TypeError(
+                    "Exact-trace TQ payload contains unsupported fields "
+                    f"{sorted(unsupported_fields)!r}"
+                )
+            router_replay_enabled = bool(
+                (cfg.policy.get("router_replay") or {}).get("enabled", False)
+            )
+            if router_replay_enabled and ROUTED_EXPERTS_FIELD not in train_data:
+                raise RuntimeError(
+                    "policy.router_replay.enabled=true requires routed_experts "
+                    "on every exact physical trace row"
+                )
+
+            physical_sample_ids = [
+                f"{plan['plan_id']}:{row_index}"
+                for row_index in range(int(plan["total_row_count"]))
+            ]
+            packed_tensor_wire_schema = describe_packed_tensor_wire(
+                train_data,
+                sample_ids=physical_sample_ids,
+            )
+
+            rewards = fb["total_reward"]
+            baselines, stds = calculate_baseline_and_std_per_prompt(
+                prompt_ids,
+                rewards,
+                torch.ones_like(rewards),
+                leave_one_out_baseline=cfg.grpo.use_leave_one_out_baseline,
+            )
+            materialization = preparation["materialization"]
+            content = [
+                "".join(str(message.get("content", "")) for message in message_log)
+                for message_log in materialization["materialized_message_logs"]
+            ]
+            # Decoded text is potentially large and is logging data, not
+            # two-phase control metadata. Store it beside the tensor rows in
+            # TQ as an object column; the controller fetches it only when its
+            # JSONL logging path needs it.
+            train_data["content"] = np.asarray(content, dtype=object)
+            controller_summary: dict[str, Any] = {
+                **plan_summary,
+                "plan": plan,
+                "logical_rewards": rewards.tolist(),
+                "logical_baselines": baselines.tolist(),
+                "logical_stds": stds.tolist(),
+                "logical_prompt_lengths": fb["length"].tolist(),
+                "rollout_advantages": [
+                    preparation["rollout_advantages"][rollout_id]
+                    for rollout_id in plan["rollout_ids"]
+                ],
+                "physical_input_lengths": train_data["input_lengths"].tolist(),
+                "row_rewards": materialization["row_rewards"].tolist(),
+                "packed_tensor_wire_schema": packed_tensor_wire_schema,
+            }
+            rollout_succeeded = True
+        finally:
+            if not rollout_succeeded:
+                self._exact_trace_failed_identity = pending_identity
+            if self.policy_generation is not None and finish_generation:
+                try:
+                    self.policy_generation.finish_generation()
+                except Exception:
+                    self._exact_trace_failed_identity = pending_identity
+                    raise
+
+        if not rollout_succeeded:
+            raise AssertionError("Exact-trace rollout exited without a result")
+        generation_logger_metrics = (
+            self.policy_generation.get_logger_metrics()
+            if self.policy_generation is not None
+            else None
+        )
+        self._exact_trace_pending = {
+            "pending_identity": pending_identity,
+            "controller_summary": controller_summary,
+            "rollout_metrics": rollout_metrics,
+            "generation_logger_metrics": generation_logger_metrics,
+            "preparation": preparation,
+            "commit_state": "prepared",
+            "committed_meta": None,
+            "partition_id": None,
+            "intended_sample_ids": None,
+        }
+        self._exact_trace_failed_identity = None
+        return controller_summary, rollout_metrics, generation_logger_metrics
+
+    def commit_pending_exact_trace(
+        self,
+        *,
+        pending_handle: str,
+        partition_id: str,
+    ) -> KVBatchMeta:
+        """Commit a prepared physical batch once after controller registration."""
+        from nemo_rl.experience.sync_exact_trace import (
+            build_exact_trace_wire_identity,
+            validate_exact_trace_committed_meta,
+        )
+
+        pending = self._require_exact_trace_pending(pending_handle)
+        committed_meta = pending["committed_meta"]
+        if committed_meta is not None:
+            if pending["partition_id"] != partition_id:
+                raise ValueError("Exact-trace retry changed its TQ partition")
+            return committed_meta
+        if pending["commit_state"] == "committing":
+            if pending["partition_id"] != partition_id:
+                raise ValueError("Exact-trace retry changed its TQ partition")
+            raise RuntimeError(
+                "Exact-trace TQ commit outcome is ambiguous; abort the pending "
+                "handle to clear its plan-derived sample IDs before continuing"
+            )
+        if pending["commit_state"] != "prepared":
+            raise RuntimeError(
+                "Exact-trace pending plan has invalid commit state "
+                f"{pending['commit_state']!r}"
+            )
+
+        preparation = pending["preparation"]
+        plan = preparation["plan"]
+        sample_ids, tags, extra_info = build_exact_trace_wire_identity(
+            plan,
+            pending_identity=pending["pending_identity"],
+            execution_ids_by_rollout=pending["controller_summary"][
+                "execution_ids_by_rollout"
+            ],
+        )
+        packed_tensor_wire_schema = pending["controller_summary"].get(
+            "packed_tensor_wire_schema"
+        )
+        if packed_tensor_wire_schema is not None:
+            extra_info[PACKED_TENSOR_WIRE_SCHEMA_KEY] = packed_tensor_wire_schema
+        train_data = preparation["materialization"]["train_data"]
+        trace_rollout_payload(keys=sample_ids, data=train_data)
+        # Record the complete cleanup authority immediately before the first
+        # non-idempotent KV write. If the write succeeds but the RPC response
+        # is lost, an explicit abort can clear the deterministic keys without
+        # replaying either the Gym /run or the Mooncake put.
+        pending["commit_state"] = "committing"
+        pending["partition_id"] = partition_id
+        pending["intended_sample_ids"] = list(sample_ids)
+        meta = kv_first_write(
+            train_data,
+            sample_ids=sample_ids,
+            dp_client=self._dp_client,
+            partition_id=partition_id,
+            extra_info=extra_info,
+            task_name=partition_id,
+            pad_to_multiple=int(
+                self.master_config.policy.get("make_sequence_length_divisible_by") or 1
+            ),
+            tags=tags,
+        )
+        validate_exact_trace_committed_meta(
+            sample_ids=meta.sample_ids,
+            tags=meta.tags,
+            extra_info=meta.extra_info,
+            plan=plan,
+            pending_identity=pending["pending_identity"],
+            execution_ids_by_rollout=pending["controller_summary"][
+                "execution_ids_by_rollout"
+            ],
+        )
+        if (
+            packed_tensor_schema_from_extra_info(meta.extra_info)
+            != packed_tensor_wire_schema
+        ):
+            raise ValueError("Committed exact-trace media schema changed")
+        pending["committed_meta"] = meta
+        pending["commit_state"] = "committed"
+        return meta
+
+    def validate_pending_exact_trace_scoring(
+        self,
+        *,
+        pending_handle: str,
+        meta: KVBatchMeta,
+        skip_policy_logprobs: bool,
+        skip_reference_logprobs: bool,
+    ) -> dict[str, Any]:
+        """Validate TQ worker columns on the actor-owned physical authority."""
+        from nemo_rl.experience.sync_exact_trace import (
+            validate_exact_trace_committed_meta,
+        )
+        from nemo_rl.experience.trace_batch_scoring import (
+            attach_precomputed_trace_logprobs,
+        )
+
+        pending = self._require_exact_trace_pending(pending_handle)
+        if pending["commit_state"] != "committed" or pending["committed_meta"] is None:
+            raise RuntimeError("Cannot score an uncommitted exact-trace plan")
+        committed_meta = pending["committed_meta"]
+        if (
+            meta.partition_id != committed_meta.partition_id
+            or meta.sample_ids != committed_meta.sample_ids
+            or meta.sequence_lengths != committed_meta.sequence_lengths
+        ):
+            raise ValueError("Exact-trace scoring metadata changed after TQ commit")
+        preparation = pending["preparation"]
+        plan = preparation["plan"]
+        validate_exact_trace_committed_meta(
+            sample_ids=meta.sample_ids,
+            tags=meta.tags,
+            extra_info=meta.extra_info,
+            plan=plan,
+            pending_identity=pending["pending_identity"],
+            execution_ids_by_rollout=pending["controller_summary"][
+                "execution_ids_by_rollout"
+            ],
+        )
+        fields = [
+            "input_ids",
+            "input_lengths",
+            "generation_logprobs",
+            "token_mask",
+            "sample_mask",
+            "advantages",
+        ]
+        if ROUTED_EXPERTS_FIELD in preparation["materialization"]["train_data"]:
+            fields.append(ROUTED_EXPERTS_FIELD)
+        if not skip_policy_logprobs:
+            fields.append("prev_logprobs")
+        if not skip_reference_logprobs:
+            fields.append("reference_policy_logprobs")
+        observed = read_columns(
+            self._dp_client,
+            meta,
+            select_fields=fields,
+            pad_value_dict={"input_ids": self.tokenizer.pad_token_id},
+        )
+        expected = preparation["materialization"]["train_data"]
+        expected_width = int(expected["input_ids"].shape[1])
+        aligned: dict[str, torch.Tensor] = {}
+        for field in fields:
+            value = observed[field]
+            expected_value = expected.get(field)
+            if not isinstance(value, torch.Tensor):
+                raise TypeError(f"TQ exact-trace field {field!r} is not a tensor")
+            if value.ndim >= 2 and value.shape[1] > expected_width:
+                trailing = value[:, expected_width:]
+                pad_value = self.tokenizer.pad_token_id if field == "input_ids" else 0
+                if torch.any(trailing != pad_value):
+                    raise ValueError(
+                        f"TQ exact-trace field {field!r} has non-canonical padding"
+                    )
+                value = value[:, :expected_width]
+            aligned[field] = value
+            if expected_value is not None:
+                if not isinstance(expected_value, torch.Tensor) or not torch.equal(
+                    value,
+                    expected_value,
+                ):
+                    raise ValueError(
+                        f"TQ exact-trace field {field!r} changed after commit"
+                    )
+
+        scored = attach_precomputed_trace_logprobs(
+            preparation,
+            policy_output=(
+                {"logprobs": aligned["prev_logprobs"]}
+                if not skip_policy_logprobs
+                else None
+            ),
+            reference_output=(
+                {"reference_logprobs": aligned["reference_policy_logprobs"]}
+                if not skip_reference_logprobs
+                else None
+            ),
+            skip_policy_logprobs=skip_policy_logprobs,
+            skip_reference_logprobs=skip_reference_logprobs,
+        )
+        canonical_train_data = scored["train_data"]
+        skipped_fields: dict[str, torch.Tensor] = {}
+        for skipped, field in (
+            (skip_policy_logprobs, "prev_logprobs"),
+            (skip_reference_logprobs, "reference_policy_logprobs"),
+        ):
+            canonical = canonical_train_data[field]
+            if skipped:
+                # No worker wrote this field, so seed its canonical zero
+                # placeholder exactly once.
+                skipped_fields[field] = canonical
+            elif not torch.equal(aligned[field], canonical):
+                raise ValueError(
+                    f"TQ exact-trace worker field {field!r} was not canonical "
+                    "on masked token positions"
+                )
+        if skipped_fields:
+            write_columns(
+                self._dp_client,
+                meta,
+                skipped_fields,
+            )
+        return {
+            "plan_id": plan["plan_id"],
+            "total_row_count": plan["total_row_count"],
+            "logical_rollout_count": plan["logical_rollout_count"],
+            "eligible_action_token_count": plan["eligible_action_token_count"],
+        }
+
+    def abort_pending_exact_trace(self, *, pending_handle: str) -> bool:
+        """Clear a prepared/committed plan after any controller-side failure."""
+        pending = self._exact_trace_pending
+        if pending is None:
+            failed_identity = self._exact_trace_failed_identity
+            if (
+                failed_identity is not None
+                and failed_identity["pending_handle"] == pending_handle
+            ):
+                self._exact_trace_failed_identity = None
+                return True
+            return False
+        pending = self._require_exact_trace_pending(pending_handle)
+        meta = pending["committed_meta"]
+        intended_sample_ids = pending["intended_sample_ids"]
+        partition_id = pending["partition_id"]
+        if meta is not None:
+            self._dp_client.clear_samples(
+                sample_ids=meta.sample_ids,
+                partition_id=meta.partition_id,
+            )
+        elif intended_sample_ids is not None and partition_id is not None:
+            self._dp_client.clear_samples(
+                sample_ids=list(intended_sample_ids),
+                partition_id=partition_id,
+            )
+        # Do not discard the cleanup authority when clear_samples raises.
+        # The controller can clear the same deterministic IDs and then retry
+        # this idempotent abort to release actor memory.
+        self._exact_trace_pending = None
+        self._exact_trace_failed_identity = None
+        return True
+
+    def finalize_pending_exact_trace(self, *, pending_handle: str) -> None:
+        """Release actor memory after the controller cleared committed samples."""
+        pending = self._require_exact_trace_pending(pending_handle)
+        if pending["commit_state"] != "committed" or pending["committed_meta"] is None:
+            raise RuntimeError("Cannot finalize an uncommitted exact-trace plan")
+        self._exact_trace_pending = None
+        self._exact_trace_failed_identity = None
+
+    def _require_exact_trace_pending(self, pending_handle: str) -> dict[str, Any]:
+        pending = self._exact_trace_pending
+        if pending is None:
+            raise RuntimeError("SyncRolloutActor has no pending exact-trace plan")
+        if pending["pending_identity"]["pending_handle"] != pending_handle:
+            raise ValueError("Exact-trace pending handle does not match actor state")
+        return pending
+
     def shutdown(self) -> None:
         try:
+            if self._exact_trace_pending is not None:
+                self.abort_pending_exact_trace(
+                    pending_handle=self._exact_trace_pending["pending_identity"][
+                        "pending_handle"
+                    ]
+                )
+            self._exact_trace_failed_identity = None
             self._dp_client.close()
         except Exception:
             pass

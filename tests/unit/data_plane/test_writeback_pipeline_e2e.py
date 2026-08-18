@@ -24,6 +24,7 @@ mixin subclass that fakes ``_is_replica_leader``.
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from nemo_rl.data_plane import KVBatchMeta
@@ -127,3 +128,46 @@ def test_writeback_single_worker_default_is_leader():
         select_fields=["prev_logprobs"],
     )
     assert torch.allclose(fetched["prev_logprobs"], torch.full((1, 4), 7.5))
+
+
+def test_writeback_canonicalizes_masked_logprob_positions_before_first_put():
+    client = NoOpDataPlaneClient()
+    meta = _seed_partition_with_one_sample(client)
+    worker = _FakeWorker(client, is_leader=True)
+    mask = torch.tensor([[False, True, False, True]])
+    values = torch.tensor([[float("nan"), 1.0, float("inf"), 2.0]])
+
+    worker._write_back_result_field(
+        meta,
+        BatchedDataDict({"logprobs": values}),
+        result_key="logprobs",
+        tq_field="prev_logprobs",
+        effective_token_mask=mask,
+    )
+
+    fetched = client.get_samples(
+        sample_ids=meta.sample_ids,
+        partition_id="train",
+        select_fields=["prev_logprobs"],
+    )
+    assert torch.equal(
+        fetched["prev_logprobs"],
+        torch.tensor([[0.0, 1.0, 0.0, 2.0]]),
+    )
+
+
+def test_writeback_rejects_nonfinite_eligible_logprob():
+    client = NoOpDataPlaneClient()
+    meta = _seed_partition_with_one_sample(client)
+    worker = _FakeWorker(client, is_leader=True)
+
+    with pytest.raises(ValueError, match="non-finite values on eligible"):
+        worker._write_back_result_field(
+            meta,
+            BatchedDataDict(
+                {"logprobs": torch.tensor([[0.0, float("nan"), 0.0, 2.0]])}
+            ),
+            result_key="logprobs",
+            tq_field="prev_logprobs",
+            effective_token_mask=torch.tensor([[False, True, False, True]]),
+        )

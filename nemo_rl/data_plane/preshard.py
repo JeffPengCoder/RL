@@ -35,6 +35,7 @@ from nemo_rl.data_plane.schema import (
     META_IDX,
     MICRO_BATCH_INDICES,
     MICRO_BATCH_LENGTHS,
+    PACKED_TENSOR_WIRE_SCHEMA_KEY,
     SAMPLE_MASK,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -143,6 +144,22 @@ def shard_meta_for_dp(
         rank_sample_ids = [meta.sample_ids[i] for i in idx_list]
         rank_seqlens = [seq_lens[i] for i in idx_list]
         rank_extra = dict(base_extra)
+        packed_tensor_schema = rank_extra.get(PACKED_TENSOR_WIRE_SCHEMA_KEY)
+        if packed_tensor_schema is not None:
+            # Replica-leader broadcast reconstructs one PackedTensor for this
+            # DP shard. Bind its authority to the shard's exact ordered sample
+            # IDs rather than carrying the full global-batch authority into a
+            # smaller local payload.
+            from nemo_rl.data_plane.packed_tensor_wire import (
+                subset_packed_tensor_wire_schema,
+            )
+
+            rank_extra[PACKED_TENSOR_WIRE_SCHEMA_KEY] = (
+                subset_packed_tensor_wire_schema(
+                    packed_tensor_schema,
+                    sample_ids=rank_sample_ids,
+                )
+            )
         # Per-shard packing metadata — set by ``shard_by_batch_size`` when
         # sequence_packing or dynamic_batching is enabled. Workers'
         # *_presharded paths look these up off ``meta.extra_info`` to avoid

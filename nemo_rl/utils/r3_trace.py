@@ -147,11 +147,15 @@ def _write_record(record: dict[str, Any]) -> None:
 
 
 def _tensor_sha256(tensor: Any) -> str:
+    import torch
+
     t = tensor.detach()
     if getattr(t, "device", None) is not None and t.device.type != "cpu":
         t = t.cpu()
     t = t.contiguous()
-    return hashlib.sha256(t.numpy().tobytes()).hexdigest()
+    # ``Tensor.numpy()`` rejects some training dtypes (notably bfloat16).
+    # Hash the same underlying bytes through an explicit uint8 view.
+    return hashlib.sha256(t.view(torch.uint8).numpy().tobytes()).hexdigest()
 
 
 def _tensor_preview(tensor: Any, limit: int = 16) -> list[Any]:
@@ -410,15 +414,28 @@ def trace_tq_fetch_payload(
     stage: str,
     keys: Sequence[str],
     data: Any,
+    media_wire_schema_id: Optional[str] = None,
 ) -> None:
     active, step = _should_trace_step(f"tq_fetch:{stage}")
-    if not active or "routed_experts" not in data or "input_lengths" not in data:
+    if not active or "input_lengths" not in data:
         return
 
-    routed_experts = data["routed_experts"]
+    from nemo_rl.data.multimodal_utils import PackedTensor
+
+    media = {
+        key: value for key, value in data.items() if isinstance(value, PackedTensor)
+    }
+    if "routed_experts" not in data and not media:
+        return
+
+    routed_experts = data.get("routed_experts")
     input_lengths = data["input_lengths"]
     input_ids = data.get("input_ids")
-    sample_count = min(len(keys), int(routed_experts.shape[0]))
+    sample_count = len(keys)
+    if routed_experts is not None:
+        sample_count = min(sample_count, int(routed_experts.shape[0]))
+    for packed in media.values():
+        sample_count = min(sample_count, len(packed))
     preview_samples = _trace_samples()
 
     for sample_idx in range(sample_count):
@@ -431,13 +448,14 @@ def trace_tq_fetch_payload(
             "sample_idx": sample_idx,
             "key": keys[sample_idx],
             "valid_length": valid_length,
-            "routed_experts": _valid_sample_record(
+        }
+        if routed_experts is not None:
+            record["routed_experts"] = _valid_sample_record(
                 routed_experts,
                 sample_idx=sample_idx,
                 valid_length=valid_length,
                 preview_limit=preview_limit,
-            ),
-        }
+            )
         if input_ids is not None:
             record["input_ids"] = _valid_sample_record(
                 input_ids,
@@ -445,6 +463,19 @@ def trace_tq_fetch_payload(
                 valid_length=valid_length,
                 preview_limit=preview_limit,
             )
+        if media:
+            record["media_wire_schema_id"] = media_wire_schema_id
+            record["packed_tensor_media"] = {
+                logical_key: (
+                    None
+                    if packed.tensors[sample_idx] is None
+                    else _tensor_record(
+                        packed.tensors[sample_idx],
+                        preview_limit=preview_limit,
+                    )
+                )
+                for logical_key, packed in sorted(media.items())
+            }
         _write_record(record)
 
 

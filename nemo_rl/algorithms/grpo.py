@@ -19,6 +19,7 @@ import warnings
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
+from copy import deepcopy
 from dataclasses import dataclass, fields
 from typing import Any, Callable, Optional, TypeVar, cast
 
@@ -90,6 +91,7 @@ from nemo_rl.experience.interfaces import (
     NEMO_GYM_TASK_INDEX_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
 )
+from nemo_rl.experience.rollout_identity import new_sampling_event_id
 from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
     backfill_missing_routed_experts,
@@ -311,6 +313,33 @@ class GRPOSaveState:
     val_reward: float  # May be removed when no validation metrics are available
 
 
+def _add_role_node_resource(
+    constraints: list[dict[str, float]] | None,
+    num_nodes: int,
+    resource_name: str | None,
+) -> list[dict[str, float]] | None:
+    """Merge an optional Ray role label into every logical node constraint."""
+    if resource_name is None:
+        return constraints
+
+    resource_name = resource_name.strip()
+    if not resource_name:
+        raise ValueError("Ray role resource names must not be empty")
+
+    if constraints is None:
+        constraints = [{} for _ in range(num_nodes)]
+    elif len(constraints) != num_nodes:
+        raise ValueError(
+            f"Expected {num_nodes} node resource constraints, got {len(constraints)}"
+        )
+
+    role_resource_fraction = 0.001
+    return [
+        {**constraint, resource_name: role_resource_fraction}
+        for constraint in constraints
+    ]
+
+
 def _initial_grpo_save_state() -> GRPOSaveState:
     return GRPOSaveState(
         consumed_samples=0,
@@ -414,6 +443,7 @@ def setup(
     )
     if generation_config["backend"] == "vllm":
         normalize_vllm_refit_config(cast(VllmConfig, generation_config))
+    _auto_enable_trajectory_training(master_config, dataset)
     _validate_context_compaction_training_config(master_config)
 
     # Set seed for all random number generators
@@ -616,10 +646,10 @@ def setup(
         master_config, enable_nemo_gym=enable_nemo_gym
     )
     nemo_gym_actor = None
-    context_compaction_runtime_contract = None
+    trajectory_runtime_contract = None
     if enable_nemo_gym:
         if _context_compaction_training_enabled(master_config):
-            context_compaction_runtime_contract = build_runtime_generation_contract(
+            trajectory_runtime_contract = build_runtime_generation_contract(
                 model_name=policy_config["model_name"],
                 model_revision=str(
                     last_checkpoint_path
@@ -631,13 +661,11 @@ def setup(
                 tokenizer_config=policy_config["tokenizer"],
                 generation_config=generation_config,
             )
-            if not context_compaction_runtime_contract["training_eligible"]:
+            if not trajectory_runtime_contract["training_eligible"]:
                 raise ValueError(
                     "Context-compaction training requires a complete launcher "
                     "runtime generation contract:\n- "
-                    + "\n- ".join(
-                        context_compaction_runtime_contract["incomplete_reasons"]
-                    )
+                    + "\n- ".join(trajectory_runtime_contract["incomplete_reasons"])
                 )
 
     def _spinup_nemo_gym(base_urls, model_name):
@@ -656,7 +684,7 @@ def setup(
             enable_router_replay=enable_router_replay,
             routed_experts_dtype=routed_experts_dtype,
             use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
-            context_compaction_runtime_contract=(context_compaction_runtime_contract),
+            trajectory_runtime_contract=trajectory_runtime_contract,
         )
         return actor, time.perf_counter() - t0
 
@@ -908,6 +936,20 @@ def setup(
                         f"skipping inference topology constraints",
                         flush=True,
                     )
+
+        # Heterogeneous deployments must not rely on Ray join or placement
+        # creation order to decide which host trains and which host serves
+        # inference. Merge explicit role labels with topology constraints.
+        node_resource_constraints = _add_role_node_resource(
+            node_resource_constraints,
+            train_nodes,
+            cluster_config.get("training_node_resource"),
+        )
+        inference_node_resource_constraints = _add_role_node_resource(
+            inference_node_resource_constraints,
+            inference_nodes,
+            cluster_config.get("inference_node_resource"),
+        )
 
         # initialize train cluster
         train_cluster = RayVirtualCluster(
@@ -2112,6 +2154,53 @@ def _context_compaction_training_enabled(master_config: MasterConfig) -> bool:
     return bool(_config_value(cc_config, "enabled", False))
 
 
+def _dataset_declares_trajectory_identity(
+    dataset: AllTaskProcessedDataset | dict[str, AllTaskProcessedDataset],
+) -> bool:
+    """Detect the generic caller-owned trajectory contract without a mode flag."""
+    datasets = dataset.values() if isinstance(dataset, dict) else (dataset,)
+    declarations: list[bool] = []
+    for task_dataset in datasets:
+        if len(task_dataset) == 0:
+            continue
+        first = task_dataset[0]
+        extra_env_info = first.get("extra_env_info")
+        declarations.append(
+            isinstance(extra_env_info, Mapping)
+            and extra_env_info.get("trajectory_identity") is not None
+        )
+    if declarations and any(declarations) and not all(declarations):
+        raise ValueError(
+            "All NeMo-Gym training datasets must agree on trajectory_identity"
+        )
+    return bool(declarations and declarations[0])
+
+
+def _auto_enable_trajectory_training(
+    master_config: MasterConfig,
+    dataset: AllTaskProcessedDataset | dict[str, AllTaskProcessedDataset],
+) -> None:
+    """Select trace-aware training from data capability, not an agent strategy."""
+    nemo_gym_config = master_config.env.get("nemo_gym") or {}
+    if _config_value(nemo_gym_config, "is_trajectory_collection", False):
+        return
+    if not _dataset_declares_trajectory_identity(dataset):
+        return
+    cc_config = _config_value(
+        master_config.grpo,
+        "context_compaction_training",
+        ContextCompactionTrainingConfig(),
+    )
+    if isinstance(cc_config, Mapping):
+        cc_config["enabled"] = True
+    else:
+        cc_config.enabled = True
+    print(
+        "  ✓ Trace-aware trajectory training selected from trajectory_identity",
+        flush=True,
+    )
+
+
 def _config_value(config: Any, name: str, default: Any = None) -> Any:
     """Read a config field from either a Pydantic model or a test mapping."""
     if isinstance(config, Mapping):
@@ -2193,9 +2282,6 @@ def _validate_context_compaction_training_config(
     dtensor_enabled = bool(policy_config.get("dtensor_cfg", {}).get("enabled"))
     if not megatron_enabled or dtensor_enabled:
         errors.append("the initial implementation requires the Megatron policy backend")
-    if (master_config.data_plane or {}).get("enabled", False):
-        errors.append("the data-plane/TQ training path is not supported")
-
     logical_rollout_count = _config_value(
         grpo_config, "num_prompts_per_step"
     ) * _config_value(grpo_config, "num_generations_per_prompt")
@@ -2422,7 +2508,7 @@ def _validate_async_context_compaction_replay_groups(
             )
 
 
-def _assign_context_compaction_generation_replica_indices(
+def _assign_trajectory_generation_replica_indices(
     repeated_batch: BatchedDataDict[DatumSpec],
     *,
     num_generations_per_prompt: int,
@@ -2436,23 +2522,43 @@ def _assign_context_compaction_generation_replica_indices(
     for row_index, row in enumerate(rows):
         if not isinstance(row, dict):
             continue
-        if row.get("context_compaction_contract_version") != 2:
+        identity = row.get("trajectory_identity")
+        if identity is not None:
+            if not isinstance(identity, Mapping):
+                raise TypeError("trajectory_identity must be a mapping")
+            if identity.get("schema_version") != 1:
+                raise ValueError("Unsupported trajectory_identity schema_version")
+            base_rollout_index = identity.get("rollout_index")
+        elif row.get("context_compaction_contract_version") == 2:
+            base_rollout_index = row.get("context_compaction_rollout_index")
+        else:
             continue
-        base_rollout_index = row.get("context_compaction_rollout_index")
         if (
             isinstance(base_rollout_index, bool)
             or not isinstance(base_rollout_index, int)
             or base_rollout_index < 0
         ):
             raise ValueError(
-                "Version 2 context compaction rows require a non-negative "
-                "integer context_compaction_rollout_index before GRPO "
-                "generation replication"
+                "Trajectory rows require a non-negative integer rollout_index "
+                "before GRPO generation replication"
             )
         generation_replica_index = row_index % num_generations_per_prompt
-        row["context_compaction_rollout_index"] = (
+        replica_rollout_index = (
             base_rollout_index * num_generations_per_prompt + generation_replica_index
         )
+        if identity is not None:
+            updated_identity = dict(identity)
+            updated_identity["rollout_index"] = replica_rollout_index
+            updated_identity.pop("rollout_id", None)
+            row["trajectory_identity"] = updated_identity
+        else:
+            row["context_compaction_rollout_index"] = replica_rollout_index
+
+
+# Compatibility alias for external callers on the Arash branch.
+_assign_context_compaction_generation_replica_indices = (
+    _assign_trajectory_generation_replica_indices
+)
 
 
 def _should_log_nemo_gym_responses(master_config: MasterConfig) -> bool:
@@ -3151,7 +3257,7 @@ def grpo_train(
                             master_config.grpo.num_generations_per_prompt
                         )
                     )
-                    _assign_context_compaction_generation_replica_indices(
+                    _assign_trajectory_generation_replica_indices(
                         repeated_batch,
                         num_generations_per_prompt=(
                             master_config.grpo.num_generations_per_prompt
@@ -3262,6 +3368,10 @@ def grpo_train(
                                 f"sync-policy-step-{total_steps:08d}"
                                 if context_compaction_training
                                 else None
+                            ),
+                            sampling_event_id=new_sampling_event_id(
+                                purpose="training",
+                                step=total_steps,
                             ),
                         )
                         input_ids = nemo_gym_rollout_result.input_ids
@@ -4260,6 +4370,10 @@ def validate(
         max_batches = (
             master_config.grpo.max_val_samples // master_config.grpo.val_batch_size
         )
+        validation_sampling_event_id = new_sampling_event_id(
+            purpose="validation",
+            step=step,
+        )
         for batch_idx, val_batch in enumerate(val_dataloader):
             if batch_idx >= max_batches:
                 break
@@ -4269,6 +4383,12 @@ def validate(
             # Use async rollouts when enabled by config/backend defaults.
             # We cascade NeMo-Gym first since NeMo-Gym also uses async rollouts.
             if _should_use_nemo_gym(master_config):
+                # StatefulDataLoader may yield the same nested row objects on a
+                # later validate() call. Sampling identity is event-scoped and
+                # must never be written back into those reusable source rows.
+                source_extra_env_info = val_batch["extra_env_info"]
+                val_batch = BatchedDataDict(dict(val_batch))
+                val_batch["extra_env_info"] = deepcopy(source_extra_env_info)
                 generation_config = master_config.policy["generation"]
                 nemo_gym_rollout_result = run_nemo_gym_rollout_sync(
                     policy_generation=policy_generation,
@@ -4290,6 +4410,7 @@ def validate(
                         master_config.env
                     ),
                     generation_only=True,
+                    sampling_event_id=validation_sampling_event_id,
                 )
                 val_batch = nemo_gym_rollout_result.final_batch
                 gen_metrics = nemo_gym_rollout_result.rollout_metrics

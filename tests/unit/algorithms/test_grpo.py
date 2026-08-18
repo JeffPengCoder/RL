@@ -35,10 +35,12 @@ from nemo_rl.algorithms.grpo import (
     MasterConfig,
     RewardPenaltyConfig,
     RewardScalingConfig,
+    _add_role_node_resource,
+    _auto_enable_trajectory_training,
     _apply_configured_message_level_advantage_penalties,
     _apply_mask_sample_filter,
     _apply_message_level_advantage_penalties,
-    _assign_context_compaction_generation_replica_indices,
+    _assign_trajectory_generation_replica_indices,
     _context_compaction_batch_quantum,
     _dedup_cc_replay_groups,
     _get_grpo_save_state,
@@ -59,7 +61,11 @@ from nemo_rl.algorithms.grpo import (
     refit_policy_generation,
     validate,
 )
-from nemo_rl.algorithms.grpo_sync import _train_fields_for_step, grpo_train_sync
+from nemo_rl.algorithms.grpo_sync import (
+    _train_fields_for_step,
+    grpo_train_sync,
+    validate_sync,
+)
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
@@ -87,6 +93,23 @@ def _mock_policy_generation() -> MagicMock:
     policy_generation.requires_kv_scale_sync = False
     policy_generation.get_logger_metrics.return_value = {}
     return policy_generation
+
+
+def test_add_role_node_resource_creates_and_merges_constraints():
+    assert _add_role_node_resource(None, 2, "nrl_trainer_node") == [
+        {"nrl_trainer_node": 0.001},
+        {"nrl_trainer_node": 0.001},
+    ]
+    assert _add_role_node_resource(
+        [{"nvlink_domain_a": 0.001}], 1, "nrl_vllm_node"
+    ) == [{"nvlink_domain_a": 0.001, "nrl_vllm_node": 0.001}]
+
+
+def test_add_role_node_resource_rejects_invalid_input():
+    with pytest.raises(ValueError, match="must not be empty"):
+        _add_role_node_resource(None, 1, " ")
+    with pytest.raises(ValueError, match="Expected 2"):
+        _add_role_node_resource([{}], 2, "nrl_trainer_node")
 
 
 @patch("nemo_rl.algorithms.grpo.ray")
@@ -199,28 +222,81 @@ def test_initial_policy_generation_stale() -> None:
     assert _initial_policy_generation_stale(generation, completed_steps=0)
 
 
-def test_context_compaction_generation_replicas_receive_unique_stable_indices():
+def test_trajectory_generation_replicas_receive_unique_stable_indices():
     repeated_batch = BatchedDataDict(
         {
             "extra_env_info": [
                 {
-                    "context_compaction_contract_version": 2,
-                    "context_compaction_rollout_index": base_index,
+                    "trajectory_identity": {
+                        "schema_version": 1,
+                        "group_id": "group",
+                        "task_id": f"task-{base_index}",
+                        "rollout_index": base_index,
+                        "attempt_index": 0,
+                    }
                 }
                 for base_index in (4, 4, 7, 7)
             ]
         }
     )
 
-    _assign_context_compaction_generation_replica_indices(
+    _assign_trajectory_generation_replica_indices(
         repeated_batch,
         num_generations_per_prompt=2,
     )
 
     assert [
-        row["context_compaction_rollout_index"]
+        row["trajectory_identity"]["rollout_index"]
         for row in repeated_batch["extra_env_info"]
     ] == [8, 9, 14, 15]
+
+
+def test_trajectory_identity_automatically_selects_trace_training():
+    class _Dataset:
+        def __len__(self):
+            return 1
+
+        def __getitem__(self, index):
+            assert index == 0
+            return {
+                "extra_env_info": {
+                    "trajectory_identity": {
+                        "schema_version": 1,
+                        "group_id": "group",
+                        "task_id": "task",
+                        "rollout_index": 0,
+                        "attempt_index": 0,
+                    }
+                }
+            }
+
+    config = SimpleNamespace(
+        env={"nemo_gym": {}},
+        grpo={"context_compaction_training": {"enabled": False}},
+    )
+
+    _auto_enable_trajectory_training(config, _Dataset())
+
+    assert config.grpo["context_compaction_training"]["enabled"] is True
+
+
+def test_trajectory_collection_does_not_activate_training_admission():
+    class _Dataset:
+        def __len__(self):
+            return 1
+
+        def __getitem__(self, index):
+            assert index == 0
+            return {"extra_env_info": {"trajectory_identity": {}}}
+
+    config = SimpleNamespace(
+        env={"nemo_gym": {"is_trajectory_collection": True}},
+        grpo={"context_compaction_training": {"enabled": False}},
+    )
+
+    _auto_enable_trajectory_training(config, _Dataset())
+
+    assert config.grpo["context_compaction_training"]["enabled"] is False
 
 
 @pytest.fixture
@@ -530,6 +606,13 @@ def test_context_compaction_training_config_accepts_initial_supported_subset():
     _validate_context_compaction_training_config(_context_compaction_master_config())
 
 
+def test_context_compaction_training_config_accepts_sync_tq_transport():
+    config = _context_compaction_master_config()
+    config.data_plane = {"enabled": True}
+
+    _validate_context_compaction_training_config(config)
+
+
 def test_context_compaction_training_config_accepts_async_replay():
     config = _context_compaction_master_config()
     config.grpo["async_grpo"]["enabled"] = True
@@ -634,10 +717,6 @@ def test_context_compaction_training_config_accepts_async_replay():
         (
             lambda cfg: cfg.policy["dtensor_cfg"].update(enabled=True),
             "Megatron policy backend",
-        ),
-        (
-            lambda cfg: setattr(cfg, "data_plane", {"enabled": True}),
-            "data-plane",
         ),
     ],
 )
@@ -2343,6 +2422,67 @@ def mock_sync_grpo_infrastructure(policy):
     policy.tq_partition_id = 0
 
     return stack
+
+
+def test_validate_sync_marks_nemo_gym_rollout_as_generation_only() -> None:
+    """Sync validation must reach Gym as evaluation, never training."""
+    val_batch = BatchedDataDict({"placeholder": ["row"]})
+    rollout_actor = MagicMock()
+    meta = MagicMock()
+    rollout_actor.rollout_to_tq.remote.return_value = (
+        meta,
+        {
+            "total_reward": torch.tensor([1.0]),
+            "turn_roles": [["user", "assistant"]],
+            "turn_contents": [["prompt", "answer"]],
+        },
+        {"mean_gen_tokens_per_sample": 4.0},
+        None,
+    )
+    policy = MagicMock()
+    val_task_to_env = {"nemo_gym": MagicMock()}
+    master_config = SimpleNamespace(
+        grpo=SimpleNamespace(
+            val_period=1,
+            max_val_samples=1,
+            val_batch_size=1,
+        ),
+        env={"nemo_gym": {}},
+        logger={"num_val_samples_to_print": 0},
+    )
+
+    with (
+        patch("nemo_rl.algorithms.grpo_sync.ray.get", side_effect=lambda ref: ref),
+        patch("nemo_rl.algorithms.grpo_sync._should_use_nemo_gym", return_value=True),
+        patch(
+            "nemo_rl.algorithms.grpo_sync.new_sampling_event_id",
+            return_value="validation-event",
+        ) as new_event,
+        patch("nemo_rl.algorithms.grpo_sync.print_message_log_samples"),
+        patch("nemo_rl.algorithms.grpo_sync.torch.cuda.empty_cache"),
+    ):
+        validate_sync(
+            rollout_actor=rollout_actor,
+            policy=policy,
+            val_dataloader=[val_batch],
+            val_task_to_env=val_task_to_env,
+            step=4,
+            master_config=master_config,
+        )
+
+    rollout_actor.rollout_to_tq.remote.assert_called_once_with(
+        val_batch,
+        partition_id="val",
+        generation_only=True,
+        generation_policy_version=None,
+        sampling_event_id="validation-event",
+        first_iter=False,
+        finish_generation=False,
+        task_to_env_override=val_task_to_env,
+        carry_keys=["total_reward", "turn_roles", "turn_contents"],
+    )
+    new_event.assert_called_once_with(purpose="validation", step=4)
+    policy.finish_step.assert_called_once_with(meta)
 
 
 @pytest.mark.parametrize(
@@ -4957,6 +5097,82 @@ class TestValidateFunction:
         # Verify metrics are returned correctly
         assert "accuracy" in val_metrics
         assert "avg_length" in val_metrics
+
+    def test_validate_twice_uses_fresh_event_without_scoping_source_rows(
+        self,
+        mock_grpo_components,
+    ):
+        mock_policy_gen = MagicMock()
+        mock_tokenizer = MagicMock(pad_token_id=0)
+        source_row = {
+            "agent_ref": {"name": "osworld_agent"},
+            "trajectory_identity": {
+                "schema_version": 1,
+                "source_group_id": "dataset-group-001",
+                "task_id": "task-001",
+                "rollout_index": 0,
+                "attempt_index": 0,
+            },
+        }
+        source_batch = BatchedDataDict[DatumSpec](
+            {
+                "message_log": [[{"role": "user", "content": "test"}]],
+                "task_name": ["osworld"],
+                "extra_env_info": [source_row],
+                "total_reward": torch.tensor([1.0]),
+            }
+        )
+        mock_dataloader = MagicMock(spec=StatefulDataLoader)
+        mock_dataloader.__iter__ = MagicMock(side_effect=lambda: iter([source_batch]))
+        mock_config = mock_grpo_components["master_config"]
+        mock_config.grpo.val_batch_size = 1
+        mock_config.grpo.max_val_samples = 1
+        seen_events = []
+
+        def fake_rollout(*, input_batch, sampling_event_id, **kwargs):
+            dispatched_row = input_batch["extra_env_info"][0]
+            assert "sampling_event_id" not in dispatched_row
+            dispatched_row["sampling_event_id"] = sampling_event_id
+            seen_events.append(sampling_event_id)
+            return NemoGymRolloutResult(
+                input_ids=torch.tensor([[1]]),
+                final_batch=input_batch,
+                rollout_metrics={"mean_gen_tokens_per_sample": 1.0},
+                task_index=None,
+            )
+
+        with (
+            patch("nemo_rl.algorithms.grpo._should_use_nemo_gym", return_value=True),
+            patch(
+                "nemo_rl.algorithms.grpo.new_sampling_event_id",
+                side_effect=["sampling-validation-5", "sampling-validation-6"],
+            ),
+            patch(
+                "nemo_rl.algorithms.grpo.run_nemo_gym_rollout_sync",
+                side_effect=fake_rollout,
+            ),
+            patch("nemo_rl.algorithms.grpo.print_message_log_samples"),
+        ):
+            validate(
+                mock_policy_gen,
+                mock_dataloader,
+                mock_tokenizer,
+                None,
+                step=5,
+                master_config=mock_config,
+            )
+            validate(
+                mock_policy_gen,
+                mock_dataloader,
+                mock_tokenizer,
+                None,
+                step=6,
+                master_config=mock_config,
+            )
+
+        assert seen_events == ["sampling-validation-5", "sampling-validation-6"]
+        assert "sampling_event_id" not in source_row
+        assert "sampling_event_id" not in source_batch["extra_env_info"][0]
 
     def test_validate_returns_empty_when_no_dataloader(self, mock_grpo_components):
         """Test that validate returns empty dicts when no dataloader is provided."""

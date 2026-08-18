@@ -70,6 +70,18 @@ PostProcessingFunction = Union[
 ]
 
 
+def _model_uses_expanded_media_token_validity(model: Any) -> bool:
+    """Whether a model interprets a 2-D attention mask as media-token validity."""
+    from megatron.core.utils import unwrap_model
+
+    unwrapped = unwrap_model(model)
+    chunks = unwrapped if isinstance(unwrapped, (list, tuple)) else [unwrapped]
+    return any(
+        bool(getattr(chunk, "model_slices_context_parallel_inputs", False))
+        for chunk in chunks
+    )
+
+
 def model_forward(
     model: GPTModel,
     data_dict: BatchedDataDict[Any],
@@ -106,6 +118,17 @@ def model_forward(
     )
     if len(multimodal_data) > 0:
         position_ids = None
+        # Megatron's decoder mask is [1, 1, S, S] with True meaning a blocked
+        # future position. Canonical Nemotron Omni media insertion instead
+        # treats a supplied mask as [B, S] token validity with True meaning a
+        # usable placeholder. The language model already applies causality, so
+        # drop only this incompatible 4-D mask at the expanded-media consumer.
+        if (
+            attention_mask is not None
+            and attention_mask.dim() == 4
+            and _model_uses_expanded_media_token_validity(model)
+        ):
+            attention_mask = None
 
     additional_kwargs = {}
     # Mamba models currently do not support packed_seq_params

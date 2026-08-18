@@ -363,27 +363,70 @@ def batched_message_log_to_flat_message(
     result = BatchedDataDict()
     for key in all_keys:
         values = [seq.get(key) for seq in sequenced_lists]
-        # if the values are PackedTensors, create a new PackedTensor from the list of values
-        if values and isinstance(values[0], PackedTensor):
-            result[key] = PackedTensor.flattened_concat(values)
+        # A modality may be absent from some samples in the batch. This is
+        # common for agentic rollouts: an environment can fail before the
+        # first screenshot reaches the model while neighboring samples still
+        # contain image tensors. Preserve one packed entry per sample by
+        # replacing a missing modality with an empty PackedTensor. Detect the
+        # type from every value instead of only values[0], so behavior does
+        # not depend on batch order.
+        packed_values = [value for value in values if isinstance(value, PackedTensor)]
+        if packed_values:
+            unexpected_types = {
+                type(value).__name__
+                for value in values
+                if value is not None and not isinstance(value, PackedTensor)
+            }
+            if unexpected_types:
+                raise TypeError(
+                    f"expected PackedTensor or None for {key!r}, got "
+                    f"{sorted(unexpected_types)}"
+                )
+            reference = packed_values[0]
+            filled_packed_values = [
+                value
+                if isinstance(value, PackedTensor)
+                else PackedTensor.empty_like(reference)
+                for value in values
+            ]
+            result[key] = PackedTensor.flattened_concat(filled_packed_values)
             continue
-        if not values or not isinstance(values[0], Tensor):
+        tensor_values = [value for value in values if isinstance(value, Tensor)]
+        if not tensor_values:
             result[key] = values
             continue
 
+        unexpected_types = {
+            type(value).__name__
+            for value in values
+            if value is not None and not isinstance(value, Tensor)
+        }
+        if unexpected_types:
+            raise TypeError(
+                f"expected Tensor or None for {key!r}, got {sorted(unexpected_types)}"
+            )
+
         # Filter out None values and validate consistency
         values: list[Tensor | None] = cast(list[Tensor | None], values)
-        tensors = cast(list[Tensor], [t for t in values if t is not None])
+        tensors = cast(list[Tensor], tensor_values)
         try:
             _validate_tensor_consistency(tensors)
         except RuntimeError as e:
             e.add_note(f"[key={key!r}]")
             raise
 
-        # Create zero tensors for None values
+        # Preserve trailing modality dimensions for a sample where an optional
+        # dense tensor is absent. A rank-one empty tensor would pad to
+        # ``[max_len]`` and fail to stack with, for example, neighboring
+        # ``pixel_values`` shaped ``[max_len, 52, 6]``.
+        reference = tensors[0]
         filled_values: list[Tensor] = [
             (
-                torch.zeros(0, dtype=tensors[0].dtype, device=tensors[0].device)  # type: ignore
+                torch.zeros(
+                    (0, *reference.shape[1:]),
+                    dtype=reference.dtype,
+                    device=reference.device,
+                )
                 if v is None
                 else v
             )

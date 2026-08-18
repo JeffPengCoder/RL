@@ -204,6 +204,8 @@ def build_rollout_trace_bundle(
     boundary_events: Sequence[Mapping[str, Any]] = (),
     policy_name: str | None = None,
     group_id: str | None = None,
+    sampling_event_id: str | None = None,
+    source_group_id: str | None = None,
     source_row_index: int | None = None,
     reward: float | None = None,
     media_assets: Mapping[str, Any] | None = None,
@@ -713,6 +715,10 @@ def build_rollout_trace_bundle(
         "physical_traces": physical_traces,
         "checks": checks,
     }
+    if sampling_event_id is not None:
+        bundle["sampling_event_id"] = sampling_event_id
+    if source_group_id is not None:
+        bundle["source_group_id"] = source_group_id
     if strict:
         validate_rollout_trace_bundle(
             bundle,

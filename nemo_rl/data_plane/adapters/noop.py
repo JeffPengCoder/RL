@@ -95,6 +95,16 @@ class NoOpDataPlaneClient(DataPlaneClient):
             consumed={t: set() for t in consumer_tasks},
         )
 
+    def ensure_partition_fields(
+        self,
+        partition_id: str,
+        fields: list[str],
+    ) -> None:
+        rec = self._partitions[partition_id]
+        for field_name in fields:
+            if field_name not in rec.fields:
+                rec.fields.append(field_name)
+
     def claim_meta(
         self,
         partition_id: str,

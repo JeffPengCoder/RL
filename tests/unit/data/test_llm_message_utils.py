@@ -772,6 +772,86 @@ def test_batched_message_log_to_flat_message_with_packed_images() -> None:
     assert torch.equal(input_lengths, torch.tensor([4, 5], dtype=torch.int32))
 
 
+def test_batched_message_log_to_flat_message_with_missing_packed_images() -> None:
+    """Missing modalities keep their batch positions regardless of row order."""
+    from nemo_rl.data.multimodal_utils import PackedTensor
+
+    image = torch.randn(2, 3, 4, 4)
+    batch_logs = [
+        [
+            {
+                "role": "user",
+                "content": "environment failed before screenshot",
+                "token_ids": torch.tensor([1, 2]),
+            }
+        ],
+        [
+            {
+                "role": "user",
+                "content": "normal multimodal prompt",
+                "token_ids": torch.tensor([3, 4, 5]),
+                "images": PackedTensor(image, dim_to_pack=0),
+            }
+        ],
+        [
+            {
+                "role": "user",
+                "content": "another environment failure",
+                "token_ids": torch.tensor([6]),
+            }
+        ],
+    ]
+
+    batched, input_lengths = batched_message_log_to_flat_message(
+        batch_logs, pad_value_dict={"token_ids": 0}
+    )
+
+    assert isinstance(batched["images"], PackedTensor)
+    assert len(batched["images"]) == 3
+    assert batched["images"].tensors[0] is None
+    assert torch.equal(batched["images"].tensors[1], image)
+    assert batched["images"].tensors[2] is None
+    assert torch.equal(input_lengths, torch.tensor([2, 3, 1], dtype=torch.int32))
+
+
+def test_batched_message_log_to_flat_message_with_missing_dense_modality() -> None:
+    """Missing dense modalities retain the reference tensor's trailing shape."""
+    token_rows = ([1, 2], [3, 4, 5], [6])
+    for modality_index in range(3):
+        pixel_values = torch.arange(2 * 4 * 3).reshape(2, 4, 3)
+        batch_logs = []
+        for batch_index, token_ids in enumerate(token_rows):
+            message = {
+                "role": "user",
+                "content": "prompt",
+                "token_ids": torch.tensor(token_ids),
+            }
+            if batch_index == modality_index:
+                message["pixel_values"] = pixel_values
+            batch_logs.append([message])
+
+        batched, input_lengths = batched_message_log_to_flat_message(
+            batch_logs, pad_value_dict={"token_ids": 0}
+        )
+
+        assert batched["pixel_values"].shape == (3, 3, 4, 3)
+        for batch_index in range(3):
+            if batch_index == modality_index:
+                assert torch.equal(
+                    batched["pixel_values"][batch_index, :2], pixel_values
+                )
+                assert torch.count_nonzero(batched["pixel_values"][batch_index, 2]) == 0
+            else:
+                assert torch.count_nonzero(batched["pixel_values"][batch_index]) == 0
+        expected_lengths = [
+            max(len(token_ids), 2 if batch_index == modality_index else 0)
+            for batch_index, token_ids in enumerate(token_rows)
+        ]
+        assert torch.equal(
+            input_lengths, torch.tensor(expected_lengths, dtype=torch.int32)
+        )
+
+
 @pytest.mark.hf_gated
 def test_get_formatted_message_log_multimodal_prompt_formatting() -> None:
     processor = AutoProcessor.from_pretrained("Qwen/Qwen2.5-VL-3B-Instruct")

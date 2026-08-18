@@ -32,6 +32,7 @@ against both entrypoints and diffing the wandb runs.
 from __future__ import annotations
 
 import gc
+import json
 import os
 import warnings
 from typing import TYPE_CHECKING, Any, Optional
@@ -48,7 +49,10 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from nemo_rl.algorithms.grpo import (
     GRPOSaveState,
     MasterConfig,
+    _assign_trajectory_generation_replica_indices,
     _clip_grpo_advantages,
+    _context_compaction_batch_quantum,
+    _context_compaction_training_enabled,
     _create_advantage_estimator,
     _log_mixed_rewards_and_advantages_information,
     _placeholder_seq_logprob_error_metrics,
@@ -56,6 +60,7 @@ from nemo_rl.algorithms.grpo import (
     _should_log_nemo_gym_responses,
     _should_use_nemo_gym,
     _validation_early_stop_message,
+    _validate_context_compaction_training_config,
     compute_and_apply_seq_logprob_error_masking,
     refit_policy_generation,
     scale_rewards,
@@ -74,9 +79,14 @@ from nemo_rl.algorithms.utils import (
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.data_plane.interfaces import KVBatchMeta
+from nemo_rl.data_plane.packed_tensor_wire import (
+    extend_fields_with_packed_tensor_wire,
+    packed_tensor_schema_from_extra_info,
+)
 from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS, DP_TRAIN_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.experience.rollout_identity import new_sampling_event_id
 from nemo_rl.experience.sync_rollout_actor import SyncRolloutActor
 from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.generation.megatron import MegatronGeneration
@@ -123,6 +133,381 @@ def _train_fields_for_step(skip_prev_logprobs: bool) -> tuple[str, ...]:
     return tuple(
         f for f in DP_TRAIN_FIELDS if not (skip_prev_logprobs and f == "prev_logprobs")
     )
+
+
+def _build_exact_trace_controller_authority(
+    *,
+    policy: "TQPolicy",
+    controller_summary: dict[str, Any],
+    sync_kv_scales: bool,
+) -> tuple[dict[str, Any], KVBatchMeta, dict[str, Any]]:
+    """Validate actor control metadata and derive deterministic cleanup state."""
+    plan = controller_summary["plan"]
+    pending_identity = controller_summary["pending_identity"]
+    if controller_summary["plan_id"] != plan["plan_id"]:
+        raise ValueError("Exact-trace controller summary changed its plan identity")
+    if controller_summary["total_row_count"] != plan["total_row_count"]:
+        raise ValueError("Exact-trace controller summary changed its physical count")
+    if controller_summary["scheduler_step_increment"] != plan["logical_rollout_count"]:
+        raise ValueError("Exact-trace controller summary changed scheduler ownership")
+    if (
+        controller_summary["training_admission_contract_id"]
+        != plan["training_admission_contract_id"]
+    ):
+        raise ValueError("Exact-trace controller summary changed training admission")
+    if pending_identity["optimizer_step_id"] != plan["optimizer_step_id"]:
+        raise ValueError("Exact-trace pending identity changed optimizer ownership")
+    if pending_identity["logical_rollout_count"] != plan["logical_rollout_count"]:
+        raise ValueError("Exact-trace pending identity changed logical cardinality")
+    if pending_identity["group_size"] != plan["expected_rollouts_per_group"]:
+        raise ValueError("Exact-trace pending identity changed comparison grouping")
+    if sync_kv_scales:
+        raise NotImplementedError(
+            "Exact-trace TQ does not yet support post-update KV-scale "
+            "calibration with an at-most-once optimizer journal"
+        )
+
+    from nemo_rl.experience.sync_exact_trace import (
+        build_exact_trace_wire_identity,
+    )
+
+    intended_ids, intended_tags, intended_extra = build_exact_trace_wire_identity(
+        plan,
+        pending_identity=pending_identity,
+        execution_ids_by_rollout=controller_summary["execution_ids_by_rollout"],
+    )
+    from nemo_rl.data_plane.packed_tensor_wire import (
+        PACKED_TENSOR_WIRE_SCHEMA_KEY,
+        validate_packed_tensor_wire_schema,
+    )
+
+    packed_tensor_wire_schema = controller_summary.get("packed_tensor_wire_schema")
+    if packed_tensor_wire_schema is not None:
+        packed_tensor_wire_schema = validate_packed_tensor_wire_schema(
+            packed_tensor_wire_schema,
+            expected_sample_ids=intended_ids,
+        )
+        intended_extra[PACKED_TENSOR_WIRE_SCHEMA_KEY] = packed_tensor_wire_schema
+    cleanup_meta = KVBatchMeta(
+        partition_id=policy.tq_partition_id,
+        task_name=policy.tq_partition_id,
+        sample_ids=intended_ids,
+        tags=intended_tags,
+        extra_info=intended_extra,
+    )
+    step_record = {
+        "schema_version": 1,
+        "sampling_event_id": pending_identity["sampling_event_id"],
+        "generation_policy_version": pending_identity["generation_policy_version"],
+        "optimizer_step_id": plan["optimizer_step_id"],
+        "pending_handle": pending_identity["pending_handle"],
+        "plan_id": plan["plan_id"],
+        "training_admission_contract_id": controller_summary[
+            "training_admission_contract_id"
+        ],
+        "generation_contract_id": plan["generation_contract_id"],
+        "execution_ids_by_rollout": dict(
+            controller_summary["execution_ids_by_rollout"]
+        ),
+        "logical_rollout_count": int(plan["logical_rollout_count"]),
+        "physical_trace_count": int(plan["physical_trace_count"]),
+        "padding_row_count": int(plan["padding_row_count"]),
+        "total_row_count": int(plan["total_row_count"]),
+        "eligible_action_token_count": int(plan["eligible_action_token_count"]),
+        "packed_tensor_wire_schema_id": (
+            packed_tensor_wire_schema["wire_schema_id"]
+            if packed_tensor_wire_schema is not None
+            else None
+        ),
+        "packed_tensor_payload_sha256": (
+            {
+                entry["logical_key"]: entry["payload_sha256"]
+                for entry in packed_tensor_wire_schema["entries"]
+            }
+            if packed_tensor_wire_schema is not None
+            else {}
+        ),
+    }
+    return plan, cleanup_meta, step_record
+
+
+def _execute_pending_exact_trace_step(
+    *,
+    policy: "TQPolicy",
+    rollout_actor: Any,
+    controller_summary: dict[str, Any],
+    loss_fn: LossFunction,
+    master_config: MasterConfig,
+    timer: Timer,
+    pad_value_dict: dict[str, Any],
+    sync_kv_scales: bool,
+) -> dict[str, Any]:
+    """Register, commit, score, train, and clear one exact physical plan.
+
+    The actor already owns materialized rows. This helper is the controller's
+    failure boundary: every pre-update exception aborts the pending handle,
+    while success clears TQ before releasing actor memory.  The helper emits a
+    structured optimizer marker so orchestration can refuse to replay an
+    already-applied optimizer step after a process-level failure.
+    """
+    pending_handle = controller_summary["pending_identity"]["pending_handle"]
+    try:
+        plan, cleanup_meta, step_record = _build_exact_trace_controller_authority(
+            policy=policy,
+            controller_summary=controller_summary,
+            sync_kv_scales=sync_kv_scales,
+        )
+    except Exception:
+        try:
+            ray.get(
+                rollout_actor.abort_pending_exact_trace.remote(
+                    pending_handle=pending_handle,
+                )
+            )
+        except Exception as cleanup_error:
+            warnings.warn(
+                "Failed to abort exact-trace actor after control validation "
+                f"failed: {cleanup_error}",
+                stacklevel=2,
+            )
+        raise
+
+    meta: KVBatchMeta | None = None
+    samples_cleared = False
+    optimizer_update_dispatched = False
+    optimizer_update_applied = False
+    try:
+        # The physical cardinality is known only after materialization.  The
+        # current TQ adapter uses this call for schema warm-up; the plan-derived
+        # meta and train gbs below remain the enforced cardinality authorities.
+        policy.prepare_step(
+            num_samples=int(plan["total_row_count"]),
+            group_size=None,
+            packed_tensor_wire_schema=controller_summary.get(
+                "packed_tensor_wire_schema"
+            ),
+        )
+        meta = ray.get(
+            rollout_actor.commit_pending_exact_trace.remote(
+                pending_handle=pending_handle,
+                partition_id=policy.tq_partition_id,
+            )
+        )
+        if meta.size != plan["total_row_count"]:
+            raise ValueError("Committed TQ metadata changed the physical row count")
+
+        skip_prev, skip_reference = _resolve_logprob_skip_flags(master_config)
+        if not (skip_prev and skip_reference):
+            print(
+                "▶ Preparing exact physical rows for logprob inference...", flush=True
+            )
+            with timer.time("logprob_inference_prep"):
+                policy.prepare_for_lp_inference()
+
+        with timer.time("policy_and_reference_logprobs"):
+            if not skip_prev:
+                policy.get_logprobs_from_meta(meta, timer=timer)
+            if not skip_reference:
+                policy.get_reference_policy_logprobs_from_meta(meta, timer=timer)
+            scoring_summary = ray.get(
+                rollout_actor.validate_pending_exact_trace_scoring.remote(
+                    pending_handle=pending_handle,
+                    meta=meta,
+                    skip_policy_logprobs=skip_prev,
+                    skip_reference_logprobs=skip_reference,
+                )
+            )
+            if scoring_summary["plan_id"] != plan["plan_id"]:
+                raise ValueError("TQ scoring validation returned the wrong trace plan")
+            physical = policy.read_from_dataplane(
+                meta,
+                select_fields=[
+                    "input_lengths",
+                    "generation_logprobs",
+                    "token_mask",
+                    "sample_mask",
+                    "advantages",
+                    "prev_logprobs",
+                    "reference_policy_logprobs",
+                ],
+                pad_value_dict=pad_value_dict,
+            )
+
+        generation_logprobs = physical["generation_logprobs"]
+        token_mask = physical["token_mask"]
+        sample_mask = physical["sample_mask"]
+        prev_logprobs = physical["prev_logprobs"]
+        if skip_prev:
+            seq_metrics = _placeholder_seq_logprob_error_metrics()
+        else:
+            checked_mask, seq_metrics = _compute_seq_logprob_error_metrics(
+                token_mask=token_mask,
+                sample_mask=sample_mask,
+                prev_logprobs=prev_logprobs,
+                generation_logprobs=generation_logprobs,
+                rewards=torch.tensor(
+                    controller_summary["row_rewards"],
+                    dtype=torch.float32,
+                ),
+                seq_logprob_error_threshold=None,
+            )
+            if not torch.equal(checked_mask, sample_mask):
+                raise ValueError("Exact-trace scoring unexpectedly changed sample_mask")
+
+        kv_scales_cache = None
+        log_input_ids: Optional[torch.Tensor] = None
+        log_content: Any = None
+        if not _should_log_nemo_gym_responses(master_config):
+            log_payload = policy.read_from_dataplane(
+                meta,
+                select_fields=["input_ids", "content"],
+                pad_value_dict=pad_value_dict,
+            )
+            log_input_ids = log_payload["input_ids"]
+            log_content = log_payload["content"]
+
+        print(
+            "NRL_EXACT_TQ_STEP_PREPARED "
+            + json.dumps(step_record, sort_keys=True, separators=(",", ":")),
+            flush=True,
+        )
+
+        with timer.time("training_prep"):
+            policy.prepare_for_training()
+        with timer.time("policy_training"):
+            optimizer_update_dispatched = True
+            print(
+                "NRL_EXACT_TQ_OPTIMIZER_DISPATCHED "
+                + json.dumps(step_record, sort_keys=True, separators=(",", ":")),
+                flush=True,
+            )
+            train_results = policy.train_from_meta(
+                meta,
+                loss_fn=loss_fn,
+                gbs=int(plan["total_row_count"]),
+                mbs=master_config.policy["train_micro_batch_size"],
+                scheduler_step_increment=int(plan["logical_rollout_count"]),
+                timer=timer,
+                train_fields=DP_TRAIN_FIELDS,
+            )
+        optimizer_update_applied = True
+        print(
+            "NRL_EXACT_TQ_OPTIMIZER_APPLIED "
+            + json.dumps(step_record, sort_keys=True, separators=(",", ":")),
+            flush=True,
+        )
+
+        policy.finish_step(meta)
+        samples_cleared = True
+        try:
+            ray.get(
+                rollout_actor.finalize_pending_exact_trace.remote(
+                    pending_handle=pending_handle,
+                )
+            )
+        except Exception as finalize_error:
+            # TQ is already empty and the optimizer result is authoritative.
+            # A lost cleanup ACK must not turn into an optimizer replay.
+            try:
+                ray.get(
+                    rollout_actor.abort_pending_exact_trace.remote(
+                        pending_handle=pending_handle,
+                    )
+                )
+            except Exception as abort_error:
+                warnings.warn(
+                    "Exact-trace optimizer step succeeded but actor cleanup "
+                    f"failed: finalize={finalize_error}; abort={abort_error}",
+                    stacklevel=2,
+                )
+            else:
+                warnings.warn(
+                    "Exact-trace optimizer step succeeded; recovered a lost "
+                    f"finalize ACK via idempotent abort: {finalize_error}",
+                    stacklevel=2,
+                )
+        print(
+            "NRL_EXACT_TQ_STEP_COMMITTED "
+            + json.dumps(step_record, sort_keys=True, separators=(",", ":")),
+            flush=True,
+        )
+        return {
+            "meta": meta,
+            "train_results": train_results,
+            "input_lengths": physical["input_lengths"],
+            "generation_logprobs": generation_logprobs,
+            "token_mask": token_mask,
+            "sample_mask": sample_mask,
+            "advantages": physical["advantages"],
+            "prev_logprobs": prev_logprobs,
+            "reference_policy_logprobs": physical["reference_policy_logprobs"],
+            "seq_logprob_error_metrics": seq_metrics,
+            "kv_scales_cache": kv_scales_cache,
+            "log_input_ids": log_input_ids,
+            "log_content": log_content,
+            "step_record": step_record,
+        }
+    except Exception as step_error:
+        actor_cleaned = False
+        try:
+            if samples_cleared:
+                ray.get(
+                    rollout_actor.finalize_pending_exact_trace.remote(
+                        pending_handle=pending_handle,
+                    )
+                )
+                actor_cleaned = True
+            else:
+                actor_cleaned = bool(
+                    ray.get(
+                        rollout_actor.abort_pending_exact_trace.remote(
+                            pending_handle=pending_handle,
+                        )
+                    )
+                )
+        except Exception as cleanup_error:
+            warnings.warn(
+                "Failed to clean exact-trace pending state after step error: "
+                f"{cleanup_error}",
+                stacklevel=2,
+            )
+        if not samples_cleared and not actor_cleaned:
+            try:
+                # Actor death or RPC ambiguity must not strand a successful
+                # plan-derived put.  The controller can clear the same stable
+                # IDs without needing the actor's returned KVBatchMeta.
+                policy.finish_step(cleanup_meta)
+            except Exception as fallback_error:
+                warnings.warn(
+                    "Controller fallback could not clear plan-derived exact "
+                    f"TQ keys: {fallback_error}",
+                    stacklevel=2,
+                )
+            else:
+                try:
+                    ray.get(
+                        rollout_actor.abort_pending_exact_trace.remote(
+                            pending_handle=pending_handle,
+                        )
+                    )
+                except Exception as release_error:
+                    warnings.warn(
+                        "Controller cleared plan-derived exact TQ keys but "
+                        f"could not release actor pending state: {release_error}",
+                        stacklevel=2,
+                    )
+        if optimizer_update_dispatched:
+            outcome = (
+                "was applied"
+                if optimizer_update_applied
+                else "was dispatched and its outcome is ambiguous"
+            )
+            raise RuntimeError(
+                f"Exact-trace optimizer update {outcome}; do not replay this "
+                "optimizer_step_id without the structured step record and "
+                "checkpoint join"
+            ) from step_error
+        raise
 
 
 # ── DAPO non-zero-std dynamic sampling, slice-only ─────────────────────
@@ -277,10 +662,17 @@ def validate_sync(
                 break
             n_prompts = int(val_batch.size)
             policy.prepare_val_partition(n_prompts, partition_id=partition_id)
+            sampling_event_id = new_sampling_event_id(
+                purpose="validation",
+                step=step,
+            )
             meta, driver_carry, rollout_metrics, _ = ray.get(
                 rollout_actor.rollout_to_tq.remote(
                     val_batch,
                     partition_id=partition_id,
+                    generation_only=True,
+                    generation_policy_version=None,
+                    sampling_event_id=sampling_event_id,
                     first_iter=False,
                     finish_generation=False,
                     task_to_env_override=val_task_to_env,
@@ -404,6 +796,7 @@ def grpo_train_sync(
     Parity with the legacy path is verified by running the same config
     against both entrypoints and diffing the wandb runs.
     """
+    _validate_context_compaction_training_config(master_config)
     timer = Timer()
     timeout = TimeoutChecker(
         timeout=master_config.checkpointing["checkpoint_must_save_by"],
@@ -463,6 +856,12 @@ def grpo_train_sync(
         )
     _raise_if_message_level_advantage_penalties_enabled(master_config)
     adv_estimator = _create_advantage_estimator(master_config)
+    context_compaction_training = _context_compaction_training_enabled(master_config)
+    if context_compaction_training and sync_kv_scales:
+        raise NotImplementedError(
+            "Exact-trace TQ does not yet support post-update KV-scale "
+            "calibration with an at-most-once optimizer journal"
+        )
 
     # Driver-side pad-value dict for materialize() — the wire emits
     # jagged tensors for variable-length token fields (input_ids,
@@ -591,6 +990,12 @@ def grpo_train_sync(
                             master_config.grpo.num_generations_per_prompt
                         )
                     )
+                    _assign_trajectory_generation_replica_indices(
+                        repeated_batch,
+                        num_generations_per_prompt=(
+                            master_config.grpo.num_generations_per_prompt
+                        ),
+                    )
 
                 memory_tracker.snapshot_start_of_stage("Generation", dir())
                 print(
@@ -644,42 +1049,62 @@ def grpo_train_sync(
                             policy.offload_after_refit()
                         policy_generation.prepare_for_generation()
 
-                # ── Per-step TQ partition register ─────────────────────
-                # Done before the rollout actor's put_samples so the
-                # partition exists with the expected schema.
-                policy.prepare_step(
-                    num_samples=int(repeated_batch.size),
-                    group_size=master_config.grpo.num_generations_per_prompt,
-                )
-
-                # ── Rollout 1-hop put: actor runs rollout + flatten +
-                # mask construction + prompt extraction + baseline/std,
-                # writes bulk to TQ in one flat put_samples, returns
-                # only meta + small slice. Bulk never visits the driver.
                 dynamic_sampling_num_gen_batches += 1
+                generation_policy_version = f"sync-policy-step-{total_steps:08d}"
+                training_sampling_event_id = new_sampling_event_id(
+                    purpose="training",
+                    step=total_steps,
+                )
                 with timer.time("generation"):
-                    # Single Ray RPC: rollout + flatten + mask + prompt
-                    # extraction + baseline/std + put_samples + finish
-                    # generation + logger metrics — all bundled into one
-                    # round-trip.
-                    # ``first_iter`` is the actor's signal to call
-                    # ``policy_generation.snapshot_step_metrics()``.
-                    # ``dynamic_sampling_num_gen_batches`` is incremented
-                    # to 1 just above before this branch — keep these in
-                    # sync if either is renamed.
-                    (
-                        meta,
-                        driver_carry,
-                        rollout_metrics,
-                        generation_logger_metrics,
-                    ) = ray.get(
-                        rollout_actor.rollout_to_tq.remote(
-                            repeated_batch,
-                            partition_id=policy.tq_partition_id,
-                            group_size=master_config.grpo.num_generations_per_prompt,
-                            first_iter=(dynamic_sampling_num_gen_batches == 1),
+                    if context_compaction_training:
+                        (
+                            exact_controller_summary,
+                            rollout_metrics,
+                            generation_logger_metrics,
+                        ) = ray.get(
+                            rollout_actor.prepare_pending_exact_trace.remote(
+                                repeated_batch,
+                                generation_policy_version=generation_policy_version,
+                                sampling_event_id=training_sampling_event_id,
+                                group_size=(
+                                    master_config.grpo.num_generations_per_prompt
+                                ),
+                                batch_quantum=_context_compaction_batch_quantum(
+                                    policy,
+                                    master_config,
+                                ),
+                                optimizer_step_id=(f"grpo-step-{total_steps + 1:08d}"),
+                                first_iter=(dynamic_sampling_num_gen_batches == 1),
+                            )
                         )
-                    )
+                        meta = None
+                        driver_carry = None
+                    else:
+                        # Ordinary TQ knows its row count before rollout, so it
+                        # retains the original register-and-put protocol.
+                        policy.prepare_step(
+                            num_samples=int(repeated_batch.size),
+                            group_size=(master_config.grpo.num_generations_per_prompt),
+                        )
+                        (
+                            meta,
+                            driver_carry,
+                            rollout_metrics,
+                            generation_logger_metrics,
+                        ) = ray.get(
+                            rollout_actor.rollout_to_tq.remote(
+                                repeated_batch,
+                                partition_id=policy.tq_partition_id,
+                                generation_only=False,
+                                generation_policy_version=(generation_policy_version),
+                                sampling_event_id=training_sampling_event_id,
+                                group_size=(
+                                    master_config.grpo.num_generations_per_prompt
+                                ),
+                                first_iter=(dynamic_sampling_num_gen_batches == 1),
+                            )
+                        )
+                        policy.ensure_step_schema(meta)
 
                     metrics_logging_data["mean_gen_tokens_per_sample"] = (
                         rollout_metrics["mean_gen_tokens_per_sample"]
@@ -694,31 +1119,49 @@ def grpo_train_sync(
                 # now back on the driver where they belong (no bulk
                 # touched by any of these ops).
                 with timer.time("reward_calculation"):
-                    driver_carry = scale_rewards(
-                        driver_carry,
-                        master_config.grpo.reward_scaling,
-                    )
-                    if master_config.grpo.reward_shaping.enabled:
-                        driver_carry = apply_reward_shaping(
+                    if context_compaction_training:
+                        rewards = torch.tensor(
+                            exact_controller_summary["logical_rewards"],
+                            dtype=torch.float32,
+                        )
+                        baseline = torch.tensor(
+                            exact_controller_summary["logical_baselines"],
+                            dtype=torch.float32,
+                        )
+                        std = torch.tensor(
+                            exact_controller_summary["logical_stds"],
+                            dtype=torch.float32,
+                        )
+                        length = torch.tensor(
+                            exact_controller_summary["logical_prompt_lengths"],
+                            dtype=torch.long,
+                        )
+                    else:
+                        assert driver_carry is not None
+                        driver_carry = scale_rewards(
                             driver_carry,
-                            master_config.grpo.reward_shaping,
+                            master_config.grpo.reward_scaling,
                         )
-                    driver_carry["baseline"], driver_carry["std"] = (
-                        calculate_baseline_and_std_per_prompt(
-                            driver_carry["prompt_ids_for_adv"],
-                            driver_carry["total_reward"],
-                            torch.ones_like(driver_carry["total_reward"]),
-                            leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
+                        if master_config.grpo.reward_shaping.enabled:
+                            driver_carry = apply_reward_shaping(
+                                driver_carry,
+                                master_config.grpo.reward_shaping,
+                            )
+                        driver_carry["baseline"], driver_carry["std"] = (
+                            calculate_baseline_and_std_per_prompt(
+                                driver_carry["prompt_ids_for_adv"],
+                                driver_carry["total_reward"],
+                                torch.ones_like(driver_carry["total_reward"]),
+                                leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
+                            )
                         )
-                    )
-                    # Mirror std onto meta so dynamic_sampling can filter
-                    # without fetching tensor data.
-                    meta.stamp_tags(
-                        {
-                            "std": driver_carry["std"].tolist(),
-                            "baseline": driver_carry["baseline"].tolist(),
-                        }
-                    )
+                        assert meta is not None
+                        meta.stamp_tags(
+                            {
+                                "std": driver_carry["std"].tolist(),
+                                "baseline": driver_carry["baseline"].tolist(),
+                            }
+                        )
 
                 # ── Dynamic sampling (DAPO non-zero-std filter) ────────
                 # Slice-only; bulk in TQ untouched except for clear_samples
@@ -772,23 +1215,34 @@ def grpo_train_sync(
                 # Mirrors legacy ``grpo.py:1707-1716`` — applied on the
                 # post-DS survivors so dropped rows don't affect this set.
                 if master_config.grpo.overlong_filtering:
+                    assert driver_carry is not None
                     lm = driver_carry["loss_multiplier"].clone()
                     lm[driver_carry["truncated"]] = 0
                     driver_carry["loss_multiplier"] = lm
 
                 # ── Unpack slice (small per-sample tensors) ────────────
-                rewards = (
-                    driver_carry["filtered_reward"]
-                    if master_config.grpo.use_dynamic_sampling
-                    else driver_carry["total_reward"]
-                )
-                baseline = driver_carry["baseline"]
-                std = driver_carry["std"]
-                input_lengths = driver_carry["input_lengths"]
-                prompt_ids_for_adv = driver_carry["prompt_ids_for_adv"]
-                loss_multiplier = driver_carry["loss_multiplier"]
-                truncated = driver_carry["truncated"]
-                length = driver_carry["length"]
+                if context_compaction_training:
+                    input_lengths = torch.tensor(
+                        exact_controller_summary["physical_input_lengths"],
+                        dtype=torch.long,
+                    )
+                    prompt_ids_for_adv = None
+                    loss_multiplier = None
+                    truncated = None
+                else:
+                    assert driver_carry is not None
+                    rewards = (
+                        driver_carry["filtered_reward"]
+                        if master_config.grpo.use_dynamic_sampling
+                        else driver_carry["total_reward"]
+                    )
+                    baseline = driver_carry["baseline"]
+                    std = driver_carry["std"]
+                    input_lengths = driver_carry["input_lengths"]
+                    prompt_ids_for_adv = driver_carry["prompt_ids_for_adv"]
+                    loss_multiplier = driver_carry["loss_multiplier"]
+                    truncated = driver_carry["truncated"]
+                    length = driver_carry["length"]
 
                 gen_step_metrics = {}
                 if hasattr(policy_generation, "get_step_metrics"):
@@ -809,143 +1263,179 @@ def grpo_train_sync(
                 # ``train_from_meta`` (driver read uses ``select_fields``).
                 train_fields = _train_fields_for_step(skip_prev_logprobs)
 
-                if compute_prev or compute_ref:
-                    print("▶ Preparing for logprob inference...", flush=True)
-                    with timer.time("logprob_inference_prep"):
-                        policy.prepare_for_lp_inference()
-
-                print("▶ Computing logprobs...", flush=True)
-                with timer.time("policy_and_reference_logprobs"):
-                    # Meta-driven worker dispatch. Workers fetch their
-                    # slice from TQ and write ``prev_logprobs`` /
-                    # ``reference_policy_logprobs`` columns back to TQ
-                    # under ``meta.sample_ids``. The Ray return is
-                    # discarded — driver reads from TQ below in one
-                    # batched fetch to avoid double-shipping the per-token
-                    # tensor through Ray's plasma store on top of the TQ
-                    # writeback.
-                    select_fields = ["generation_logprobs", "token_mask"]
-                    if compute_prev:
-                        policy.get_logprobs_from_meta(meta, timer=timer)
-                        select_fields.append("prev_logprobs")
-                    else:
-                        print(
-                            "▶ Skipping prev_logprobs (force_on_policy_ratio=True)...",
-                            flush=True,
-                        )
-                    if compute_ref:
-                        policy.get_reference_policy_logprobs_from_meta(
-                            meta,
-                            timer=timer,
-                        )
-                        select_fields.append("reference_policy_logprobs")
-
-                    # Driver pulls only the per-token columns it needs
-                    # for masking / advantage. Bulk (input_ids, multimodal,
-                    # output_ids, attention_mask, position_ids) stays in
-                    # TQ — workers will fetch it via ``train_presharded``.
-                    extras_bdd = policy.read_from_dataplane(
-                        meta,
-                        select_fields=select_fields,
+                if context_compaction_training:
+                    exact_step = _execute_pending_exact_trace_step(
+                        policy=policy,
+                        rollout_actor=rollout_actor,
+                        controller_summary=exact_controller_summary,
+                        loss_fn=loss_fn,
+                        master_config=master_config,
+                        timer=timer,
                         pad_value_dict=_pad_dict,
+                        sync_kv_scales=sync_kv_scales,
                     )
-                    generation_logprobs = extras_bdd["generation_logprobs"]
-                    token_mask = extras_bdd["token_mask"]
-                    prev_logprobs = (
-                        extras_bdd["prev_logprobs"]
-                        if compute_prev
-                        else torch.zeros_like(generation_logprobs)
-                    )
-                    reference_policy_logprobs = (
-                        extras_bdd["reference_policy_logprobs"] if compute_ref else None
-                    )
-
-                # Seq-level logprob error metrics/masking require real prev_logprobs
-                if skip_prev_logprobs:
-                    sample_mask = loss_multiplier
-                    # Cannot compute seq-level metrics with placeholder prev_logprobs
-                    seq_logprob_error_metrics = _placeholder_seq_logprob_error_metrics()
+                    meta = exact_step["meta"]
+                    train_results = exact_step["train_results"]
+                    input_lengths = exact_step["input_lengths"]
+                    generation_logprobs = exact_step["generation_logprobs"]
+                    token_mask = exact_step["token_mask"]
+                    sample_mask = exact_step["sample_mask"]
+                    advantages = exact_step["advantages"]
+                    prev_logprobs = exact_step["prev_logprobs"]
+                    reference_policy_logprobs = exact_step["reference_policy_logprobs"]
+                    seq_logprob_error_metrics = exact_step["seq_logprob_error_metrics"]
+                    if exact_step["kv_scales_cache"] is not None:
+                        kv_scales_cache = exact_step["kv_scales_cache"]
+                    _log_input_ids = exact_step["log_input_ids"]
+                    _log_content = exact_step["log_content"]
+                    POLICY_GENERATION_STALE = True
                 else:
-                    sample_mask, seq_logprob_error_metrics = (
-                        _compute_seq_logprob_error_metrics(
-                            token_mask=token_mask,
-                            sample_mask=loss_multiplier,
-                            prev_logprobs=prev_logprobs,
-                            generation_logprobs=generation_logprobs,
-                            rewards=rewards,
-                            seq_logprob_error_threshold=seq_logprob_error_threshold,
+                    assert meta is not None
+                    if compute_prev or compute_ref:
+                        print("▶ Preparing for logprob inference...", flush=True)
+                        with timer.time("logprob_inference_prep"):
+                            policy.prepare_for_lp_inference()
+
+                    print("▶ Computing logprobs...", flush=True)
+                    with timer.time("policy_and_reference_logprobs"):
+                        select_fields = ["generation_logprobs", "token_mask"]
+                        if compute_prev:
+                            policy.get_logprobs_from_meta(meta, timer=timer)
+                            select_fields.append("prev_logprobs")
+                        else:
+                            print(
+                                "▶ Skipping prev_logprobs "
+                                "(force_on_policy_ratio=True)...",
+                                flush=True,
+                            )
+                        if compute_ref:
+                            policy.get_reference_policy_logprobs_from_meta(
+                                meta,
+                                timer=timer,
+                            )
+                            select_fields.append("reference_policy_logprobs")
+                        extras_bdd = policy.read_from_dataplane(
+                            meta,
+                            select_fields=select_fields,
+                            pad_value_dict=_pad_dict,
                         )
-                    )
+                        generation_logprobs = extras_bdd["generation_logprobs"]
+                        token_mask = extras_bdd["token_mask"]
+                        prev_logprobs = (
+                            extras_bdd["prev_logprobs"]
+                            if compute_prev
+                            else torch.zeros_like(generation_logprobs)
+                        )
+                        reference_policy_logprobs = (
+                            extras_bdd["reference_policy_logprobs"]
+                            if compute_ref
+                            else None
+                        )
+
+                if not context_compaction_training:
+                    # Seq-level masking is an ordinary-TQ semantic. Exact
+                    # training rejects a non-None threshold and validates its
+                    # immutable physical sample mask in the helper above.
+                    assert loss_multiplier is not None
+                    if skip_prev_logprobs:
+                        sample_mask = loss_multiplier
+                        seq_logprob_error_metrics = (
+                            _placeholder_seq_logprob_error_metrics()
+                        )
+                    else:
+                        sample_mask, seq_logprob_error_metrics = (
+                            _compute_seq_logprob_error_metrics(
+                                token_mask=token_mask,
+                                sample_mask=loss_multiplier,
+                                prev_logprobs=prev_logprobs,
+                                generation_logprobs=generation_logprobs,
+                                rewards=rewards,
+                                seq_logprob_error_threshold=(
+                                    seq_logprob_error_threshold
+                                ),
+                            )
+                        )
 
                 with timer.time("advantage_calculation"):
-                    print("▶ Computing advantages...", flush=True)
-                    mask = token_mask * sample_mask.unsqueeze(-1)
-
-                    # GRPO / Reinforce++ ignore ``repeated_batch`` (it's
-                    # swallowed via ``**kwargs``); GDPO reads the
-                    # per-component reward keys returned by
-                    # ``get_gdpo_reward_component_keys``. The actor stashes
-                    # those keys into ``driver_carry`` — same payload as
-                    # legacy passing the full repeated_batch.
-                    adv_inputs = BatchedDataDict(
-                        {
-                            "total_reward": rewards,
-                            "baseline": baseline,
-                            "std": std,
-                        }
-                    )
-                    for k in get_gdpo_reward_component_keys(driver_carry):
-                        adv_inputs[k] = driver_carry[k]
-                    advantages = adv_estimator.compute_advantage(
-                        prompt_ids=prompt_ids_for_adv,
-                        rewards=rewards,
-                        mask=mask,
-                        repeated_batch=adv_inputs,
-                        logprobs_policy=prev_logprobs,
-                        logprobs_reference=reference_policy_logprobs,
-                    )
-                    del prompt_ids_for_adv
-
-                    _log_mixed_rewards_and_advantages_information(
-                        logger=logger,
-                        total_steps=total_steps,
-                        metrics=metrics,
-                        baseline=baseline_for_log,
-                        advantages=advantages,
-                    )
+                    if context_compaction_training:
+                        logical_advantages = torch.tensor(
+                            exact_controller_summary["rollout_advantages"],
+                            dtype=torch.float32,
+                        ).unsqueeze(-1)
+                        _log_mixed_rewards_and_advantages_information(
+                            logger=logger,
+                            total_steps=total_steps,
+                            metrics=metrics,
+                            baseline=baseline_for_log,
+                            advantages=logical_advantages,
+                        )
+                    else:
+                        print("▶ Computing advantages...", flush=True)
+                        mask = token_mask * sample_mask.unsqueeze(-1)
+                        assert driver_carry is not None
+                        assert prompt_ids_for_adv is not None
+                        adv_inputs = BatchedDataDict(
+                            {
+                                "total_reward": rewards,
+                                "baseline": baseline,
+                                "std": std,
+                            }
+                        )
+                        for k in get_gdpo_reward_component_keys(driver_carry):
+                            adv_inputs[k] = driver_carry[k]
+                        advantages = adv_estimator.compute_advantage(
+                            prompt_ids=prompt_ids_for_adv,
+                            rewards=rewards,
+                            mask=mask,
+                            repeated_batch=adv_inputs,
+                            logprobs_policy=prev_logprobs,
+                            logprobs_reference=reference_policy_logprobs,
+                        )
+                        del prompt_ids_for_adv
+                        _log_mixed_rewards_and_advantages_information(
+                            logger=logger,
+                            total_steps=total_steps,
+                            metrics=metrics,
+                            baseline=baseline_for_log,
+                            advantages=advantages,
+                        )
                     del baseline_for_log
 
                 # ── Driver delta-write: advantages + (post-masking)
                 # sample_mask under the same meta.sample_ids so workers fetch
                 # the union via train_presharded.
-                advantages = _clip_grpo_advantages(advantages, master_config.grpo)
-                policy.write_to_dataplane(
-                    meta,
-                    fields={
-                        "advantages": advantages,
-                        "sample_mask": sample_mask,
-                    },
-                )
-
-                memory_tracker.snapshot_start_of_stage("Policy train", dir())
-                print("▶ Preparing for training...", flush=True)
-                with timer.time("training_prep"):
-                    policy.prepare_for_training()
-                    POLICY_GENERATION_STALE = True
-
-                print("▶ Training policy...", flush=True)
-                with timer.time("policy_training"):
-                    # Meta-driven train: workers fetch the union of
-                    # rollout + driver-written + worker-written columns
-                    # from TQ, train, return aggregated metrics via Ray.
-                    train_results = policy.train_from_meta(
+                if not context_compaction_training:
+                    advantages = _clip_grpo_advantages(
+                        advantages,
+                        master_config.grpo,
+                    )
+                    assert meta is not None
+                    policy.write_to_dataplane(
                         meta,
-                        loss_fn=loss_fn,
-                        timer=timer,
-                        train_fields=train_fields,
+                        fields={
+                            "advantages": advantages,
+                            "sample_mask": sample_mask,
+                        },
                     )
 
-                if sync_kv_scales:
+                memory_tracker.snapshot_start_of_stage("Policy train", dir())
+                if not context_compaction_training:
+                    print("▶ Preparing for training...", flush=True)
+                    with timer.time("training_prep"):
+                        policy.prepare_for_training()
+                        POLICY_GENERATION_STALE = True
+
+                    print("▶ Training policy...", flush=True)
+                    with timer.time("policy_training"):
+                        assert meta is not None
+                        train_results = policy.train_from_meta(
+                            meta,
+                            loss_fn=loss_fn,
+                            timer=timer,
+                            train_fields=train_fields,
+                        )
+
+                if sync_kv_scales and not context_compaction_training:
                     with timer.time("recompute_kv_scales"):
                         print(
                             "▶ Recomputing KV cache scales after policy update...",
@@ -959,6 +1449,10 @@ def grpo_train_sync(
                         _calib_fields = [
                             f for f in (meta.fields or []) if f in DP_CALIB_INPUT_FIELDS
                         ]
+                        _calib_fields = extend_fields_with_packed_tensor_wire(
+                            _calib_fields,
+                            packed_tensor_schema_from_extra_info(meta.extra_info),
+                        )
                         calibration_data = policy.read_from_dataplane(
                             meta,
                             select_fields=_calib_fields,
@@ -976,22 +1470,26 @@ def grpo_train_sync(
                 # read_columns on this meta would fail. ``content`` is a
                 # decoded object array (list[str]); read_columns decodes
                 # the NonTensorStack wire field via materialize.
-                _log_input_ids: Optional[torch.Tensor] = None
-                _log_content: Optional[np.ndarray] = None
-                if not _should_log_nemo_gym_responses(master_config):
-                    _log_select = ["input_ids"]
-                    if "content" in (meta.fields or []):
-                        _log_select.append("content")
-                    _log_extras = policy.read_from_dataplane(
-                        meta,
-                        select_fields=_log_select,
-                        pad_value_dict=_pad_dict,
-                    )
-                    _log_input_ids = _log_extras["input_ids"]
-                    _log_content = _log_extras.get("content")
+                if not context_compaction_training:
+                    _log_input_ids = None
+                    _log_content = None
+                    if not _should_log_nemo_gym_responses(master_config):
+                        assert meta is not None
+                        _log_select = ["input_ids"]
+                        if "content" in (meta.fields or []):
+                            _log_select.append("content")
+                        _log_extras = policy.read_from_dataplane(
+                            meta,
+                            select_fields=_log_select,
+                            pad_value_dict=_pad_dict,
+                        )
+                        _log_input_ids = _log_extras["input_ids"]
+                        _log_content = _log_extras.get("content")
 
                 # ── Step-end TQ cleanup ────────────────────────────────
-                policy.finish_step(meta)
+                if not context_compaction_training:
+                    assert meta is not None
+                    policy.finish_step(meta)
 
                 is_last_step = total_steps + 1 >= max_num_steps
                 if not master_config.data["use_multiple_dataloader"]:
@@ -1049,6 +1547,30 @@ def grpo_train_sync(
                 response_advantages = torch.masked_select(advantages, token_mask.bool())
 
                 memory_tracker.snapshot_start_of_stage("Metrics", dir())
+                if context_compaction_training:
+                    metrics.update(
+                        {
+                            "context_compaction/logical_rollouts": (
+                                exact_controller_summary["logical_rollout_count"]
+                            ),
+                            "context_compaction/physical_traces": (
+                                exact_controller_summary["physical_trace_count"]
+                            ),
+                            "context_compaction/padding_rows": (
+                                exact_controller_summary["padding_row_count"]
+                            ),
+                            "context_compaction/physical_rows": (
+                                exact_controller_summary["total_row_count"]
+                            ),
+                            "context_compaction/eligible_action_tokens": (
+                                exact_controller_summary["eligible_action_token_count"]
+                            ),
+                            "context_compaction/scheduler_step_increment": (
+                                exact_controller_summary["scheduler_step_increment"]
+                            ),
+                            "context_compaction/optimizer_steps": 1,
+                        }
+                    )
                 metrics = {
                     **metrics,
                     "loss": train_results["loss"].numpy(),
@@ -1221,6 +1743,26 @@ def grpo_train_sync(
                             checkpoint_path,
                             wait_fn=policy.finalize_async_save,
                         )
+                        if context_compaction_training:
+                            checkpoint_record = {
+                                **exact_step["step_record"],
+                                "checkpoint_step": total_steps + 1,
+                                "checkpoint_tmp_path": str(checkpoint_path),
+                                "checkpoint_expected_path": os.path.join(
+                                    os.path.dirname(str(checkpoint_path)),
+                                    f"step_{total_steps + 1}",
+                                ),
+                                "checkpoint_status": "finalization_submitted",
+                            }
+                            print(
+                                "NRL_EXACT_TQ_CHECKPOINT_SUBMITTED "
+                                + json.dumps(
+                                    checkpoint_record,
+                                    sort_keys=True,
+                                    separators=(",", ":"),
+                                ),
+                                flush=True,
+                            )
 
             memory_tracker.snapshot_start_of_stage("Logging", dir())
             # Per-step log_data jsonl. The 1-hop driver holds per-token
@@ -1232,14 +1774,28 @@ def grpo_train_sync(
             if not _should_log_nemo_gym_responses(master_config):
                 log_data: dict = {}
                 if "agent_ref" in repeated_batch:
-                    log_data["agent_ref"] = repeated_batch["agent_ref"]
+                    if context_compaction_training:
+                        log_data["agent_ref"] = [
+                            repeated_batch["agent_ref"][parent_index]
+                            if parent_index >= 0
+                            else None
+                            for parent_index in exact_controller_summary["plan"][
+                                "parent_indices"
+                            ]
+                        ]
+                    else:
+                        log_data["agent_ref"] = repeated_batch["agent_ref"]
                 if master_config.grpo.use_dynamic_sampling:
                     # Legacy semantics: ``rewards`` is unfiltered total_reward,
                     # ``filtered_rewards`` is the kept slice that's trained on.
                     log_data["rewards"] = unfiltered_rewards.tolist()
                     log_data["filtered_rewards"] = rewards.tolist()
                 else:
-                    log_data["rewards"] = rewards.tolist()
+                    log_data["rewards"] = (
+                        exact_controller_summary["row_rewards"]
+                        if context_compaction_training
+                        else rewards.tolist()
+                    )
                 log_data["input_lengths"] = input_lengths.tolist()
                 log_data["token_loss_mask"] = token_mask.tolist()
                 log_data["sample_loss_mask"] = sample_mask.tolist()
@@ -1263,9 +1819,20 @@ def grpo_train_sync(
 
             timing_metrics: dict = timer.get_timing_metrics(reduction_op="sum")  # type: ignore
             if metrics["token_mult_prob_error"] > 1.05:
+                plot_prompt_lengths = length
+                if context_compaction_training:
+                    plot_prompt_lengths = torch.tensor(
+                        [
+                            int(length[parent_index]) if parent_index >= 0 else 0
+                            for parent_index in exact_controller_summary["plan"][
+                                "parent_indices"
+                            ]
+                        ],
+                        dtype=length.dtype,
+                    )
                 logger.log_plot_token_mult_prob_error(
                     {
-                        "prompt_lengths": length,
+                        "prompt_lengths": plot_prompt_lengths,
                         "full_lengths": input_lengths,
                         "generation_logprobs": generation_logprobs,
                         "prev_logprobs": prev_logprobs,

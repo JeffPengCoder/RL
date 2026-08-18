@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import copy
 import gc
 import json
 import tempfile
@@ -908,6 +909,38 @@ def test_run_async_nemo_gym_rollout_warns_when_max_seq_len_exceeds_engine():
             asyncio.run(_consume_rollout())
 
 
+def test_prepare_nemo_gym_rows_scopes_trajectory_identity() -> None:
+    rows = [
+        {
+            "responses_create_params": {"input": []},
+            "trajectory_identity": {
+                "schema_version": 1,
+                "group_id": "dataset-group",
+                "task_id": "task-1",
+                "rollout_index": 0,
+                "attempt_index": 0,
+            },
+        }
+    ]
+    generation_config = {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "max_new_tokens": 768,
+    }
+
+    rollouts_mod._prepare_nemo_gym_rows(
+        rows,
+        generation_config,
+        sampling_event_id="sampling-test",
+    )
+
+    identity = rows[0]["trajectory_identity"]
+    assert identity["sampling_event_id"] == "sampling-test"
+    assert identity["source_group_id"] == "dataset-group"
+    assert identity["group_id"] != "dataset-group"
+    assert identity["rollout_id"]
+
+
 def test_native_rollout_groups_match_whole_batch(monkeypatch):
     """One native batch can be split without changing data or metric semantics."""
 
@@ -1213,6 +1246,8 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
 
     assert [result.task_index for result in rollout_results] == [11, 10]
     assert captured_groups == [(11, [2, 3]), (10, [0, 1])]
+    assert all("_rowidx" not in row and "rollout_purpose" not in row for row in rows)
+    assert all(row["responses_create_params"] == {} for row in rows)
     assert rollout_results[-1].rollout_metrics["timing/remote"] == 1.0
     assert rollout_results[-1].rollout_metrics["timing/rollout/run_rollouts"] == 4.0
     assert rollout_results[-1].rollout_metrics["timing/rollout/total"] == 4.0
@@ -1265,7 +1300,7 @@ def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
         {"agent_ref": {"name": "agent"}, "_ng_task_index": 42},
     ]
     results = []
-    for reward in (1.0, 2.0):
+    for row_index, reward in enumerate((1.0, 2.0)):
         input_message = {
             "role": "user",
             "content": "prompt",
@@ -1295,7 +1330,14 @@ def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
                     ]
                 ],
                 "rollout_trace_bundle": {"rollout_id": f"rollout-{reward}"},
-                "full_result": {"reward": reward},
+                "full_result": {
+                    "reward": reward,
+                    "response": {
+                        "execution_context": {
+                            "execution_id": f"execution-{row_index}",
+                        }
+                    },
+                },
             }
         )
 
@@ -1316,6 +1358,10 @@ def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
 
     assert rollout_result.task_index == 42
     assert rollout_result.final_batch["total_reward"].tolist() == [1.0, 2.0]
+    assert rollout_result.final_batch["rollout_execution_context"] == [
+        {"execution_id": "execution-0"},
+        {"execution_id": "execution-1"},
+    ]
     assert (
         "agent/full_result" in rollout_result.rollout_metrics
     ) is log_full_result_tables
@@ -1530,6 +1576,7 @@ def test_run_async_nemo_gym_rollout(
     # Row 1: no per-agent override — should fall back to max_new_tokens.
     rows[0]["responses_create_params"]["max_output_tokens"] = max_new_tokens + 1
     assert "max_output_tokens" not in rows[1]["responses_create_params"]
+    source_rows = copy.deepcopy(rows)
 
     actual_result = run_nemo_gym_rollout_sync(
         policy_generation=nemo_gym_vllm_generation,
@@ -1541,12 +1588,15 @@ def test_run_async_nemo_gym_rollout(
         log_full_result_tables=True,
         max_rollout_turns=None,
     )
-    for row in rows:
-        assert row["responses_create_params"]["max_output_tokens"] == max_new_tokens
+    # Sampling parameters and event IDs are transport state. The dispatched
+    # copies are clamped, while the reusable source batch remains byte-for-byte
+    # unchanged for later validation/training events.
+    assert rows == source_rows
     actual_result = asdict(actual_result)
     actual_result["final_batch"] = actual_result["final_batch"].get_dict()
     assert len(actual_result["final_batch"]["physical_message_logs"]) == len(rows)
     assert len(actual_result["final_batch"]["rollout_trace_bundle"]) == len(rows)
+    assert len(actual_result["final_batch"]["rollout_execution_context"]) == len(rows)
     for message_logs, bundle in zip(
         actual_result["final_batch"]["physical_message_logs"],
         actual_result["final_batch"]["rollout_trace_bundle"],
@@ -1657,6 +1707,7 @@ def test_run_async_nemo_gym_rollout(
         final_batch.pop("message_log", None)
         final_batch.pop("physical_message_logs", None)
         final_batch.pop("rollout_trace_bundle", None)
+        final_batch.pop("rollout_execution_context", None)
         final_batch["total_reward"] = final_batch["total_reward"].tolist()
         final_batch["loss_multiplier"] = final_batch["loss_multiplier"].tolist()
         final_batch["length"] = final_batch["length"].tolist()

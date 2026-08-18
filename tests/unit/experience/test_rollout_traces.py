@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from nemo_rl.environments.generation_contract import (
+    RUNTIME_GENERATION_CONTRACT_SCHEMA_VERSION,
     build_training_admission_contract,
     canonical_digest,
     stable_id,
@@ -75,7 +76,7 @@ def _training_admitted(bundle: dict, *, policy_version: str = "sync-step-0") -> 
         ),
     }
     runtime = {
-        "schema_version": 1,
+        "schema_version": RUNTIME_GENERATION_CONTRACT_SCHEMA_VERSION,
         **component_ids,
         "runtime_contract_id": stable_id(
             "generation-runtime-contract",

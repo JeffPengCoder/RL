@@ -41,6 +41,8 @@ from typing import Any, Callable, Literal, NotRequired, Sequence, TypedDict
 
 from tensordict import TensorDict
 
+from nemo_rl.data_plane.schema import PACKED_TENSOR_WIRE_SCHEMA_KEY
+
 
 class DataPlaneConfig(TypedDict):
     """Feature-gated config; defaults to disabled.
@@ -179,7 +181,7 @@ class KVBatchMeta:
 
     def subset(self, indices: "Sequence[int]") -> "KVBatchMeta":
         """Return a new meta with only the rows at ``indices`` (any order)."""
-        return self._replace(
+        result = self._replace(
             sample_ids=[self.sample_ids[i] for i in indices],
             sequence_lengths=(
                 [self.sequence_lengths[i] for i in indices]
@@ -188,10 +190,12 @@ class KVBatchMeta:
             ),
             tags=([self.tags[i] for i in indices] if self.tags is not None else None),
         )
+        self._project_packed_tensor_authority(result)
+        return result
 
     def slice(self, start: int, stop: int) -> "KVBatchMeta":
         """Return a new meta with rows in the contiguous range ``[start, stop)``."""
-        return self._replace(
+        result = self._replace(
             sample_ids=self.sample_ids[start:stop],
             sequence_lengths=(
                 self.sequence_lengths[start:stop]
@@ -199,6 +203,28 @@ class KVBatchMeta:
                 else None
             ),
             tags=self.tags[start:stop] if self.tags is not None else None,
+        )
+        self._project_packed_tensor_authority(result)
+        return result
+
+    def _project_packed_tensor_authority(self, result: "KVBatchMeta") -> None:
+        """Keep a media wire authority aligned with subset/slice sample IDs."""
+        schema_key = PACKED_TENSOR_WIRE_SCHEMA_KEY
+        schema = (self.extra_info or {}).get(schema_key)
+        if schema is None:
+            return
+        if not result.sample_ids:
+            # Empty metadata has no payload to authenticate and the wire
+            # schema deliberately requires at least one row.
+            result.extra_info.pop(schema_key, None)
+            return
+        from nemo_rl.data_plane.packed_tensor_wire import (
+            subset_packed_tensor_wire_schema,
+        )
+
+        result.extra_info[schema_key] = subset_packed_tensor_wire_schema(
+            schema,
+            sample_ids=result.sample_ids,
         )
 
     def concat(self, *others: "KVBatchMeta") -> "KVBatchMeta":
@@ -215,9 +241,30 @@ class KVBatchMeta:
         )
         all_have_tags = all(m.tags is not None for m in all_m)
         tags = [t for m in all_m for t in (m.tags or [])] if all_have_tags else None
-        return self._replace(
+        result = self._replace(
             sample_ids=sample_ids, sequence_lengths=seq_lens, tags=tags
         )
+        # Multimodal TQ schemas bind per-sample payload digests. Dynamic
+        # sampling concatenates survivors from separate rollout iterations,
+        # so retaining only ``self.extra_info`` would make later rows decode
+        # against the first iteration's authority. Import lazily to keep the
+        # stable data-plane interface lightweight for text-only callers.
+        schema_key = PACKED_TENSOR_WIRE_SCHEMA_KEY
+        schemas = [(meta.extra_info or {}).get(schema_key) for meta in all_m]
+        if any(schema is not None for schema in schemas):
+            if not all(schema is not None for schema in schemas):
+                raise ValueError(
+                    "KVBatchMeta.concat cannot mix media and text-only TQ batches"
+                )
+            from nemo_rl.data_plane.packed_tensor_wire import (
+                concat_packed_tensor_wire_schemas,
+            )
+
+            result.extra_info[schema_key] = concat_packed_tensor_wire_schemas(
+                schemas,  # type: ignore[arg-type]
+                sample_id_groups=[meta.sample_ids for meta in all_m],
+            )
+        return result
 
     def drop(self, indices: "Sequence[int]") -> "KVBatchMeta | None":
         """Complement of :meth:`subset`. Returns ``None`` when all rows are dropped."""
@@ -289,6 +336,19 @@ class DataPlaneClient(ABC):
             consumer_tasks: Named tasks; each gets its own consumption cursor.
             grpo_group_size: Group size for GRPO balanced sampling.
             enums: Per-field fixed-vocab string codec, shipped once at register.
+        """
+
+    @abstractmethod
+    def ensure_partition_fields(
+        self,
+        partition_id: str,
+        fields: list[str],
+    ) -> None:
+        """Declare additional fields without resetting live partition state.
+
+        This is needed when a processor-owned multimodal schema becomes known
+        only after rollout. Implementations must preserve existing rows,
+        consumer cursors, tags, and partition cardinality.
         """
 
     @abstractmethod

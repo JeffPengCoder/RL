@@ -165,6 +165,34 @@ class TestModelForward:
         call_kwargs = mock_model.call_args[1]
         assert call_kwargs["position_ids"] is None
 
+    @patch(
+        "nemo_rl.models.megatron.train._model_uses_expanded_media_token_validity",
+        return_value=True,
+    )
+    def test_model_forward_drops_4d_causal_mask_at_expanded_media_boundary(
+        self, _mock_expanded_media
+    ):
+        """A decoder causal mask must not be consumed as media-token validity."""
+        from nemo_rl.models.megatron.train import model_forward
+
+        mock_model = MagicMock()
+        mock_model.return_value = torch.randn(1, 4, 8)
+        mock_data_dict = MagicMock()
+        mock_data_dict.get_multimodal_dict.return_value = {
+            "images": torch.randn(1, 3, 16, 16)
+        }
+        causal_mask = torch.triu(torch.ones((1, 1, 4, 4), dtype=torch.bool), diagonal=1)
+
+        model_forward(
+            model=mock_model,
+            data_dict=mock_data_dict,
+            input_ids_cp_sharded=torch.tensor([[7, 18, 18, 9]]),
+            position_ids=torch.arange(4).unsqueeze(0),
+            attention_mask=causal_mask,
+        )
+
+        assert mock_model.call_args.kwargs["attention_mask"] is None
+
 
 class TestApplyTemperatureScaling:
     """Tests for apply_temperature_scaling function."""

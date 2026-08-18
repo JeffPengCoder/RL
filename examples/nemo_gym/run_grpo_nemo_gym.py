@@ -53,6 +53,38 @@ from nemo_rl.utils.logger import get_next_experiment_dir, log_container_init_tim
 from nemo_rl.utils.timer import Timer
 
 
+def _select_sync_trainer(master_config: MasterConfig):
+    """Select the synchronous trainer from the resolved data-plane contract.
+
+    This dispatch does not weaken GRPO's capability validation. The sync
+    trainer applies the exact-trace logical-to-physical materialization when
+    context-compaction training is enabled and otherwise keeps the ordinary
+    one-row-per-rollout TQ path.
+    """
+    dp_cfg = master_config.data_plane or {}
+    if dp_cfg.get("enabled", False):
+        from nemo_rl.algorithms.grpo_sync import grpo_train_sync
+
+        print("🚀 Running synchronous GRPO training (TransferQueue)")
+        return grpo_train_sync
+    print("🚀 Running synchronous GRPO training (legacy)")
+    return grpo_train
+
+
+def _select_policy_factory(master_config: MasterConfig):
+    """Build the TQ policy only when the resolved data-plane is enabled."""
+    dp_cfg = master_config.data_plane or {}
+    if not dp_cfg.get("enabled", False):
+        return None
+
+    from nemo_rl.models.policy.tq_policy import TQPolicy
+
+    def _make_policy(**kwargs):
+        return TQPolicy(**kwargs, dp_cfg=dp_cfg)
+
+    return _make_policy
+
+
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="Run GRPO training with configuration")
@@ -222,11 +254,11 @@ The validation set you pass in will directly be used for validation with no addi
     with rl_init_timer.time("ray_connect"):
         init_ray()
 
-    # `is_trajectory_collection` is a NeMo-RL-side control-flow knob; pop it
-    # before setup() so it is not forwarded into NeMo-Gym's global config (the
-    # gym actor is now created inside setup()).
-    is_trajectory_collection = (
-        config.env["nemo_gym"].pop("is_trajectory_collection", False) or False
+    # This is a NeMo-RL control-flow marker. spinup_nemo_gym_actor removes it
+    # from its copied Gym config, while setup uses it to avoid enabling the
+    # training-only exact-runtime admission path during benchmark collection.
+    is_trajectory_collection = bool(
+        config.env["nemo_gym"].get("is_trajectory_collection", False)
     )
 
     with rl_init_timer.time("setup"):
@@ -250,6 +282,7 @@ The validation set you pass in will directly be used for validation with no addi
             train_dataset,
             val_dataset,
             processor=processor,
+            policy_factory=_select_policy_factory(config),
         )
 
     rl_init_timer.record("total", time.perf_counter() - main_start)
@@ -318,23 +351,22 @@ The validation set you pass in will directly be used for validation with no addi
             alias_to_group_alias=alias_to_group_alias,
         )
     else:
-        print("🚀 Running synchronous GRPO training")
-
-        # Run standard GRPO training
-        grpo_train(
-            policy,
-            policy_generation,
-            dataloader,
-            val_dataloader,
-            tokenizer,
-            loss_fn,
-            task_to_env,
-            val_task_to_env,
-            logger,
-            checkpointer,
-            grpo_state,
-            master_config,
-        )
+        trainer = _select_sync_trainer(master_config)
+        with checkpointer:
+            trainer(
+                policy,
+                policy_generation,
+                dataloader,
+                val_dataloader,
+                tokenizer,
+                loss_fn,
+                task_to_env,
+                val_task_to_env,
+                logger,
+                checkpointer,
+                grpo_state,
+                master_config,
+            )
 
 
 if __name__ == "__main__":

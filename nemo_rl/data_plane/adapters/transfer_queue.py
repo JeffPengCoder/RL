@@ -27,7 +27,7 @@ import os
 import socket
 import subprocess
 import time
-from importlib import resources
+from importlib import metadata, resources
 from typing import Any
 
 import torch
@@ -106,99 +106,37 @@ def _connect_existing() -> None:
     tq.init()
 
 
-_TQ_RUNTIME_ENV_PATCHED = False
+_REQUIRED_TRANSFER_QUEUE_CALLABLES = (
+    "init",
+    "get_client",
+    "kv_batch_put",
+    "kv_batch_get",
+    "kv_list",
+    "kv_clear",
+    "close",
+)
 
 
-def _resolve_tq_pin() -> str:
-    """Return the ``TransferQueue`` requirement string from nemo-rl metadata.
-
-    Single source of truth is ``pyproject.toml`` — we read it back via
-    ``importlib.metadata.requires`` so the runtime_env injection cannot
-    drift from the dependency declaration.
-    """
-    from importlib.metadata import requires
-
-    for req in requires("nemo-rl") or []:
-        spec = req.split(";")[0].strip()
-        if spec.lower().startswith("transferqueue"):
-            return spec
-    raise RuntimeError(
-        "Could not resolve TransferQueue dependency from nemo-rl metadata. "
-        "Check pyproject.toml under [project.dependencies]."
-    )
-
-
-def _patch_tq_actor_runtime_env() -> None:
-    """Inject a per-actor ``runtime_env`` pin into TQ's actor ``.options()``.
-
-    TQ spawns ``SimpleStorageUnit`` and ``TransferQueueController`` via
-    ``Cls.options(...).remote(...)`` without a runtime_env, so they
-    inherit the job-level env. In a multi-node container deployment
-    where each node has its own ``/opt/nemo_rl_venv``, the driver's
-    ``uv sync`` only updates ray-head's venv and a worker-node actor
-    fails with ``ModuleNotFoundError``. This monkey-patch makes Ray
-    pip-install TQ into a per-actor runtime_env on first spawn (cached
-    per-node by Ray afterwards). Idempotent. Couples us to TQ's internal
-    class layout — if TQ restructures, this becomes a no-op with a
-    logged warning and we fall back to per-node ``uv sync``.
-
-    The pin is sourced from nemo-rl's installed metadata via
-    :func:`_resolve_tq_pin` so it cannot drift from ``pyproject.toml``.
-
-    TODO(zhiyul): remove this patch once the nightly container image
-    is published with ``TransferQueue`` baked in via ``pyproject.toml``.
-    When every node starts from that image, the base env already has TQ
-    and Ray actors inherit it — this injection then becomes pure
-    overhead (Ray builds a redundant per-actor pip env on top of the
-    container's existing TQ install). Drop the call from
-    ``TQDataPlaneClient.__init__`` and delete this function.
-    """
-    global _TQ_RUNTIME_ENV_PATCHED
-    if _TQ_RUNTIME_ENV_PATCHED:
-        return
-
-    runtime_env = {"pip": [_resolve_tq_pin()]}
-
-    def _install(cls) -> bool:
-        if not hasattr(cls, "options"):
-            return False
-        original = cls.options
-
-        def patched(*args, **kwargs):
-            kwargs.setdefault("runtime_env", runtime_env)
-            return original(*args, **kwargs)
-
-        cls.options = patched  # type: ignore[method-assign]
-        return True
-
-    patched_any = False
-    try:
-        from transfer_queue.storage.simple_backend import SimpleStorageUnit
-
-        patched_any |= _install(SimpleStorageUnit)
-    except ImportError:
-        pass
-    try:
-        from transfer_queue.controller import TransferQueueController
-
-        patched_any |= _install(TransferQueueController)
-    except ImportError:
-        pass
-
-    if not patched_any:
-        # Soft-fail: TQ may have moved its actor classes. The driver will
-        # still work; multi-node TQ may need the per-node `uv sync` workaround.
-        import warnings
-
-        warnings.warn(
-            "Could not patch TQ actor classes for runtime_env injection. "
-            "Multi-node TQ may fail with ModuleNotFoundError: 'transfer_queue' "
-            "on worker nodes. Workaround: run `uv sync` inside each node's "
-            "container before the driver runs.",
-            RuntimeWarning,
-            stacklevel=2,
+def validate_transfer_queue_api() -> dict[str, str]:
+    """Validate only the TransferQueue API reached by this adapter."""
+    missing = [
+        name
+        for name in _REQUIRED_TRANSFER_QUEUE_CALLABLES
+        if not callable(getattr(tq, name, None))
+    ]
+    if missing:
+        raise RuntimeError(
+            "TransferQueue does not provide the API required by NeMo-RL: "
+            + ", ".join(missing)
         )
-    _TQ_RUNTIME_ENV_PATCHED = True
+    try:
+        version = metadata.version("TransferQueue")
+    except metadata.PackageNotFoundError:
+        version = "unknown"
+    return {
+        "version": version,
+        "module_path": os.path.realpath(tq.__file__),
+    }
 
 
 def _init_tq(cfg: DataPlaneConfig) -> None:
@@ -291,11 +229,6 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
         raise ValueError(f"unknown TQ backend: {backend!r}")
 
     conf = OmegaConf.merge(base, overlay)
-
-    # Inject runtime_env into TQ's actor spawn so SimpleStorageUnit /
-    # TransferQueueController land on workers with transfer_queue available
-    # — see _patch_tq_actor_runtime_env() docstring for the why.
-    _patch_tq_actor_runtime_env()
 
     # pyrefly: ignore  # bad-argument-type
     tq.init(conf=conf)
@@ -428,6 +361,7 @@ class TQDataPlaneClient(DataPlaneClient):
         # unifies the schema/data shapes for 1D fields.
         self._promote_1d = cfg["backend"] == "mooncake_cpu"
 
+        self.transfer_queue_capabilities = validate_transfer_queue_api()
         if bootstrap:
             _init_tq(cfg)
         else:
@@ -464,6 +398,14 @@ class TQDataPlaneClient(DataPlaneClient):
         # (``0@field`` at the Mooncake storage layer). Mooncake does not
         # support upsert, so repeated schema warmups can collide with
         # stale metadata from a previous registration.
+        self.ensure_partition_fields(partition_id, fields)
+
+    def ensure_partition_fields(
+        self,
+        partition_id: str,
+        fields: list[str],
+    ) -> None:
+        """Warm field names without resetting live keys or consumer state."""
         if not fields:
             return
         schema_key = (
@@ -589,11 +531,11 @@ class TQDataPlaneClient(DataPlaneClient):
         wire_fields: TensorDict | None = None
         field_names: list[str] | None = None
         if fields is not None:
-            # No ``.contiguous()``: under tensordict==0.12.2 it strips
-            # non-tensor leaves (NonTensorStack stored as LinkedList) to empty
-            # TDs. TQ's encoder forces ``.contiguous()`` per tensor leaf
-            # itself, so the call here was redundant for tensors and
-            # destructive for non-tensors.
+            # No ``.contiguous()``: affected TensorDict implementations can
+            # strip non-tensor leaves (NonTensorStack stored as LinkedList) to
+            # empty TDs. TQ's encoder forces ``.contiguous()`` per tensor leaf
+            # itself, so the call here is redundant for tensors and destructive
+            # for non-tensors.
             wire_fields = fields.detach()  # type: ignore[bad-assignment,missing-argument]
             if self._promote_1d:
                 wire_fields = _promote_1d_leaves(wire_fields)  # type: ignore[bad-argument-type]
