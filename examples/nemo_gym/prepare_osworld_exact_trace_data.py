@@ -67,8 +67,10 @@ def split_osworld_rows(
     seed: str,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Select a fixed validation set by stable task-ID hashing."""
-    if validation_count <= 0:
-        raise ValueError("validation_count must be positive")
+    if validation_count < 0:
+        raise ValueError("validation_count must be non-negative")
+    if validation_count == 0:
+        return list(rows), []
     if validation_count >= len(rows):
         raise ValueError(
             "validation_count must leave at least one training task: "
@@ -167,8 +169,13 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--train-output", type=Path, required=True)
-    parser.add_argument("--validation-output", type=Path, required=True)
+    parser.add_argument("--validation-output", type=Path)
     parser.add_argument("--validation-count", type=int, required=True)
+    parser.add_argument(
+        "--expected-input-count",
+        type=int,
+        help="Fail unless the selected input contains exactly this many unique tasks.",
+    )
     parser.add_argument("--domain", action="append", dest="domains")
     parser.add_argument("--seed", default="osworld-exact-trace-v1")
     parser.add_argument("--group-prefix", default="osworld")
@@ -182,6 +189,15 @@ def main() -> None:
         args.input,
         domains=set(args.domains) if args.domains else None,
     )
+    if args.expected_input_count is not None and len(rows) != args.expected_input_count:
+        raise ValueError(
+            "selected OSWorld task count does not match the requested authority: "
+            f"expected={args.expected_input_count} observed={len(rows)}"
+        )
+    if args.validation_count > 0 and args.validation_output is None:
+        raise ValueError(
+            "--validation-output is required when --validation-count is positive"
+        )
     train, validation = split_osworld_rows(
         rows,
         validation_count=args.validation_count,
@@ -198,7 +214,8 @@ def main() -> None:
         agent_name=args.agent_name,
     )
     write_jsonl_atomic(args.train_output, train)
-    write_jsonl_atomic(args.validation_output, validation)
+    if args.validation_output is not None:
+        write_jsonl_atomic(args.validation_output, validation)
     print(
         f"OSWORLD_EXACT_TRACE_DATA_OK train={len(train)} "
         f"validation={len(validation)} seed={args.seed!r}"

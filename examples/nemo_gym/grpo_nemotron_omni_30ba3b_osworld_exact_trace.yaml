@@ -97,7 +97,9 @@ policy:
         reasoning_parser: nano_v3
         chat_template_content_format: openai
     vllm_kwargs:
-      limit_mm_per_prompt: {image: 3}
+      # The live prompt grows to ten snapshots before Gym compacts it back to
+      # three, so the serving admission limit must cover the high-water mark.
+      limit_mm_per_prompt: {image: 10}
       mm_processor_cache_gb: 0
       max_num_batched_tokens: ${policy.max_total_sequence_length}
       mamba_ssm_cache_dtype: float32
@@ -143,6 +145,9 @@ env:
           agent_kwargs:
             coordinate_type: relative
             max_image_history_length: 3
+            # Accumulate visual snapshots through the high-water mark, then
+            # compact the prompt back to the three most recent snapshots.
+            max_live_images: 10
             thinking: true
             parse_retries: 1
 

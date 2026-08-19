@@ -1,0 +1,113 @@
+# Full-scale NeMo-RL + NeMo Gym OSWorld candidate for standard
+# Nemotron-3-Nano-Omni-30B-A3B BF16 checkpoints.
+#
+# This recipe intentionally keeps the model and data as caller-supplied
+# authorities. It adopts workload parameters from the current OSWorld team
+# recommendation where the exact-trace implementation already supports their
+# semantics. It does not pin an experiment checkpoint, container, or library
+# resolution.
+#
+# Resource interpretation:
+#   cluster.num_nodes=2                         -> two training nodes
+#   policy.generation.colocated.resources=2    -> two rollout nodes
+#   total                                      -> four 8-GPU nodes
+
+defaults: grpo_nemotron_omni_30ba3b_osworld_exact_trace.yaml
+
+grpo:
+  num_prompts_per_step: ${oc.decode:${oc.env:OSWORLD_NUM_PROMPTS_PER_STEP,128}}
+  num_generations_per_prompt: ${oc.decode:${oc.env:OSWORLD_NUM_GENERATIONS,16}}
+  max_rollout_turns: ${oc.decode:${oc.env:OSWORLD_MAX_TURNS,200}}
+  max_num_epochs: ${oc.decode:${oc.env:OSWORLD_MAX_NUM_EPOCHS,1000000}}
+  max_num_steps: ${oc.decode:${oc.env:OSWORLD_TRAIN_STEPS,16}}
+  use_leave_one_out_baseline: true
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+  async_grpo:
+    enabled: true
+    in_flight_weight_updates: true
+    # Keep replay bounded to the immediately preceding policy version until a
+    # wider staleness window has selected-workload evidence.
+    max_trajectory_age_steps: 1
+
+loss_fn:
+  # Required by asynchronous replay. Exact sampled logprobs from vLLM remain
+  # the rollout authority and also drive the gen_kl_error (vLLM-KL) metric.
+  use_importance_sampling_correction: true
+  use_on_policy_kl_approximation: true
+  # The recommended 0.99-1.01 sequence mask is not enabled here yet. A logical
+  # rollout can expand into several compacted physical traces, so that mask
+  # must first be computed at rollout_id scope and broadcast to every trace.
+  truncated_importance_sampling_type: null
+  truncated_importance_sampling_ratio_min: null
+  truncated_importance_sampling_ratio: null
+
+policy:
+  train_global_batch_size: ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}
+  max_total_sequence_length: 49152
+  make_sequence_length_divisible_by: 32
+  megatron_cfg:
+    # 2 TP x 1 PP x 8 CP consumes the 16 training ranks. EP8 is the requested
+    # expert partition over that parallel topology.
+    tensor_model_parallel_size: 2
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 8
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 8
+    optimizer:
+      lr: 5.0e-6
+      min_lr: 5.0e-6
+    scheduler:
+      lr_warmup_iters: 0
+      lr_warmup_init: 5.0e-6
+  generation:
+    vllm_cfg:
+      async_engine: true
+      tensor_parallel_size: 8
+      max_model_len: ${policy.max_total_sequence_length}
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 2
+
+data:
+  max_input_seq_length: 49152
+  train:
+    # Use Scale CUA only when its exact manifest is available. Otherwise this
+    # may point at the annotated standard 361-task OSWorld manifest.
+    data_path: ${oc.env:OSWORLD_TRAIN_DATA}
+  # The fallback intentionally uses all 361 OSWorld tasks for training. Supply
+  # an independent held-out manifest in a separate evaluation run.
+  validation: null
+
+env:
+  nemo_gym:
+    osworld_simple_agent:
+      responses_api_agents:
+        osworld_agent:
+          concurrency: ${oc.decode:${oc.env:OSWORLD_CONCURRENCY,64}}
+          max_steps: ${oc.decode:${oc.env:OSWORLD_MAX_TURNS,200}}
+          max_trajectory_length: 3
+          task_timeout: ${oc.decode:${oc.env:OSWORLD_TASK_TIMEOUT,7200}}
+          agent_kwargs:
+            coordinate_type: relative
+            max_image_history_length: 3
+            max_live_images: 10
+            thinking: true
+            parse_retries: 1
+
+checkpointing:
+  checkpoint_dir: ${oc.env:OSWORLD_CHECKPOINT_DIR,results/osworld-recommended}
+
+logger:
+  log_dir: ${oc.env:OSWORLD_LOG_DIR,logs/osworld-recommended}
+  wandb:
+    project: grpo-nemotron-omni-osworld
+    group: exact-trace-recommended
+    name: osworld-omni-v3-recommended
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 2

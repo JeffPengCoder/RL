@@ -37,6 +37,17 @@ def test_split_is_fixed_disjoint_and_seeded_by_task_id():
     assert len(train_a) == len(train_b) == 4
 
 
+def test_split_can_keep_the_complete_source_as_training_data():
+    rows = [_row(f"task-{index}") for index in range(361)]
+
+    train, validation = split_osworld_rows(
+        rows, validation_count=0, seed="unused-for-all-train"
+    )
+
+    assert train == rows
+    assert validation == []
+
+
 def test_annotate_adds_exact_trace_identity_without_mutating_source():
     source = _row("task-1")
     [annotated] = annotate_trajectory_rows(
