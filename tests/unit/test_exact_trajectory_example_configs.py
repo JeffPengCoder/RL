@@ -63,6 +63,8 @@ def test_exact_trajectory_example_config_passes_runtime_model_validation(
         assert config.loss_fn.truncated_importance_sampling_type is None
         assert config.policy["train_global_batch_size"] == 2048
         assert config.policy["max_total_sequence_length"] == 49152
+        assert config.policy["generation"]["max_new_tokens"] == 2048
+        assert osworld_agent["max_tokens"] == 2048
         assert config.policy["megatron_cfg"]["tensor_model_parallel_size"] == 2
         assert config.policy["megatron_cfg"]["context_parallel_size"] == 8
         assert config.policy["megatron_cfg"]["expert_model_parallel_size"] == 8

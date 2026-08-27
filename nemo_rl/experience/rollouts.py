@@ -2022,17 +2022,42 @@ def _prepare_nemo_gym_rows(
     rows: list[dict],
     generation_config: GenerationConfig,
     *,
+    generation_only: bool,
     sampling_event_id: str | None = None,
 ) -> None:
-    """Apply sampling parameters and bind rows to one sampling event."""
+    """Stamp scheduler intent, sampling parameters, and event identity."""
+    purpose_metadata_key = "nemo_rl_rollout_purpose"
+    rollout_purpose = "evaluation" if generation_only else "training"
     if sampling_event_id is None:
-        sampling_event_id = new_sampling_event_id(purpose="nemo-gym")
+        sampling_event_id = new_sampling_event_id(purpose=rollout_purpose)
     for row_index, row in enumerate(rows):
         responses_create_params = row.get("responses_create_params")
         if not isinstance(responses_create_params, dict):
             raise TypeError(
                 "Each NeMo-Gym row must contain a responses_create_params dict"
             )
+
+        existing_purpose = row.get("rollout_purpose")
+        if existing_purpose is not None and existing_purpose != rollout_purpose:
+            raise ValueError(
+                "NeMo-Gym row rollout_purpose conflicts with the scheduler: "
+                f"row={existing_purpose!r}, scheduler={rollout_purpose!r}"
+            )
+        row["rollout_purpose"] = rollout_purpose
+
+        metadata = responses_create_params.get("metadata")
+        if metadata is None:
+            metadata = {}
+            responses_create_params["metadata"] = metadata
+        if not isinstance(metadata, dict):
+            raise TypeError("responses_create_params.metadata must be a dict")
+        metadata_purpose = metadata.get(purpose_metadata_key)
+        if metadata_purpose is not None and metadata_purpose != rollout_purpose:
+            raise ValueError(
+                "NeMo-Gym metadata rollout_purpose conflicts with the scheduler: "
+                f"metadata={metadata_purpose!r}, scheduler={rollout_purpose!r}"
+            )
+        metadata[purpose_metadata_key] = rollout_purpose
 
         responses_create_params["temperature"] = generation_config["temperature"]
         responses_create_params["top_p"] = generation_config["top_p"]
@@ -2046,6 +2071,15 @@ def _prepare_nemo_gym_rows(
         row["_rowidx"] = row_index
 
     scope_trajectory_identities(rows, sampling_event_id=sampling_event_id)
+
+    print(
+        "NEMO_RL_ROLLOUT_PURPOSE_STAMP|"
+        f"purpose={rollout_purpose}|rows={len(rows)}|"
+        f"sampling_event_id={sampling_event_id}|"
+        f"max_new_tokens={generation_config['max_new_tokens']}|"
+        "carriers=top_level,metadata",
+        flush=True,
+    )
 
 
 def _tensorize_nemo_gym_result(result: dict) -> None:
@@ -2200,6 +2234,7 @@ async def run_async_nemo_gym_rollout(
         _prepare_nemo_gym_rows(
             nemo_gym_rows,
             generation_config,
+            generation_only=generation_only,
             sampling_event_id=sampling_event_id,
         )
         accumulator = _NemoGymStreamAccumulator(

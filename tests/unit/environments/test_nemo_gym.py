@@ -43,6 +43,7 @@ from nemo_rl.environments.nemo_gym import (
     _index_per_turn_images,
     _resolve_images_by_media_id,
     _stamp_trajectory_rollout_ids,
+    _validate_scheduler_rollout_purpose,
     _validate_trajectory_transitions,
     build_reward_component_columns,
     extract_reward_components,
@@ -61,6 +62,47 @@ from tests.unit.models.generation.test_vllm_generation import (
 from tests.unit.models.generation.test_vllm_generation import (
     tokenizer as nemo_gym_tokenizer,  # noqa: F401
 )
+
+
+@pytest.mark.parametrize(
+    ("purpose", "generation_only"),
+    [("training", False), ("evaluation", True)],
+)
+def test_actor_accepts_matching_scheduler_rollout_purpose(
+    purpose: str, generation_only: bool
+) -> None:
+    _validate_scheduler_rollout_purpose(
+        [
+            {
+                "rollout_purpose": purpose,
+                "responses_create_params": {
+                    "metadata": {"nemo_rl_rollout_purpose": purpose}
+                },
+            }
+        ],
+        generation_only=generation_only,
+    )
+
+
+def test_actor_rejects_lost_scheduler_rollout_purpose() -> None:
+    with pytest.raises(ValueError, match="wrong scheduler purpose"):
+        _validate_scheduler_rollout_purpose(
+            [{"responses_create_params": {"metadata": {}}}],
+            generation_only=False,
+        )
+
+
+def test_actor_rejects_lost_metadata_rollout_purpose() -> None:
+    with pytest.raises(ValueError, match="wrong metadata purpose"):
+        _validate_scheduler_rollout_purpose(
+            [
+                {
+                    "rollout_purpose": "training",
+                    "responses_create_params": {"metadata": {}},
+                }
+            ],
+            generation_only=False,
+        )
 
 
 def test_extract_reward_components():

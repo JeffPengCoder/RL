@@ -1159,6 +1159,36 @@ def _stamp_trajectory_rollout_ids(
 _stamp_context_compaction_rollout_ids = _stamp_trajectory_rollout_ids
 
 
+def _validate_scheduler_rollout_purpose(
+    rows: list[dict], *, generation_only: bool
+) -> None:
+    """Fail before dispatch if scheduler intent was lost or rewritten."""
+    expected = "evaluation" if generation_only else "training"
+    for row_index, row in enumerate(rows):
+        observed = row.get("rollout_purpose")
+        if observed != expected:
+            raise ValueError(
+                "NeMo-Gym actor received a row with the wrong scheduler purpose: "
+                f"row={row_index}, observed={observed!r}, expected={expected!r}"
+            )
+        responses_create_params = row.get("responses_create_params")
+        metadata = (
+            responses_create_params.get("metadata")
+            if isinstance(responses_create_params, dict)
+            else None
+        )
+        metadata_purpose = (
+            metadata.get("nemo_rl_rollout_purpose")
+            if isinstance(metadata, dict)
+            else None
+        )
+        if metadata_purpose != expected:
+            raise ValueError(
+                "NeMo-Gym actor received a row with the wrong metadata purpose: "
+                f"row={row_index}, observed={metadata_purpose!r}, expected={expected!r}"
+            )
+
+
 @ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
 class NemoGym(EnvironmentInterface):
     """This environment class isn't really used for training. It's really meant as an integration wrapper around NeMo-Gym that hooks into the existing NeMo RL resource management via ray. So there is still one source of truth for resource management in NeMo RL."""
@@ -1294,6 +1324,17 @@ Depending on your data shape, you may want to change these values."""
         """Stream postprocessed rollouts as NeMo-Gym tasks complete."""
         if not nemo_gym_examples:
             raise ValueError("NeMo-Gym rollout batch must not be empty")
+
+        _validate_scheduler_rollout_purpose(
+            nemo_gym_examples, generation_only=generation_only
+        )
+        rollout_purpose = "evaluation" if generation_only else "training"
+        print(
+            "NEMO_RL_ROLLOUT_PURPOSE_DISPATCH|"
+            f"purpose={rollout_purpose}|rows={len(nemo_gym_examples)}|"
+            f"actor_batch={self._rollout_batch_index}",
+            flush=True,
+        )
 
         from nemo_rl.utils.fastokens import maybe_patch_fastokens
 

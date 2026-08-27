@@ -909,7 +909,7 @@ def test_run_async_nemo_gym_rollout_warns_when_max_seq_len_exceeds_engine():
             asyncio.run(_consume_rollout())
 
 
-def test_prepare_nemo_gym_rows_scopes_trajectory_identity() -> None:
+def test_prepare_nemo_gym_rows_stamps_training_purpose_and_identity() -> None:
     rows = [
         {
             "responses_create_params": {"input": []},
@@ -931,14 +931,63 @@ def test_prepare_nemo_gym_rows_scopes_trajectory_identity() -> None:
     rollouts_mod._prepare_nemo_gym_rows(
         rows,
         generation_config,
+        generation_only=False,
         sampling_event_id="sampling-test",
     )
 
+    assert rows[0]["rollout_purpose"] == "training"
+    assert rows[0]["responses_create_params"]["metadata"] == {
+        "nemo_rl_rollout_purpose": "training"
+    }
+    assert rows[0]["responses_create_params"]["max_output_tokens"] == 768
     identity = rows[0]["trajectory_identity"]
     assert identity["sampling_event_id"] == "sampling-test"
     assert identity["source_group_id"] == "dataset-group"
     assert identity["group_id"] != "dataset-group"
     assert identity["rollout_id"]
+
+
+def test_prepare_nemo_gym_rows_stamps_evaluation_purpose() -> None:
+    rows = [{"responses_create_params": {"input": []}}]
+    generation_config = {
+        "temperature": 0.6,
+        "top_p": 0.95,
+        "max_new_tokens": 2048,
+    }
+
+    rollouts_mod._prepare_nemo_gym_rows(
+        rows,
+        generation_config,
+        generation_only=True,
+        sampling_event_id="sampling-eval",
+    )
+
+    assert rows[0]["rollout_purpose"] == "evaluation"
+    assert rows[0]["responses_create_params"]["metadata"] == {
+        "nemo_rl_rollout_purpose": "evaluation"
+    }
+    assert rows[0]["responses_create_params"]["max_output_tokens"] == 2048
+
+
+def test_prepare_nemo_gym_rows_rejects_purpose_conflict() -> None:
+    rows = [
+        {
+            "rollout_purpose": "evaluation",
+            "responses_create_params": {"input": []},
+        }
+    ]
+    generation_config = {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "max_new_tokens": 2048,
+    }
+
+    with pytest.raises(ValueError, match="conflicts with the scheduler"):
+        rollouts_mod._prepare_nemo_gym_rows(
+            rows,
+            generation_config,
+            generation_only=False,
+        )
 
 
 def test_native_rollout_groups_match_whole_batch(monkeypatch):

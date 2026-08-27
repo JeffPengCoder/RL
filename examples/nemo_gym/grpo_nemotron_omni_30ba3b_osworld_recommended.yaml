@@ -67,6 +67,9 @@ policy:
       lr_warmup_iters: 0
       lr_warmup_init: 5.0e-6
   generation:
+    # The base exact-trace recipe keeps a 768-token canary cap. Full OSWorld
+    # training needs room for Nano Omni reasoning plus one executable action.
+    max_new_tokens: ${oc.decode:${oc.env:OSWORLD_MAX_NEW_TOKENS,2048}}
     vllm_cfg:
       async_engine: true
       tensor_parallel_size: 8
@@ -95,6 +98,7 @@ env:
           concurrency: ${oc.decode:${oc.env:OSWORLD_CONCURRENCY,64}}
           max_steps: ${oc.decode:${oc.env:OSWORLD_MAX_TURNS,200}}
           max_trajectory_length: 3
+          max_tokens: ${policy.generation.max_new_tokens}
           task_timeout: ${oc.decode:${oc.env:OSWORLD_TASK_TIMEOUT,7200}}
           agent_kwargs:
             coordinate_type: relative
