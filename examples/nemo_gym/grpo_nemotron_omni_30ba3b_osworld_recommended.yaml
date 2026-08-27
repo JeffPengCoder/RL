@@ -30,15 +30,20 @@ grpo:
     # Keep replay bounded to the immediately preceding policy version until a
     # wider staleness window has selected-workload evidence.
     max_trajectory_age_steps: 1
+  context_compaction_training:
+    rollout_sequence_mask:
+      enabled: true
+      ratio_min: 0.99
+      ratio_max: 1.01
 
 loss_fn:
   # Required by asynchronous replay. Exact sampled logprobs from vLLM remain
   # the rollout authority and also drive the gen_kl_error (vLLM-KL) metric.
   use_importance_sampling_correction: true
   use_on_policy_kl_approximation: true
-  # The recommended 0.99-1.01 sequence mask is not enabled here yet. A logical
-  # rollout can expand into several compacted physical traces, so that mask
-  # must first be computed at rollout_id scope and broadcast to every trace.
+  # The 0.99-1.01 mask is applied by exact-trace scoring at logical rollout_id
+  # scope. Keep the physical-row loss filter disabled: retained rollouts still
+  # use the existing raw token-level importance-sampling correction.
   truncated_importance_sampling_type: null
   truncated_importance_sampling_ratio_min: null
   truncated_importance_sampling_ratio: null

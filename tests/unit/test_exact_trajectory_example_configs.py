@@ -50,6 +50,15 @@ def test_exact_trajectory_example_config_passes_runtime_model_validation(
         assert config.grpo.max_rollout_turns == 200
         assert config.grpo.use_leave_one_out_baseline is True
         assert config.grpo.async_grpo.enabled is True
+        assert config.grpo.context_compaction_training.rollout_sequence_mask.enabled
+        assert (
+            config.grpo.context_compaction_training.rollout_sequence_mask.ratio_min
+            == pytest.approx(0.99)
+        )
+        assert (
+            config.grpo.context_compaction_training.rollout_sequence_mask.ratio_max
+            == pytest.approx(1.01)
+        )
         assert config.loss_fn.use_importance_sampling_correction is True
         assert config.loss_fn.truncated_importance_sampling_type is None
         assert config.policy["train_global_batch_size"] == 2048

@@ -621,6 +621,49 @@ def test_context_compaction_training_config_accepts_async_replay():
     _validate_context_compaction_training_config(config)
 
 
+def test_context_compaction_training_config_accepts_rollout_sequence_mask():
+    config = _context_compaction_master_config()
+    config.grpo["context_compaction_training"]["rollout_sequence_mask"] = {
+        "enabled": True,
+        "ratio_min": 0.99,
+        "ratio_max": 1.01,
+    }
+    config.loss_fn.use_importance_sampling_correction = True
+
+    _validate_context_compaction_training_config(config)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "match"),
+    [
+        (
+            lambda cfg: setattr(cfg.loss_fn, "force_on_policy_ratio", True),
+            "measured policy logprobs",
+        ),
+        (
+            lambda cfg: setattr(
+                cfg.loss_fn,
+                "use_importance_sampling_correction",
+                False,
+            ),
+            "token-level importance sampling correction",
+        ),
+    ],
+)
+def test_rollout_sequence_mask_rejects_incompatible_loss_modes(mutate, match):
+    config = _context_compaction_master_config()
+    config.grpo["context_compaction_training"]["rollout_sequence_mask"] = {
+        "enabled": True,
+        "ratio_min": 0.99,
+        "ratio_max": 1.01,
+    }
+    config.loss_fn.use_importance_sampling_correction = True
+    mutate(config)
+
+    with pytest.raises(ValueError, match=match):
+        _validate_context_compaction_training_config(config)
+
+
 @pytest.mark.parametrize(
     ("mutate", "match"),
     [
@@ -1061,6 +1104,161 @@ def test_grpo_context_compaction_uses_one_physical_batch_and_logical_scheduler(
     assert train_call.kwargs["gbs"] == 4
     assert train_call.kwargs["mbs"] == 1
     assert train_call.kwargs["scheduler_step_increment"] == 1
+
+
+def test_sync_exact_trace_discards_masked_group_before_scoring(
+    mock_grpo_components, capsys
+):
+    """A pre-model Gym failure consumes the next prompt, not a train step."""
+    config = mock_grpo_components["master_config"]
+    config.grpo.max_num_steps = 1
+    config.grpo.max_num_epochs = 1
+    config.grpo.context_compaction_training = ContextCompactionTrainingConfig(
+        enabled=True
+    )
+    config.policy["train_global_batch_size"] = 1
+    config.policy["train_micro_batch_size"] = 1
+    config.policy["megatron_cfg"] = {"enabled": True}
+    config.policy["dtensor_cfg"] = {"enabled": False}
+    config.policy["generation"]["vllm_cfg"]["expose_http_server"] = True
+    config.env["should_use_nemo_gym"] = True
+    config.data_plane = None
+    policy = mock_grpo_components["policy"]
+    policy.data_parallel_size = 1
+
+    masked_batch = BatchedDataDict(
+        {
+            "message_log": [
+                [{"role": "user", "content": "", "token_ids": torch.tensor([])}]
+            ],
+            "length": torch.tensor([0]),
+            "total_reward": torch.tensor([0.0]),
+            "loss_multiplier": torch.tensor([1.0]),
+            "mask_sample": torch.tensor([True]),
+            "truncated": torch.tensor([False]),
+            "rollout_trace_bundle": [None],
+            "physical_message_logs": [[]],
+        }
+    )
+    valid_batch = BatchedDataDict(
+        {
+            "message_log": [
+                [
+                    {
+                        "role": "user",
+                        "content": "test",
+                        "token_ids": torch.tensor([1, 2, 3]),
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "answer",
+                        "token_ids": torch.tensor([4]),
+                        "generation_logprobs": torch.tensor([-0.5]),
+                    },
+                ]
+            ],
+            "length": torch.tensor([3]),
+            "total_reward": torch.tensor([1.0]),
+            "loss_multiplier": torch.tensor([1.0]),
+            "mask_sample": torch.tensor([False]),
+            "truncated": torch.tensor([False]),
+            "rollout_trace_bundle": [{"rollout_id": "rollout-valid"}],
+            "physical_message_logs": [[]],
+        }
+    )
+    rollout_metrics = {
+        "mean_gen_tokens_per_sample": 1.0,
+        "max_gen_tokens": 1,
+        "min_gen_tokens": 1,
+    }
+    rollout_results = [
+        NemoGymRolloutResult(
+            input_ids=torch.tensor([[]], dtype=torch.long),
+            final_batch=masked_batch,
+            rollout_metrics=rollout_metrics,
+            task_index=None,
+        ),
+        NemoGymRolloutResult(
+            input_ids=torch.tensor([[1, 2, 3]]),
+            final_batch=valid_batch,
+            rollout_metrics=rollout_metrics,
+            task_index=None,
+        ),
+    ]
+    trace_train_data = BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[1, 2, 3, 4]]),
+            "input_lengths": torch.tensor([4]),
+            "generation_logprobs": torch.zeros(1, 4),
+            "token_mask": torch.tensor([[0, 0, 0, 1]]),
+            "sample_mask": torch.tensor([1.0]),
+            "advantages": torch.zeros(1, 4),
+            "prev_logprobs": torch.zeros(1, 4),
+            "reference_policy_logprobs": torch.zeros(1, 4),
+        }
+    )
+    trace_preparation = {
+        "rollout_advantages": {"rollout-valid": 0.0},
+        "plan": {
+            "logical_rollout_count": 1,
+            "physical_trace_count": 1,
+            "padding_row_count": 0,
+            "total_row_count": 1,
+            "eligible_action_token_count": 1,
+            "parent_indices": [0],
+        },
+        "materialization": {
+            "train_data": trace_train_data,
+            "row_rewards": torch.tensor([1.0]),
+            "materialized_message_logs": [[{"content": "trace"}]],
+        },
+        "logprob_data": BatchedDataDict({}),
+    }
+
+    with (
+        patch(
+            "nemo_rl.algorithms.grpo.run_nemo_gym_rollout_sync",
+            side_effect=rollout_results,
+        ) as rollout_call,
+        patch(
+            "nemo_rl.algorithms.grpo.prepare_trace_batch_for_scoring",
+            return_value=trace_preparation,
+        ) as prepare_trace_batch,
+        patch(
+            "nemo_rl.algorithms.grpo.score_prepared_trace_batch",
+            return_value={
+                "preparation": trace_preparation,
+                "train_data": trace_train_data,
+            },
+        ),
+        patch(
+            "nemo_rl.algorithms.grpo.compute_and_apply_seq_logprob_error_masking",
+            return_value=_mock_seq_logprob_error_result(),
+        ),
+    ):
+        grpo_train(
+            policy,
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            config,
+        )
+
+    assert rollout_call.call_count == 2
+    prepare_trace_batch.assert_called_once()
+    assert prepare_trace_batch.call_args.args[0] is valid_batch
+    policy.train.assert_called_once()
+    output = capsys.readouterr().out
+    assert "NRL_EXACT_TRACE_GROUP_DISCARDED" in output
+    assert "mode=sync" in output
+    assert "masked_rollouts=1" in output
 
 
 def test_async_grpo_context_compaction_replays_logical_group_then_trains_physical_rows(

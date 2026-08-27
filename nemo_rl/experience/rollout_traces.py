@@ -33,7 +33,7 @@ from nemo_rl.environments.nemo_gym_trace import (
 )
 
 
-_TRACE_BATCH_PLAN_SCHEMA_VERSION = 1
+_TRACE_BATCH_PLAN_SCHEMA_VERSION = 2
 _LOSS_NORMALIZATION = "global_action_token_mean"
 _SUPPORTED_ADVANTAGE_ESTIMATORS = frozenset({"grpo"})
 
@@ -71,6 +71,8 @@ class TraceBatchPlan(TypedDict):
     training_admitted: bool
     sequence_level_ratios_enabled: bool
     sequence_level_clipping_enabled: bool
+    rollout_sequence_mask_ratio_min: float | None
+    rollout_sequence_mask_ratio_max: float | None
     expected_rollouts_per_group: int
     batch_quantum: int
     comparison_group_count: int
@@ -124,6 +126,8 @@ def build_trace_batch_plan(
     advantage_estimator_name: str = "grpo",
     sequence_level_ratios_enabled: bool = False,
     sequence_level_clipping_enabled: bool = False,
+    rollout_sequence_mask_ratio_min: float | None = None,
+    rollout_sequence_mask_ratio_max: float | None = None,
 ) -> TraceBatchPlan:
     """Build a fail-closed physical-row plan from complete logical rollouts.
 
@@ -144,11 +148,43 @@ def build_trace_batch_plan(
             f"{advantage_estimator_name!r}; supported="
             f"{sorted(_SUPPORTED_ADVANTAGE_ESTIMATORS)!r}"
         )
-    if sequence_level_ratios_enabled or sequence_level_clipping_enabled:
+    if sequence_level_ratios_enabled:
         raise ValueError(
-            "Sequence-level ratios and clipping are disabled until their "
-            "multi-trace semantics are explicitly qualified"
+            "Sequence-level importance ratios are not supported for multi-trace "
+            "training; token-level correction remains authoritative"
         )
+    mask_bounds_present = (
+        rollout_sequence_mask_ratio_min is not None,
+        rollout_sequence_mask_ratio_max is not None,
+    )
+    if mask_bounds_present[0] != mask_bounds_present[1]:
+        raise ValueError(
+            "Rollout sequence mask requires both minimum and maximum ratios"
+        )
+    rollout_sequence_mask_enabled = all(mask_bounds_present)
+    if sequence_level_clipping_enabled and not rollout_sequence_mask_enabled:
+        raise ValueError(
+            "Sequence-level clipping requires rollout sequence-mask bounds"
+        )
+    if rollout_sequence_mask_enabled:
+        assert rollout_sequence_mask_ratio_min is not None
+        assert rollout_sequence_mask_ratio_max is not None
+        rollout_sequence_mask_ratio_min = _finite_float(
+            rollout_sequence_mask_ratio_min,
+            field="rollout_sequence_mask_ratio_min",
+        )
+        rollout_sequence_mask_ratio_max = _finite_float(
+            rollout_sequence_mask_ratio_max,
+            field="rollout_sequence_mask_ratio_max",
+        )
+        if (
+            rollout_sequence_mask_ratio_min <= 0
+            or rollout_sequence_mask_ratio_max <= 0
+            or rollout_sequence_mask_ratio_min > rollout_sequence_mask_ratio_max
+        ):
+            raise ValueError(
+                "Rollout sequence-mask bounds must be positive and ordered"
+            )
     if not bundles:
         raise ValueError("TraceBatchPlan requires at least one rollout bundle")
 
@@ -307,7 +343,9 @@ def build_trace_batch_plan(
         "loss_normalization": _LOSS_NORMALIZATION,
         "training_admitted": training_admission,
         "sequence_level_ratios_enabled": False,
-        "sequence_level_clipping_enabled": False,
+        "sequence_level_clipping_enabled": rollout_sequence_mask_enabled,
+        "rollout_sequence_mask_ratio_min": rollout_sequence_mask_ratio_min,
+        "rollout_sequence_mask_ratio_max": rollout_sequence_mask_ratio_max,
         "expected_rollouts_per_group": expected_rollouts_per_group,
         "batch_quantum": batch_quantum,
         "comparison_group_count": len(grouped),
@@ -360,8 +398,28 @@ def validate_trace_batch_plan(
         raise ValueError("TraceBatchPlan has an unsupported loss normalization")
     if plan.get("sequence_level_ratios_enabled") is not False:
         raise ValueError("TraceBatchPlan unexpectedly enables sequence-level ratios")
-    if plan.get("sequence_level_clipping_enabled") is not False:
-        raise ValueError("TraceBatchPlan unexpectedly enables sequence-level clipping")
+    sequence_level_clipping_enabled = plan.get("sequence_level_clipping_enabled")
+    if not isinstance(sequence_level_clipping_enabled, bool):
+        raise ValueError("TraceBatchPlan sequence-level clipping flag is invalid")
+    ratio_min = plan.get("rollout_sequence_mask_ratio_min")
+    ratio_max = plan.get("rollout_sequence_mask_ratio_max")
+    if sequence_level_clipping_enabled:
+        ratio_min = _finite_float(
+            ratio_min,
+            field="rollout_sequence_mask_ratio_min",
+        )
+        ratio_max = _finite_float(
+            ratio_max,
+            field="rollout_sequence_mask_ratio_max",
+        )
+        if ratio_min <= 0 or ratio_max <= 0 or ratio_min > ratio_max:
+            raise ValueError(
+                "TraceBatchPlan rollout sequence-mask bounds are invalid"
+            )
+    elif ratio_min is not None or ratio_max is not None:
+        raise ValueError(
+            "TraceBatchPlan has rollout sequence-mask bounds while masking is disabled"
+        )
     if not isinstance(plan.get("training_admitted"), bool):
         raise ValueError("TraceBatchPlan training_admitted must be boolean")
     if not isinstance(plan.get("optimizer_step_id"), str) or not plan.get(

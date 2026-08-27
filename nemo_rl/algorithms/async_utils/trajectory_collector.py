@@ -39,6 +39,7 @@ from nemo_rl.experience.interfaces import (
 from nemo_rl.experience.rollout_identity import new_sampling_event_id
 from nemo_rl.experience.rollouts import (
     RolloutGroupResult,
+    count_masked_nemo_gym_rollouts,
     run_async_multi_turn_rollout_groups,
 )
 from nemo_rl.models.generation.interfaces import GenerationConfig, GenerationInterface
@@ -290,8 +291,11 @@ class AsyncTrajectoryCollector:
                         self._refit_pause_cleared.wait()
                     print("▶️ Refit completed, resuming collection")
 
-                # Check if generation limits require pausing collection
-                if self._should_pause_for_generation_limits() and self.running:
+                # Check if generation limits require pausing collection. Recheck
+                # after every wakeup: a completed target should remain paused,
+                # while a discarded group leaves an incomplete target that the
+                # current dataloader batch must be allowed to fill.
+                while self.running and self._should_pause_for_generation_limits():
                     # Only log warning once per weight version
                     if self._last_limit_warning_version != self.current_weight_version:
                         max_trajectory_age = (
@@ -308,15 +312,20 @@ class AsyncTrajectoryCollector:
                         )
                         self._last_limit_warning_version = self.current_weight_version
 
-                        self._generation_limit_cleared.clear()  # Clear the event to pause
+                    self._generation_limit_cleared.clear()  # Clear the event to pause
+
+                    # A worker can release its target between the capacity
+                    # check above and this clear. Recheck after clearing so a
+                    # just-released, still-incomplete target cannot lose its
+                    # wakeup and leave collection paused forever.
+                    if not self._should_pause_for_generation_limits():
+                        self._generation_limit_cleared.set()
+                        break
 
                     # Efficiently wait for generation limits to be cleared (no polling!)
-                    with self._efficiency_timer.time("idle/generation_limit_pause"):
-                        self._generation_limit_cleared.wait()
-
-                    # Double-check we're still running after being woken up
-                    if not self.running:
-                        break
+                    if not self._generation_limit_cleared.is_set():
+                        with self._efficiency_timer.time("idle/generation_limit_pause"):
+                            self._generation_limit_cleared.wait()
 
                 if not self.running:
                     break
@@ -642,6 +651,7 @@ class AsyncTrajectoryCollector:
         with self._generation_check_lock:
             if target_weight_version in self._generating_targets:
                 self._generating_targets.discard(target_weight_version)
+                self._generation_limit_cleared.set()
                 print(
                     f"🧹 Released reservation for target weight {target_weight_version}"
                 )
@@ -803,9 +813,7 @@ class AsyncTrajectoryCollector:
                 ),
                 generation_policy_version=(
                     f"async-policy-weight-{generation_weight_version:08d}"
-                    if self.master_config.grpo.get(
-                        "context_compaction_training", {}
-                    ).get("enabled", False)
+                    if self.master_config.grpo.context_compaction_training.enabled
                     else None
                 ),
                 sampling_event_id=sampling_event_id,
@@ -1029,6 +1037,7 @@ class AsyncTrajectoryCollector:
             else {}
         )
         buffered_group_indices: set[int] = set()
+        discarded_group_indices: set[int] = set()
         last_error: Exception | None = None
         max_attempts = 1 + (_MAX_NEMO_GYM_STREAM_RETRIES if use_nemo_gym else 0)
         for attempt in range(1, max_attempts + 1):
@@ -1060,6 +1069,30 @@ class AsyncTrajectoryCollector:
                             f"Rollout stream yielded prompt group {group_index} twice"
                         )
                     scheduled_group_indices.add(group_index)
+                    trace_training_enabled = bool(
+                        use_nemo_gym
+                        and self.master_config.grpo.context_compaction_training.enabled
+                    )
+                    masked_rollout_count = (
+                        count_masked_nemo_gym_rollouts(rollout_result.final_batch)
+                        if trace_training_enabled
+                        else 0
+                    )
+                    if masked_rollout_count:
+                        # GRPO statistics require every replica in a prompt
+                        # group.  A Gym failure has no trainable exact trace, so
+                        # do not enqueue a partial group or fabricate a sample.
+                        # Releasing this target lets the next dataloader prompt
+                        # fill the still-missing replay-buffer slot.
+                        discarded_group_indices.add(group_index)
+                        print(
+                            "NRL_EXACT_TRACE_GROUP_DISCARDED "
+                            f"group_index={group_index} "
+                            f"masked_rollouts={masked_rollout_count} "
+                            f"target_weight={target_weight_version}",
+                            flush=True,
+                        )
+                        continue
                     push_tasks.append(
                         asyncio.create_task(
                             self._enqueue_rollout_group(
@@ -1079,7 +1112,9 @@ class AsyncTrajectoryCollector:
             push_errors = [
                 result for result in push_results if isinstance(result, Exception)
             ]
-            pending_group_indices = expected_group_indices - buffered_group_indices
+            pending_group_indices = expected_group_indices - (
+                buffered_group_indices | discarded_group_indices
+            )
             if not pending_group_indices:
                 return
 

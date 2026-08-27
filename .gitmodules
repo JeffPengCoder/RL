@@ -10,6 +10,6 @@
 	shallow = true
 [submodule "3rdparty/Gym-workspace/Gym"]
 	path = 3rdparty/Gym-workspace/Gym
-	url = https://github.com/jinglinglingling/Gym.git
-	branch = feature/osworld-cell2-context-compaction-signed
+	url = https://github.com/JeffPengCoder/Gym.git
+	branch = feature/osworld-exact-trace-training
 	shallow = true

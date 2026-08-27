@@ -95,6 +95,7 @@ from nemo_rl.experience.rollout_identity import new_sampling_event_id
 from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
     backfill_missing_routed_experts,
+    count_masked_nemo_gym_rollouts,
     get_nemo_gym_thinking_tags,
     run_async_multi_turn_rollout,
     run_multi_turn_rollout,
@@ -195,10 +196,35 @@ class AsyncGRPOConfig(BaseModel, extra="allow"):
     recompute_kv_cache_after_weight_updates: bool = False
 
 
+class RolloutSequenceMaskConfig(BaseModel, extra="forbid"):
+    """Logical-rollout importance-ratio mask for exact multi-trace training."""
+
+    enabled: bool = False
+    ratio_min: float = 0.99
+    ratio_max: float = 1.01
+
+    @model_validator(mode="after")
+    def _validate_bounds(self) -> "RolloutSequenceMaskConfig":
+        if (
+            not np.isfinite(self.ratio_min)
+            or not np.isfinite(self.ratio_max)
+            or self.ratio_min <= 0
+            or self.ratio_max <= 0
+            or self.ratio_min > self.ratio_max
+        ):
+            raise ValueError(
+                "rollout_sequence_mask bounds must be finite, positive, and ordered"
+            )
+        return self
+
+
 class ContextCompactionTrainingConfig(BaseModel, extra="forbid"):
     """Fail-closed opt-in for exact multi-trace GRPO training."""
 
     enabled: bool = False
+    rollout_sequence_mask: RolloutSequenceMaskConfig = Field(
+        default_factory=RolloutSequenceMaskConfig
+    )
 
 
 class RewardPenaltyTokenIdsConfig(BaseModel, extra="allow"):
@@ -2208,6 +2234,25 @@ def _config_value(config: Any, name: str, default: Any = None) -> Any:
     return getattr(config, name, default)
 
 
+def _context_compaction_sequence_mask_bounds(
+    master_config: MasterConfig,
+) -> tuple[float | None, float | None]:
+    """Return configured logical-rollout mask bounds, or disabled sentinels."""
+    grpo_config = _config_value(master_config, "grpo", {})
+    context_config = _config_value(
+        grpo_config,
+        "context_compaction_training",
+        {},
+    )
+    mask_config = _config_value(context_config, "rollout_sequence_mask", {})
+    if not bool(_config_value(mask_config, "enabled", False)):
+        return None, None
+    return (
+        float(_config_value(mask_config, "ratio_min", 0.99)),
+        float(_config_value(mask_config, "ratio_max", 1.01)),
+    )
+
+
 def _validate_context_compaction_training_config(
     master_config: MasterConfig,
 ) -> None:
@@ -2264,6 +2309,29 @@ def _validate_context_compaction_training_config(
         errors.append("sequence-level loss reduction is not supported")
     if loss_config.truncated_importance_sampling_type == "seq-mask-tis":
         errors.append("sequence-level TIS masking is not supported")
+    sequence_mask_min, sequence_mask_max = _context_compaction_sequence_mask_bounds(
+        master_config
+    )
+    if sequence_mask_min is not None:
+        if loss_config.force_on_policy_ratio:
+            errors.append(
+                "rollout sequence masking requires measured policy logprobs; "
+                "force_on_policy_ratio is not supported"
+            )
+        if not loss_config.use_importance_sampling_correction:
+            errors.append(
+                "rollout sequence masking requires token-level importance "
+                "sampling correction"
+            )
+        if (
+            sequence_mask_max is None
+            or not np.isfinite(sequence_mask_min)
+            or not np.isfinite(sequence_mask_max)
+            or sequence_mask_min <= 0
+            or sequence_mask_max <= 0
+            or sequence_mask_min > sequence_mask_max
+        ):
+            errors.append("rollout sequence-mask bounds are invalid")
     if loss_config.use_kl_in_reward:
         errors.append("KL-in-reward advantage rewriting is not supported")
     if loss_config.positive_example_nll_weight != 0:
@@ -3378,7 +3446,6 @@ def grpo_train(
                         repeated_batch = nemo_gym_rollout_result.final_batch
                         rollout_metrics = nemo_gym_rollout_result.rollout_metrics
                         del nemo_gym_rollout_result
-
                     # Use async rollouts when enabled by config/backend defaults.
                     elif _should_use_async_rollouts(master_config):
                         (
@@ -3419,6 +3486,27 @@ def grpo_train(
                         rollout_metrics["mean_gen_tokens_per_sample"]
                     )
                     logger.log_metrics(rollout_metrics, total_steps + 1, prefix="train")
+
+                if context_compaction_training:
+                    masked_rollout_count = count_masked_nemo_gym_rollouts(
+                        repeated_batch
+                    )
+                    if masked_rollout_count:
+                        # Exact-trace GRPO needs every replica in the prompt
+                        # group. A rollout that failed before its first model
+                        # call has no trainable trace, so discard the complete
+                        # comparison group before reward/scoring and consume the
+                        # next dataloader prompt without advancing the optimizer
+                        # step. This is the synchronous counterpart of the
+                        # AsyncTrajectoryCollector admission gate.
+                        print(
+                            "NRL_EXACT_TRACE_GROUP_DISCARDED "
+                            "mode=sync "
+                            f"masked_rollouts={masked_rollout_count} "
+                            f"optimizer_step={total_steps + 1}",
+                            flush=True,
+                        )
+                        continue
 
                 repeated_batch = scale_rewards(
                     repeated_batch, master_config.grpo.reward_scaling
@@ -3535,6 +3623,9 @@ def grpo_train(
                     trace_scoring_preparation = None
                     if context_compaction_training:
                         metrics["num_mask_sample_filtered"] = 0
+                        sequence_mask_min, sequence_mask_max = (
+                            _context_compaction_sequence_mask_bounds(master_config)
+                        )
                         trace_scoring_preparation = prepare_trace_batch_for_scoring(
                             repeated_batch,
                             prompt_ids=prompt_ids_for_adv,
@@ -3551,6 +3642,8 @@ def grpo_train(
                                 "make_sequence_length_divisible_by"
                             ],
                             training_admission=True,
+                            rollout_sequence_mask_ratio_min=sequence_mask_min,
+                            rollout_sequence_mask_ratio_max=sequence_mask_max,
                         )
                         train_data = trace_scoring_preparation["materialization"][
                             "train_data"
@@ -3675,6 +3768,24 @@ def grpo_train(
                             skip_reference_logprobs=skip_reference_logprobs,
                         )
                         train_data = scored_trace_batch["train_data"]
+                        metrics.update(
+                            scored_trace_batch.get(
+                                "rollout_sequence_mask_metrics",
+                                {},
+                            )
+                        )
+                        if scored_trace_batch.get(
+                            "rollout_sequence_mask_metrics", {}
+                        ).get("rollout_sequence_mask/enabled"):
+                            print(
+                                "NRL_ROLLOUT_SEQUENCE_MASK "
+                                + json.dumps(
+                                    scored_trace_batch["rollout_sequence_mask_metrics"],
+                                    sort_keys=True,
+                                    separators=(",", ":"),
+                                ),
+                                flush=True,
+                            )
                         del scored_trace_batch
                     else:
                         # Custom create this logprob_data so we avoid Ray comm overheads sending unused data to workers.
@@ -5208,6 +5319,9 @@ def async_grpo_train(
                     trace_scoring_preparation = None
                     context_compaction_metrics: dict[str, Any] = {}
                     if context_compaction_training:
+                        sequence_mask_min, sequence_mask_max = (
+                            _context_compaction_sequence_mask_bounds(master_config)
+                        )
                         trace_scoring_preparation = prepare_trace_batch_for_scoring(
                             repeated_batch,
                             prompt_ids=prompt_ids_for_adv,
@@ -5224,6 +5338,8 @@ def async_grpo_train(
                                 "make_sequence_length_divisible_by"
                             ],
                             training_admission=True,
+                            rollout_sequence_mask_ratio_min=sequence_mask_min,
+                            rollout_sequence_mask_ratio_max=sequence_mask_max,
                         )
                         train_data = trace_scoring_preparation["materialization"][
                             "train_data"
@@ -5344,6 +5460,24 @@ def async_grpo_train(
                             skip_reference_logprobs=skip_reference_logprobs,
                         )
                         train_data = scored_trace_batch["train_data"]
+                        context_compaction_metrics.update(
+                            scored_trace_batch.get(
+                                "rollout_sequence_mask_metrics",
+                                {},
+                            )
+                        )
+                        if scored_trace_batch.get(
+                            "rollout_sequence_mask_metrics", {}
+                        ).get("rollout_sequence_mask/enabled"):
+                            print(
+                                "NRL_ROLLOUT_SEQUENCE_MASK "
+                                + json.dumps(
+                                    scored_trace_batch["rollout_sequence_mask_metrics"],
+                                    sort_keys=True,
+                                    separators=(",", ":"),
+                                ),
+                                flush=True,
+                            )
                         del scored_trace_batch
                     else:
                         if not skip_prev_logprobs:

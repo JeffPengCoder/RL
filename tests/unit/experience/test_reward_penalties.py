@@ -22,6 +22,7 @@ from nemo_rl.experience.rollouts import (
     _extract_mask_sample_flags,
     _postprocess_single_nemo_gym_group,
     apply_reward_penalties,
+    count_masked_nemo_gym_rollouts,
     resolve_reward_penalty_config,
     should_mask_flagged_samples,
 )
@@ -107,6 +108,44 @@ class TestExtractMaskSampleFlags:
         assert torch.equal(
             mask_sample, torch.tensor([True, False, False, False, False])
         )
+
+    def test_prefers_top_level_mask_without_dropping_legacy_mask(self):
+        results = [
+            {"full_result": {"mask_sample": True}},
+            {
+                "full_result": {
+                    "mask_sample": False,
+                    "instance_config": {"mask_sample": True},
+                }
+            },
+            {
+                "full_result": {
+                    "mask_sample": False,
+                    "instance_config": {"mask_sample": False},
+                }
+            },
+        ]
+
+        assert torch.equal(
+            _extract_mask_sample_flags(results),
+            torch.tensor([True, True, False]),
+        )
+
+    def test_counts_masked_rollouts_without_mutating_group(self):
+        rollout_batch = BatchedDataDict(
+            {
+                "loss_multiplier": torch.tensor([1.0, 1.0]),
+                "mask_sample": [False, True],
+            }
+        )
+
+        assert count_masked_nemo_gym_rollouts(rollout_batch) == 1
+        assert rollout_batch["mask_sample"] == [False, True]
+
+    def test_counts_zero_when_group_has_no_mask_field(self):
+        rollout_batch = BatchedDataDict({"loss_multiplier": torch.tensor([1.0, 1.0])})
+
+        assert count_masked_nemo_gym_rollouts(rollout_batch) == 0
 
 
 class TestShouldMaskFlaggedSamples:

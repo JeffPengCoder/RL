@@ -19,7 +19,10 @@ from pathlib import Path
 import pytest
 import torch
 
-from nemo_rl.algorithms.advantage_estimator import GRPOAdvantageEstimator
+from nemo_rl.algorithms.advantage_estimator import (
+    AdvEstimatorConfig,
+    GRPOAdvantageEstimator,
+)
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.trace_batch_scoring import (
@@ -86,10 +89,10 @@ def _message_logs(bundle: dict) -> list[list[dict]]:
 
 def _estimator() -> GRPOAdvantageEstimator:
     return GRPOAdvantageEstimator(
-        {
-            "use_leave_one_out_baseline": False,
-            "normalize_rewards": True,
-        },
+        AdvEstimatorConfig(
+            use_leave_one_out_baseline=False,
+            normalize_rewards=True,
+        ),
         ClippedPGLossConfig(),
     )
 
@@ -302,6 +305,101 @@ def _prepared_compacted_batch():
         optimizer_step_id="step-score-workers",
         pad_token_id=999,
     )
+
+
+def test_rollout_sequence_mask_aggregates_all_physical_rows_and_broadcasts():
+    first = _rekey_rollout(
+        _fixture("k2_compaction.json"),
+        rollout_id="masked-rollout",
+        group_id="shared-group",
+        source_row_index=0,
+        reward=1.0,
+    )
+    second = _rekey_rollout(
+        _fixture("k2_compaction.json"),
+        rollout_id="kept-rollout",
+        group_id="shared-group",
+        source_row_index=1,
+        reward=3.0,
+    )
+    prepared = prepare_trace_batch_for_scoring(
+        _rollout_batch([first, second]),
+        prompt_ids=torch.tensor([[101, 102], [101, 102]]),
+        advantage_estimator=_estimator(),
+        expected_rollouts_per_group=2,
+        batch_quantum=8,
+        optimizer_step_id="step-rollout-sequence-mask",
+        pad_token_id=999,
+        rollout_sequence_mask_ratio_min=0.99,
+        rollout_sequence_mask_ratio_max=1.01,
+    )
+    train_data = prepared["materialization"]["train_data"]
+    policy_logprobs = train_data["generation_logprobs"].clone()
+    first_rows = prepared["plan"]["rollout_to_rows"][0]
+    first_mask = train_data["token_mask"][first_rows].bool()
+    policy_logprobs[first_rows] += first_mask * torch.log(torch.tensor(1.02))
+
+    scored = attach_precomputed_trace_logprobs(
+        prepared,
+        policy_output={"logprobs": policy_logprobs},
+        reference_output={"reference_logprobs": torch.zeros_like(policy_logprobs)},
+    )
+
+    assert prepared["plan"]["rollout_to_rows"] == [[0, 1, 2], [3, 4, 5]]
+    assert scored["train_data"]["sample_mask"].tolist() == [
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        1.0,
+        1.0,
+        0.0,
+        0.0,
+    ]
+    assert scored["rollout_sequence_mask_metrics"] == pytest.approx(
+        {
+            "rollout_sequence_mask/enabled": 1.0,
+            "rollout_sequence_mask/logical_rollouts": 2.0,
+            "rollout_sequence_mask/kept_rollouts": 1.0,
+            "rollout_sequence_mask/masked_rollouts": 1.0,
+            "rollout_sequence_mask/masked_physical_rows": 3.0,
+            "rollout_sequence_mask/ratio_min": 1.0,
+            "rollout_sequence_mask/ratio_mean": 1.01,
+            "rollout_sequence_mask/ratio_max": 1.02,
+        },
+        rel=1e-5,
+        abs=1e-6,
+    )
+
+
+def test_rollout_sequence_mask_can_zero_an_entire_out_of_bounds_batch():
+    prepared = prepare_trace_batch_for_scoring(
+        _rollout_batch([_fixture("k2_compaction.json")]),
+        prompt_ids=torch.tensor([[101, 102]]),
+        advantage_estimator=_estimator(),
+        expected_rollouts_per_group=1,
+        batch_quantum=4,
+        optimizer_step_id="step-all-masked",
+        pad_token_id=999,
+        rollout_sequence_mask_ratio_min=0.99,
+        rollout_sequence_mask_ratio_max=1.01,
+    )
+    train_data = prepared["materialization"]["train_data"]
+    policy_logprobs = train_data["generation_logprobs"].clone()
+    policy_logprobs += train_data["token_mask"].bool() * torch.log(
+        torch.tensor(1.02)
+    )
+
+    scored = attach_precomputed_trace_logprobs(
+        prepared,
+        policy_output={"logprobs": policy_logprobs},
+        reference_output={"reference_logprobs": torch.zeros_like(policy_logprobs)},
+    )
+
+    assert torch.count_nonzero(scored["train_data"]["sample_mask"]).item() == 0
+    assert scored["rollout_sequence_mask_metrics"][
+        "rollout_sequence_mask/kept_rollouts"
+    ] == 0.0
 
 
 def test_policy_and_reference_outputs_are_attached_to_exact_physical_rows():

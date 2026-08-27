@@ -319,6 +319,22 @@ def _execute_pending_exact_trace_step(
             )
             if scoring_summary["plan_id"] != plan["plan_id"]:
                 raise ValueError("TQ scoring validation returned the wrong trace plan")
+            rollout_sequence_mask_metrics = scoring_summary.get(
+                "rollout_sequence_mask_metrics",
+                {},
+            )
+            if rollout_sequence_mask_metrics.get(
+                "rollout_sequence_mask/enabled"
+            ):
+                print(
+                    "NRL_ROLLOUT_SEQUENCE_MASK "
+                    + json.dumps(
+                        rollout_sequence_mask_metrics,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    flush=True,
+                )
             physical = policy.read_from_dataplane(
                 meta,
                 select_fields=[
@@ -442,6 +458,7 @@ def _execute_pending_exact_trace_step(
             "prev_logprobs": prev_logprobs,
             "reference_policy_logprobs": physical["reference_policy_logprobs"],
             "seq_logprob_error_metrics": seq_metrics,
+            "rollout_sequence_mask_metrics": rollout_sequence_mask_metrics,
             "kv_scales_cache": kv_scales_cache,
             "log_input_ids": log_input_ids,
             "log_content": log_content,
@@ -1284,6 +1301,9 @@ def grpo_train_sync(
                     prev_logprobs = exact_step["prev_logprobs"]
                     reference_policy_logprobs = exact_step["reference_policy_logprobs"]
                     seq_logprob_error_metrics = exact_step["seq_logprob_error_metrics"]
+                    metrics.update(
+                        exact_step.get("rollout_sequence_mask_metrics", {})
+                    )
                     if exact_step["kv_scales_cache"] is not None:
                         kv_scales_cache = exact_step["kv_scales_cache"]
                     _log_input_ids = exact_step["log_input_ids"]

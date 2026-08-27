@@ -469,6 +469,7 @@ class SyncRolloutActor:
         ``group_size=None`` before calling :meth:`commit_pending_exact_trace`.
         """
         from nemo_rl.algorithms.grpo import (
+            _context_compaction_sequence_mask_bounds,
             _create_advantage_estimator,
             _should_use_nemo_gym,
             extract_initial_prompt_messages,
@@ -580,6 +581,9 @@ class SyncRolloutActor:
                 pad_value_dict={"token_ids": self.tokenizer.pad_token_id},
             )
             prompt_ids = prompt_flat["token_ids"]
+            sequence_mask_min, sequence_mask_max = (
+                _context_compaction_sequence_mask_bounds(cfg)
+            )
             preparation = prepare_trace_batch_for_scoring(
                 fb,
                 prompt_ids=prompt_ids,
@@ -592,6 +596,8 @@ class SyncRolloutActor:
                     "make_sequence_length_divisible_by"
                 ],
                 training_admission=True,
+                rollout_sequence_mask_ratio_min=sequence_mask_min,
+                rollout_sequence_mask_ratio_max=sequence_mask_max,
             )
             plan = preparation["plan"]
             plan_summary = summarize_exact_trace_plan(
@@ -881,6 +887,9 @@ class SyncRolloutActor:
         )
         canonical_train_data = scored["train_data"]
         skipped_fields: dict[str, torch.Tensor] = {}
+        canonical_sample_mask = canonical_train_data["sample_mask"]
+        if not torch.equal(aligned["sample_mask"], canonical_sample_mask):
+            skipped_fields["sample_mask"] = canonical_sample_mask
         for skipped, field in (
             (skip_policy_logprobs, "prev_logprobs"),
             (skip_reference_logprobs, "reference_policy_logprobs"),
@@ -906,6 +915,10 @@ class SyncRolloutActor:
             "total_row_count": plan["total_row_count"],
             "logical_rollout_count": plan["logical_rollout_count"],
             "eligible_action_token_count": plan["eligible_action_token_count"],
+            "rollout_sequence_mask_metrics": scored.get(
+                "rollout_sequence_mask_metrics",
+                {},
+            ),
         }
 
     def abort_pending_exact_trace(self, *, pending_handle: str) -> bool:

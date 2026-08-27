@@ -1397,11 +1397,54 @@ class TestAsyncTrajectoryCollector:
         collector = self.create_local_collector()
         target_weight = 5
 
+        collector._generation_limit_cleared.clear()
         collector._generating_targets.add(target_weight)
         collector._release_target(target_weight)
         collector._release_target(target_weight)
 
         assert target_weight not in collector._generating_targets
+        assert collector._generation_limit_cleared.is_set()
+
+    def test_collection_loop_rechecks_capacity_after_clearing_pause_event(self):
+        """A target released before event clear cannot strand the dataloader."""
+        collector = self.create_local_collector()
+        self._prime_collection_loop(collector)
+        processed = []
+        collector.dataloader = [object()]
+        collector._process_batch = processed.append
+        pause_checks = iter((True, False))
+        collector._should_pause_for_generation_limits = lambda: next(pause_checks)
+
+        collector._collection_loop()
+
+        assert len(processed) == 1
+        assert collector.data_exhausted is True
+
+    def test_collection_loop_rechecks_capacity_after_release_wakeup(self):
+        """A successful target release cannot consume a still-blocked batch."""
+        collector = self.create_local_collector()
+        self._prime_collection_loop(collector)
+        processed = []
+        collector.dataloader = [object()]
+        collector._process_batch = processed.append
+        pause_checks = iter((True, True, True, False))
+        observed_pause_checks = []
+
+        def should_pause():
+            paused = next(pause_checks)
+            observed_pause_checks.append(paused)
+            if paused:
+                # Model a worker release after the pause event was cleared.
+                collector._generation_limit_cleared.set()
+            return paused
+
+        collector._should_pause_for_generation_limits = should_pause
+
+        collector._collection_loop()
+
+        assert len(processed) == 1
+        assert observed_pause_checks == [True, True, True, False]
+        assert collector.data_exhausted is True
 
     def test_process_batch_releases_target_when_worker_start_fails(self, monkeypatch):
         """Test start failures do not leave a target reserved forever."""
@@ -1861,6 +1904,77 @@ class TestAsyncTrajectoryCollector:
         assert replay_buffer.add.task_indices == [7, 8]
         assert target_weight not in collector._generating_targets
 
+    def test_nemo_gym_masked_exact_group_is_discarded_for_next_prompt(
+        self, monkeypatch, capsys
+    ):
+        """A failed replica cannot enter replay or trigger same-prompt stream retry."""
+
+        class RemoteMethod:
+            def __init__(self):
+                self.calls = []
+
+            async def remote(self, *args):
+                self.calls.append(args)
+                return "success"
+
+        class FakeReplayBuffer:
+            def __init__(self):
+                self.add = RemoteMethod()
+
+        replay_buffer = FakeReplayBuffer()
+        collector = self.create_local_collector(replay_buffer=replay_buffer)
+        collector.running = True
+        collector.master_config.grpo.context_compaction_training.enabled = True
+        collector.master_config.policy["generation"] = {
+            "stop_token_ids": [1],
+            "stop_strings": ["stop"],
+        }
+        target_weight = 16
+        collector._generating_targets.add(target_weight)
+        repeated_batch = BatchedDataDict(
+            {
+                "extra_env_info": [
+                    {"_ng_task_index": 7},
+                    {"_ng_task_index": 7},
+                ],
+                "loss_multiplier": torch.ones(2),
+            }
+        )
+        rollout_calls = 0
+
+        async def fake_rollouts(**kwargs):
+            nonlocal rollout_calls
+            rollout_calls += 1
+            yield SimpleNamespace(
+                task_index=7,
+                final_batch=BatchedDataDict(
+                    {
+                        "loss_multiplier": torch.ones(2),
+                        "mask_sample": torch.tensor([False, True]),
+                    }
+                ),
+                rollout_metrics={},
+            )
+
+        import nemo_rl.experience.rollouts as rollouts_mod
+
+        monkeypatch.setattr(rollouts_mod, "run_async_nemo_gym_rollout", fake_rollouts)
+
+        asyncio.run(
+            collector._run_rollout_batch_worker(
+                repeated_batch=repeated_batch,
+                generation_weight_version=3,
+                target_weight_version=target_weight,
+                num_generations=2,
+                use_nemo_gym=True,
+            )
+        )
+
+        assert rollout_calls == 1
+        assert replay_buffer.add.calls == []
+        assert target_weight not in collector._generating_targets
+        assert "NRL_EXACT_TRACE_GROUP_DISCARDED" in capsys.readouterr().out
+
     def test_invalid_gym_batch_releases_target(self):
         """Validation errors cannot leave a target reservation stuck."""
         collector = self.create_local_collector()
@@ -1920,7 +2034,7 @@ class TestAsyncTrajectoryCollector:
 
         collector = self.create_local_collector(replay_buffer=FakeReplayBuffer())
         collector._run_rollout_batch_worker = record_rollout_batch
-        collector.master_config.grpo["context_compaction_training"] = {"enabled": True}
+        collector.master_config.grpo.context_compaction_training.enabled = True
         collector.running = True
         target_weight = 7
 
@@ -1977,7 +2091,7 @@ class TestAsyncTrajectoryCollector:
             add = RemoteAdd()
 
         collector = self.create_local_collector(replay_buffer=FakeReplayBuffer())
-        collector.master_config.grpo["context_compaction_training"] = {"enabled": True}
+        collector.master_config.grpo.context_compaction_training.enabled = True
         collector.master_config.policy["generation"] = {
             "temperature": 1.0,
             "top_p": 1.0,

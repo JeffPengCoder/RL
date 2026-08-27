@@ -47,6 +47,7 @@ from nemo_rl.environments.nemo_gym import (
     build_reward_component_columns,
     extract_reward_components,
     setup_nemo_gym_config,
+    spinup_nemo_gym_actor,
     validate_reward_components_match_scalar,
 )
 from nemo_rl.experience.rollout_identity import scope_trajectory_identities
@@ -120,6 +121,48 @@ def test_validate_reward_components_match_scalar():
                 },
             ]
         )
+
+
+def test_spinup_nemo_gym_actor_applies_opt_in_ray_resources(monkeypatch):
+    """Keep the Gym actor on nodes that carry its role-scoped writable mounts."""
+    captured: dict = {}
+    actor = SimpleNamespace(_spinup=SimpleNamespace(remote=lambda: "spinup-ref"))
+
+    class _FakeNemoGym:
+        @staticmethod
+        def options(**options):
+            captured["options"] = options
+            return SimpleNamespace(
+                remote=lambda config: captured.update(config=config) or actor
+            )
+
+    import nemo_rl.environments.nemo_gym as nemo_gym_module
+
+    monkeypatch.setattr(nemo_gym_module, "NemoGym", _FakeNemoGym)
+    monkeypatch.setattr(
+        nemo_gym_module, "get_actor_python_env", lambda _name: "/fake/python"
+    )
+    monkeypatch.setattr(nemo_gym_module, "get_nemo_gym_uv_cache_dir", lambda: None)
+    monkeypatch.setattr(nemo_gym_module, "get_nemo_gym_venv_dir", lambda: None)
+    monkeypatch.setattr(nemo_gym_module.ray, "get", lambda ref: ref)
+
+    returned_actor = spinup_nemo_gym_actor(
+        {
+            "nemo_gym": {
+                "ray_actor_resources": {"nrl_trainer_node": 0.001},
+                "initial_global_config_dict": {"agent_name": "test"},
+            }
+        },
+        ["http://model/v1"],
+        "model",
+        enable_router_replay=False,
+        routed_experts_dtype="int32",
+        use_fastokens=False,
+    )
+
+    assert returned_actor is actor
+    assert captured["options"]["resources"] == {"nrl_trainer_node": 0.001}
+    assert "ray_actor_resources" not in captured["config"]["initial_global_config_dict"]
 
 
 _TEST_GENERATION_CONTRACT = {
@@ -1211,6 +1254,49 @@ def test_nemo_gym_training_rejects_semantic_only_trajectory() -> None:
             object(),
             generation_only=False,
         )
+
+
+def test_nemo_gym_training_preserves_masked_pre_model_failure_for_group_retry() -> None:
+    trajectory_contract = _test_trajectory_contract(
+        rollout_id="rollout-masked-before-model",
+        transition_count=0,
+        model_call_count=0,
+        exact=False,
+    )
+    payload = {
+        "mask_sample": True,
+        "reward": 0.0,
+        "response": {
+            "trajectory_contract": trajectory_contract,
+            "trajectory_transitions": [],
+            "trajectory_model_calls": [],
+            "model_call_summaries": [],
+            "media_assets": {},
+            "output": [],
+        },
+        "responses_create_params": {"input": []},
+    }
+    row = {
+        "_rowidx": 0,
+        "trajectory_runtime_contract": _test_runtime_contract(),
+    }
+
+    postprocess = (
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result
+    )
+    result = postprocess(
+        type("_MockSelf", (), {"cfg": {}})(),
+        row,
+        payload,
+        object(),
+        generation_only=False,
+    )
+
+    assert result["full_result"] is payload
+    assert result["full_result"]["mask_sample"] is True
+    assert result["rollout_trace_bundle"] is None
+    assert result["physical_message_logs"] == []
+    assert result["message_log"][0]["token_ids"].numel() == 0
 
 
 def test_nemo_gym_generation_only_accepts_semantic_trajectory_without_tokens() -> None:

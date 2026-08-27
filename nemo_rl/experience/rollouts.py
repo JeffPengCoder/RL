@@ -46,7 +46,10 @@ from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
     EnvironmentReturn,
 )
-from nemo_rl.environments.nemo_gym import DEFAULT_THINKING_TAGS
+from nemo_rl.environments.nemo_gym import (
+    DEFAULT_THINKING_TAGS,
+    nemo_gym_result_requests_mask,
+)
 from nemo_rl.experience.interfaces import NEMO_GYM_TASK_INDEX_KEY
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.experience.rollout_identity import (
@@ -95,16 +98,21 @@ def _add_r3_fallback_metrics(
 def _extract_mask_sample_flags(results: list[dict[str, Any]]) -> torch.Tensor:
     """Return True for samples the environment asks GRPO to mask from loss."""
     return torch.tensor(
-        [
-            bool(
-                (result["full_result"].get("instance_config") or {}).get(
-                    "mask_sample", False
-                )
-            )
-            for result in results
-        ],
+        [nemo_gym_result_requests_mask(result["full_result"]) for result in results],
         dtype=torch.bool,
     )
+
+
+def count_masked_nemo_gym_rollouts(
+    rollout_batch: BatchedDataDict[DatumSpec],
+) -> int:
+    """Count rollout-aligned Gym failures without mutating their group."""
+    mask_sample = rollout_batch.get("mask_sample")
+    if mask_sample is None:
+        return 0
+    if not isinstance(mask_sample, torch.Tensor):
+        mask_sample = torch.tensor(mask_sample, dtype=torch.bool)
+    return int(mask_sample.bool().sum().item())
 
 
 def _attach_routed_experts_to_message_log_prefix(

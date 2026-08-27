@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Mapping, Protocol, TypedDict
+from typing import Any, Mapping, NotRequired, Protocol, TypedDict
 
 import torch
 
@@ -47,6 +47,7 @@ class TraceScoringResult(TypedDict):
 
     preparation: TraceScoringPreparation
     train_data: BatchedDataDict[Any]
+    rollout_sequence_mask_metrics: NotRequired[dict[str, float]]
 
 
 class _TraceLogprobPolicy(Protocol):
@@ -226,6 +227,8 @@ def prepare_trace_batch_for_scoring(
     pad_token_id: int,
     make_sequence_length_divisible_by: int = 1,
     training_admission: bool = False,
+    rollout_sequence_mask_ratio_min: float | None = None,
+    rollout_sequence_mask_ratio_max: float | None = None,
 ) -> TraceScoringPreparation:
     """Compute logical GRPO advantages, then expand exact physical rows.
 
@@ -272,7 +275,8 @@ def prepare_trace_batch_for_scoring(
         training_admission=training_admission,
         advantage_estimator_name="grpo",
         sequence_level_ratios_enabled=False,
-        sequence_level_clipping_enabled=False,
+        rollout_sequence_mask_ratio_min=rollout_sequence_mask_ratio_min,
+        rollout_sequence_mask_ratio_max=rollout_sequence_mask_ratio_max,
     )
     physical_message_logs_by_rollout = {
         str(bundle["rollout_id"]): logs
@@ -325,6 +329,122 @@ def _validated_logprobs(
     # objective. Canonicalize them to zero so masked NaN/Inf values cannot leak
     # through a later multiplication.
     return torch.where(effective_token_mask, value, torch.zeros_like(value))
+
+
+def apply_rollout_sequence_mask(
+    preparation: TraceScoringPreparation,
+) -> dict[str, float]:
+    """Apply one importance-ratio decision to every row of a logical rollout.
+
+    Context compaction may split one rollout across several physical rows.  The
+    mask therefore aggregates all eligible action tokens owned by the logical
+    ``rollout_id`` before deciding whether any of its rows may train.  Token-level
+    importance-sampling correction remains unchanged in the loss.
+    """
+    plan = preparation["plan"]
+    enabled = bool(plan["sequence_level_clipping_enabled"])
+    metrics = {
+        "rollout_sequence_mask/enabled": float(enabled),
+        "rollout_sequence_mask/logical_rollouts": float(
+            plan["logical_rollout_count"]
+        ),
+        "rollout_sequence_mask/kept_rollouts": float(
+            plan["logical_rollout_count"]
+        ),
+        "rollout_sequence_mask/masked_rollouts": 0.0,
+        "rollout_sequence_mask/masked_physical_rows": 0.0,
+        "rollout_sequence_mask/ratio_min": 1.0,
+        "rollout_sequence_mask/ratio_mean": 1.0,
+        "rollout_sequence_mask/ratio_max": 1.0,
+    }
+    if not enabled:
+        return metrics
+
+    ratio_min = plan["rollout_sequence_mask_ratio_min"]
+    ratio_max = plan["rollout_sequence_mask_ratio_max"]
+    if not isinstance(ratio_min, float) or not isinstance(ratio_max, float):
+        raise ValueError("Enabled rollout sequence mask has no finite bounds")
+
+    train_data = preparation["materialization"]["train_data"]
+    required = (
+        "token_mask",
+        "sample_mask",
+        "prev_logprobs",
+        "generation_logprobs",
+    )
+    if any(not isinstance(train_data.get(key), torch.Tensor) for key in required):
+        raise TypeError("Rollout sequence mask requires tensor logprob and mask fields")
+    token_mask = train_data["token_mask"].bool()
+    sample_mask = train_data["sample_mask"]
+    prev_logprobs = train_data["prev_logprobs"]
+    generation_logprobs = train_data["generation_logprobs"]
+    if (
+        token_mask.shape != prev_logprobs.shape
+        or generation_logprobs.shape != prev_logprobs.shape
+        or sample_mask.shape != (prev_logprobs.shape[0],)
+    ):
+        raise ValueError("Rollout sequence mask fields have inconsistent shapes")
+
+    updated_sample_mask = sample_mask.clone()
+    ratios: list[torch.Tensor] = []
+    kept_rollouts = 0
+    masked_physical_rows = 0
+    for rollout_index, row_indices in enumerate(plan["rollout_to_rows"]):
+        if not row_indices:
+            raise ValueError("Rollout sequence mask found a rollout with no rows")
+        row_index = torch.tensor(
+            row_indices,
+            dtype=torch.int64,
+            device=prev_logprobs.device,
+        )
+        eligible = token_mask.index_select(0, row_index) & (
+            sample_mask.index_select(0, row_index).bool().unsqueeze(-1)
+        )
+        eligible_count = int(torch.count_nonzero(eligible).item())
+        expected_count = sum(
+            int(plan["rows"][index]["eligible_token_count"])
+            for index in row_indices
+        )
+        if eligible_count <= 0 or eligible_count != expected_count:
+            raise ValueError(
+                "Rollout sequence mask disagrees with planned eligible-token ownership"
+            )
+        log_ratio = (
+            prev_logprobs.index_select(0, row_index)
+            - generation_logprobs.index_select(0, row_index)
+        )[eligible].mean()
+        ratio = torch.exp(log_ratio).detach()
+        if not torch.isfinite(ratio):
+            raise ValueError(
+                f"Rollout {plan['rollout_ids'][rollout_index]!r} has a non-finite "
+                "sequence importance ratio"
+            )
+        ratios.append(ratio)
+        keep = bool((ratio >= ratio_min).item() and (ratio <= ratio_max).item())
+        if keep:
+            kept_rollouts += 1
+        else:
+            updated_sample_mask[row_index] = 0
+            masked_physical_rows += len(row_indices)
+
+    ratio_tensor = torch.stack(ratios).float()
+    train_data["sample_mask"] = updated_sample_mask
+    logical_rollouts = int(plan["logical_rollout_count"])
+    metrics.update(
+        {
+            "rollout_sequence_mask/kept_rollouts": float(kept_rollouts),
+            "rollout_sequence_mask/masked_rollouts": float(
+                logical_rollouts - kept_rollouts
+            ),
+            "rollout_sequence_mask/masked_physical_rows": float(
+                masked_physical_rows
+            ),
+            "rollout_sequence_mask/ratio_min": float(ratio_tensor.min().item()),
+            "rollout_sequence_mask/ratio_mean": float(ratio_tensor.mean().item()),
+            "rollout_sequence_mask/ratio_max": float(ratio_tensor.max().item()),
+        }
+    )
+    return metrics
 
 
 def attach_precomputed_trace_logprobs(
@@ -388,9 +508,11 @@ def attach_precomputed_trace_logprobs(
 
     train_data["prev_logprobs"] = prev_logprobs
     train_data["reference_policy_logprobs"] = reference_logprobs
+    rollout_sequence_mask_metrics = apply_rollout_sequence_mask(preparation)
     return {
         "preparation": preparation,
         "train_data": train_data,
+        "rollout_sequence_mask_metrics": rollout_sequence_mask_metrics,
     }
 
 

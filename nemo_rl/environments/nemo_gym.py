@@ -98,6 +98,20 @@ _EXACT_TRACE_RESPONSE_PROJECTION_FIELDS = (
 _MEDIA_PART_TYPES = frozenset({"input_image", "image", "image_url"})
 
 
+def nemo_gym_result_requests_mask(nemo_gym_result: dict[str, Any]) -> bool:
+    """Return whether Gym marked a rollout as unusable for training.
+
+    New Gym results expose ``mask_sample`` at the result boundary.  Keep the
+    legacy ``instance_config`` location readable so mounted Gym code can be
+    upgraded independently from NeMo-RL.
+    """
+    instance_config = nemo_gym_result.get("instance_config") or {}
+    return bool(
+        nemo_gym_result.get("mask_sample", False)
+        or instance_config.get("mask_sample", False)
+    )
+
+
 def _has_nan_generation_logprobs(result: dict) -> bool:
     """Return whether a postprocessed rollout contains NaN policy logprobs."""
     return any(
@@ -1553,6 +1567,26 @@ Depending on your data shape, you may want to change these values."""
             )
         else:
             if runtime_contract is not None:
+                if nemo_gym_result_requests_mask(nemo_gym_result):
+                    # An environment may fail before its first model call (for
+                    # example while creating an OpenSandbox instance).  There
+                    # can be no exact trace authority in that case.  Preserve a
+                    # rollout-aligned masked result so the GRPO controller can
+                    # discard the whole incomplete comparison group and sample
+                    # the next prompt.  Successful semantic-only trajectories
+                    # remain fail-closed below.
+                    semantic_placeholder = {
+                        "role": "user",
+                        "content": "",
+                        "token_ids": torch.tensor([], dtype=torch.long),
+                    }
+                    return {
+                        "message_log": [semantic_placeholder],
+                        "input_message_log": [semantic_placeholder],
+                        "physical_message_logs": [],
+                        "rollout_trace_bundle": None,
+                        "full_result": nemo_gym_result,
+                    }
                 raise ValueError(
                     "Trace-aware NeMo-RL requires exact model-call authority; "
                     "Gym returned only semantic trajectory evidence"
@@ -2165,12 +2199,13 @@ def spinup_nemo_gym_actor(
 
     When env_configs["nemo_gym"]["num_gpu_nodes"] > 0, the actor is scheduled
     with soft NodeAffinity to the current Ray node so its colocated GPU
-    resources land where the caller expects.
+    resources land where the caller expects. ``ray_actor_resources`` can bind
+    a CPU-only actor to scheduler-labelled Ray nodes that carry its mounts.
 
     Args:
         env_configs: The master_config.env mapping; env_configs["nemo_gym"] supplies
             the Gym global config plus NeMo-RL detection knobs (invalid_tool_call_patterns,
-            thinking_tags and num_gpu_nodes).
+            thinking_tags, num_gpu_nodes and ray_actor_resources).
         base_urls: Per-DP-rank OpenAI-compatible server base URLs from the generation backend.
         model_name: Served model name the Gym rollouts should target.
         enable_router_replay: Sets require_routed_experts on the NemoGymConfig.
@@ -2191,6 +2226,7 @@ def spinup_nemo_gym_actor(
     invalid_tool_call_patterns = nemo_gym_dict.pop("invalid_tool_call_patterns", None)
     thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
     tokenizer_config = nemo_gym_dict.pop("tokenizer_config", None)
+    ray_actor_resources = nemo_gym_dict.pop("ray_actor_resources", None)
     nemo_gym_dict.pop("is_trajectory_collection", None)
 
     # Pass prebuilt cache + venv dirs through the global config so the gym reuses
@@ -2227,6 +2263,8 @@ def spinup_nemo_gym_actor(
             node_id=ray.get_runtime_context().get_node_id(),
             soft=True,
         )
+    if ray_actor_resources:
+        nemo_gym_opts["resources"] = dict(ray_actor_resources)
     nemo_gym_opts["runtime_env"] = {
         "py_executable": nemo_gym_py_exec,
         "env_vars": {

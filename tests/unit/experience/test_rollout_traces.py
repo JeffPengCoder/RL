@@ -465,3 +465,46 @@ def test_unsupported_multitrace_semantics_fail_closed(kwargs):
             optimizer_step_id="step-unsupported",
             **kwargs,
         )
+
+
+def test_rollout_sequence_mask_bounds_are_part_of_the_plan_identity():
+    bundle = _fixture("k2_compaction.json")
+    plan = build_trace_batch_plan(
+        [bundle],
+        rollout_advantages=_advantages(bundle),
+        expected_rollouts_per_group=1,
+        batch_quantum=4,
+        optimizer_step_id="step-rollout-sequence-mask",
+        rollout_sequence_mask_ratio_min=0.99,
+        rollout_sequence_mask_ratio_max=1.01,
+    )
+
+    assert plan["sequence_level_ratios_enabled"] is False
+    assert plan["sequence_level_clipping_enabled"] is True
+    assert plan["rollout_sequence_mask_ratio_min"] == pytest.approx(0.99)
+    assert plan["rollout_sequence_mask_ratio_max"] == pytest.approx(1.01)
+    assert validate_trace_batch_plan(plan)["logical_rollout_count"] == 1
+
+    corrupted = deepcopy(plan)
+    corrupted["rollout_sequence_mask_ratio_max"] = 1.02
+    with pytest.raises(ValueError, match="identity"):
+        validate_trace_batch_plan(corrupted)
+
+
+@pytest.mark.parametrize(
+    ("ratio_min", "ratio_max"),
+    [(None, 1.01), (0.99, None), (0.0, 1.01), (1.02, 1.01)],
+)
+def test_rollout_sequence_mask_rejects_invalid_bounds(ratio_min, ratio_max):
+    bundle = _fixture("k2_compaction.json")
+
+    with pytest.raises(ValueError, match="bounds|minimum and maximum"):
+        build_trace_batch_plan(
+            [bundle],
+            rollout_advantages=_advantages(bundle),
+            expected_rollouts_per_group=1,
+            batch_quantum=1,
+            optimizer_step_id="step-invalid-rollout-mask",
+            rollout_sequence_mask_ratio_min=ratio_min,
+            rollout_sequence_mask_ratio_max=ratio_max,
+        )
