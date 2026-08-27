@@ -29,6 +29,7 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from nemo_rl.weight_sync.nccl_reshard_utils import (
     MeshInfo,
+    _STR_TO_DTYPE,
     _extract_layer_name,
     build_mesh_info,
     build_nccl_reshard_refit_info,
@@ -39,6 +40,12 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
     is_expert_param,
     is_nccl_reshard_param,
 )
+
+
+@pytest.mark.parametrize("dtype_name", ["torch.int64", "int64"])
+def test_str_to_dtype_supports_int64_misc_tensor_metadata(dtype_name: str) -> None:
+    """Misc packed-broadcast metadata must decode integer tensor dtypes."""
+    assert _STR_TO_DTYPE[dtype_name] is torch.int64
 
 
 # --------------------------------------------------------------------------

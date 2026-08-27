@@ -275,64 +275,84 @@ class AsyncTrajectoryCollector:
                 "start_collection must set a dataloader before collection"
             )
         dataloader = self.dataloader
+        max_num_epochs = self.master_config.grpo.max_num_epochs
         try:
-            for batch in dataloader:
-                if not self.running:
-                    break
-
-                # Check if manually paused and wait
-                if not self._manual_pause_cleared.is_set() and self.running:
-                    self._manual_pause_cleared.wait()
-
-                # Check if refit is in progress and wait
-                if not self._refit_pause_cleared.is_set() and self.running:
-                    print("⏸️ Pausing collection for refit...")
-                    with self._efficiency_timer.time("idle/refit_event_wait"):
-                        self._refit_pause_cleared.wait()
-                    print("▶️ Refit completed, resuming collection")
-
-                # Check if generation limits require pausing collection. Recheck
-                # after every wakeup: a completed target should remain paused,
-                # while a discarded group leaves an incomplete target that the
-                # current dataloader batch must be allowed to fill.
-                while self.running and self._should_pause_for_generation_limits():
-                    # Only log warning once per weight version
-                    if self._last_limit_warning_version != self.current_weight_version:
-                        max_trajectory_age = (
-                            self.master_config.grpo.async_grpo.max_trajectory_age_steps
-                        )
-                        target_weights = [
-                            self.current_weight_version + i
-                            for i in range(max_trajectory_age)
-                        ]
-
-                        print(
-                            f"⏸️ Pausing collection: all target weights {target_weights} for weight version {self.current_weight_version} "
-                            f"already exist in buffer. Waiting for weight update..."
-                        )
-                        self._last_limit_warning_version = self.current_weight_version
-
-                    self._generation_limit_cleared.clear()  # Clear the event to pause
-
-                    # A worker can release its target between the capacity
-                    # check above and this clear. Recheck after clearing so a
-                    # just-released, still-incomplete target cannot lose its
-                    # wakeup and leave collection paused forever.
-                    if not self._should_pause_for_generation_limits():
-                        self._generation_limit_cleared.set()
+            for epoch_index in range(max_num_epochs):
+                epoch_had_batches = False
+                print(
+                    "🔁 Trajectory collection starting data epoch "
+                    f"{epoch_index + 1}/{max_num_epochs}",
+                    flush=True,
+                )
+                for batch in dataloader:
+                    epoch_had_batches = True
+                    if not self.running:
                         break
 
-                    # Efficiently wait for generation limits to be cleared (no polling!)
-                    if not self._generation_limit_cleared.is_set():
-                        with self._efficiency_timer.time("idle/generation_limit_pause"):
-                            self._generation_limit_cleared.wait()
+                    # Check if manually paused and wait
+                    if not self._manual_pause_cleared.is_set() and self.running:
+                        self._manual_pause_cleared.wait()
+
+                    # Check if refit is in progress and wait
+                    if not self._refit_pause_cleared.is_set() and self.running:
+                        print("⏸️ Pausing collection for refit...")
+                        with self._efficiency_timer.time("idle/refit_event_wait"):
+                            self._refit_pause_cleared.wait()
+                        print("▶️ Refit completed, resuming collection")
+
+                    # Check if generation limits require pausing collection. Recheck
+                    # after every wakeup: a completed target should remain paused,
+                    # while a discarded group leaves an incomplete target that the
+                    # current dataloader batch must be allowed to fill.
+                    while self.running and self._should_pause_for_generation_limits():
+                        # Only log warning once per weight version
+                        if (
+                            self._last_limit_warning_version
+                            != self.current_weight_version
+                        ):
+                            max_trajectory_age = self.master_config.grpo.async_grpo.max_trajectory_age_steps
+                            target_weights = [
+                                self.current_weight_version + i
+                                for i in range(max_trajectory_age)
+                            ]
+
+                            print(
+                                f"⏸️ Pausing collection: all target weights {target_weights} for weight version {self.current_weight_version} "
+                                f"already exist in buffer. Waiting for weight update..."
+                            )
+                            self._last_limit_warning_version = (
+                                self.current_weight_version
+                            )
+
+                        self._generation_limit_cleared.clear()  # Clear the event to pause
+
+                        # A worker can release its target between the capacity
+                        # check above and this clear. Recheck after clearing so a
+                        # just-released, still-incomplete target cannot lose its
+                        # wakeup and leave collection paused forever.
+                        if not self._should_pause_for_generation_limits():
+                            self._generation_limit_cleared.set()
+                            break
+
+                        # Efficiently wait for generation limits to be cleared (no polling!)
+                        if not self._generation_limit_cleared.is_set():
+                            with self._efficiency_timer.time(
+                                "idle/generation_limit_pause"
+                            ):
+                                self._generation_limit_cleared.wait()
+
+                    if not self.running:
+                        break
+
+                    self._process_batch(batch)
 
                 if not self.running:
                     break
-
-                self._process_batch(batch)
+                if not epoch_had_batches:
+                    dataloader_exhausted = True
+                    break
             else:
-                # for-loop completed without break → dataloader iterator exhausted
+                # All configured epochs completed without an external stop.
                 dataloader_exhausted = True
 
         except Exception as e:

@@ -1159,6 +1159,28 @@ class TestAsyncTrajectoryCollector:
         assert status["errored"] is False
         assert status["running"] is False
 
+    def test_collection_loop_repeats_dataloader_for_configured_epochs(self):
+        """Async collection honors max_num_epochs instead of draining one pass."""
+        collector = self.create_local_collector()
+        self._prime_collection_loop(collector)
+        collector.master_config.grpo.max_num_epochs = 3
+        processed = []
+        collector._process_batch = lambda batch: processed.append(batch)
+        collector.dataloader = [{"b": 0}, {"b": 1}]
+
+        collector._collection_loop()
+
+        assert processed == [
+            {"b": 0},
+            {"b": 1},
+            {"b": 0},
+            {"b": 1},
+            {"b": 0},
+            {"b": 1},
+        ]
+        assert collector.data_exhausted is True
+        assert collector.collection_failed is False
+
     def test_collection_loop_marks_errored_on_crash(self):
         """A crash sets errored (not data_exhausted) so driver guards fail fast."""
         collector = self.create_local_collector()

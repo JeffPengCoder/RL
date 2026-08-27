@@ -213,11 +213,13 @@ def _get_expert_tp_shard_dim(param_name: str) -> Optional[int]:
 # =========================================================================
 
 _STR_TO_DTYPE = {
+    "torch.int64": torch.int64,
     "torch.bfloat16": torch.bfloat16,
     "torch.float16": torch.float16,
     "torch.float32": torch.float32,
     "torch.float8_e4m3fn": torch.float8_e4m3fn,
     "torch.float8_e5m2": torch.float8_e5m2,
+    "int64": torch.int64,
     "bfloat16": torch.bfloat16,
     "float16": torch.float16,
     "float32": torch.float32,
