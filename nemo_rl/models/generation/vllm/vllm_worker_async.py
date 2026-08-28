@@ -353,6 +353,7 @@ class VllmAsyncGenerationWorkerImpl(
 
         from fastapi import Request
         from fastapi.responses import JSONResponse, StreamingResponse
+        from vllm.entrypoints.chat_utils import load_chat_template
         from vllm.entrypoints.openai.chat_completion.protocol import (
             ChatCompletionRequest,
             ChatCompletionResponse,
@@ -639,6 +640,30 @@ class VllmAsyncGenerationWorkerImpl(
         serving_chat_kwargs = serving_chat_default_kwargs | self.cfg["vllm_cfg"].get(
             "http_server_serving_chat_kwargs", dict()
         )
+        # Recipes expose the stable NeMo-RL field ``chat_template_kwargs``, while
+        # vLLM 0.25 calls the constructor argument
+        # ``default_chat_template_kwargs``. Normalize it once and pass the same
+        # defaults to chat completion, rendering, and tokenization so all three
+        # endpoints render an identical prompt contract.
+        recipe_chat_template_kwargs = serving_chat_kwargs.pop(
+            "chat_template_kwargs", None
+        )
+        explicit_default_chat_template_kwargs = serving_chat_kwargs.get(
+            "default_chat_template_kwargs"
+        )
+        if recipe_chat_template_kwargs or explicit_default_chat_template_kwargs:
+            serving_chat_kwargs["default_chat_template_kwargs"] = {
+                **(recipe_chat_template_kwargs or {}),
+                **(explicit_default_chat_template_kwargs or {}),
+            }
+
+        # NeMo-RL constructs vLLM's serving objects directly. Mirror vLLM's
+        # stock API server and resolve a configured template path before the
+        # renderer sees it; otherwise the path itself is treated as literal
+        # Jinja source.
+        serving_chat_kwargs["chat_template"] = load_chat_template(
+            serving_chat_kwargs["chat_template"]
+        )
         online_renderer = NeMoRLOnlineRenderer(
             model_config=engine_client.model_config,
             renderer=engine_client.renderer,
@@ -652,6 +677,9 @@ class VllmAsyncGenerationWorkerImpl(
             # passed to OpenAIServingChat via http_server_serving_chat_kwargs.
             tool_parser=serving_chat_kwargs.get("tool_parser"),
             reasoning_parser=serving_chat_kwargs.get("reasoning_parser"),
+            default_chat_template_kwargs=serving_chat_kwargs.get(
+                "default_chat_template_kwargs"
+            ),
         )
         serving_chat_kwargs.update(
             dict(
@@ -739,6 +767,9 @@ class VllmAsyncGenerationWorkerImpl(
             chat_template_content_format=serving_chat_kwargs[
                 "chat_template_content_format"
             ],
+            default_chat_template_kwargs=serving_chat_kwargs.get(
+                "default_chat_template_kwargs"
+            ),
             models=serving_chat_kwargs["models"],
             online_renderer=online_renderer,
         )

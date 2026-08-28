@@ -267,9 +267,12 @@ def _install_fake_vllm_openai_modules(monkeypatch):
             self.registry = "registry"
 
     class OnlineRenderer:
+        instances = []
+
         def __init__(self, **kwargs):
             self.kwargs = kwargs
             self.renderer = kwargs["renderer"]
+            self.instances.append(self)
 
     class OpenAIServingChat:
         instances = []
@@ -298,6 +301,11 @@ def _install_fake_vllm_openai_modules(monkeypatch):
         "vllm.entrypoints.openai.chat_completion.protocol",
         ChatCompletionRequest=type("ChatCompletionRequest", (), {}),
         ChatCompletionResponse=type("ChatCompletionResponse", (), {}),
+    )
+    load_chat_template = MagicMock(side_effect=lambda path: f"resolved::{path}")
+    make_module(
+        "vllm.entrypoints.chat_utils",
+        load_chat_template=load_chat_template,
     )
     make_module(
         "vllm.entrypoints.openai.chat_completion.serving",
@@ -339,7 +347,14 @@ def _install_fake_vllm_openai_modules(monkeypatch):
         ToolParserManager=ToolParserManager,
     )
     make_module("vllm.v1.engine.async_llm", logger=MagicMock())
-    return ToolParserManager, ReasoningParserManager, OpenAIServingChat
+    return (
+        ToolParserManager,
+        ReasoningParserManager,
+        OpenAIServingChat,
+        OnlineRenderer,
+        ServingTokenization,
+        load_chat_template,
+    )
 
 
 class _FakeFastAPIApp:
@@ -359,6 +374,9 @@ def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch):
         tool_parser_manager,
         reasoning_parser_manager,
         openai_serving_chat,
+        online_renderer,
+        serving_tokenization,
+        load_chat_template,
     ) = _install_fake_vllm_openai_modules(monkeypatch)
 
     worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
@@ -370,6 +388,11 @@ def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch):
             "reasoning_parser_plugin": "/plugins/reasoning_parser.py",
             "http_server_serving_chat_kwargs": {
                 "reasoning_parser": "nano_v3",
+                "chat_template": "/contracts/nano-omni.jinja",
+                "chat_template_kwargs": {
+                    "enable_thinking": True,
+                    "truncate_history_thinking": False,
+                },
             },
         },
     }
@@ -388,6 +411,33 @@ def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch):
         "/plugins/reasoning_parser.py"
     )
     assert openai_serving_chat.instances[0].kwargs["reasoning_parser"] == "nano_v3"
+    expected_template_kwargs = {
+        "enable_thinking": True,
+        "truncate_history_thinking": False,
+    }
+    load_chat_template.assert_called_once_with("/contracts/nano-omni.jinja")
+    assert "chat_template_kwargs" not in openai_serving_chat.instances[0].kwargs
+    assert (
+        openai_serving_chat.instances[0].kwargs["default_chat_template_kwargs"]
+        == expected_template_kwargs
+    )
+    assert openai_serving_chat.instances[0].kwargs["chat_template"] == (
+        "resolved::/contracts/nano-omni.jinja"
+    )
+    assert (
+        online_renderer.instances[0].kwargs["default_chat_template_kwargs"]
+        == expected_template_kwargs
+    )
+    assert online_renderer.instances[0].kwargs["chat_template"] == (
+        "resolved::/contracts/nano-omni.jinja"
+    )
+    assert (
+        serving_tokenization.instances[0].kwargs["default_chat_template_kwargs"]
+        == expected_template_kwargs
+    )
+    assert serving_tokenization.instances[0].kwargs["chat_template"] == (
+        "resolved::/contracts/nano-omni.jinja"
+    )
     # make sure that the config attribute does not leak into `http_server_serving_chat_kwargs`
     assert "reasoning_parser_plugin" not in openai_serving_chat.instances[0].kwargs
 
