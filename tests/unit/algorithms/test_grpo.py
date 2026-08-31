@@ -49,6 +49,7 @@ from nemo_rl.algorithms.grpo import (
     _raise_if_reward_penalties_enabled_without_nemo_gym,
     _resolve_logprob_skip_flags,
     _resolve_message_level_advantage_penalties,
+    _save_async_replay_buffer_checkpoint,
     _should_use_async_rollouts,
     _validate_use_kl_in_reward_compat,
     _validate_async_context_compaction_replay_groups,
@@ -110,6 +111,48 @@ def test_add_role_node_resource_rejects_invalid_input():
         _add_role_node_resource(None, 1, " ")
     with pytest.raises(ValueError, match="Expected 2"):
         _add_role_node_resource([{}], 2, "nrl_trainer_node")
+
+
+def test_async_checkpoint_can_intentionally_skip_replay_buffer(
+    tmp_path, capsys
+) -> None:
+    replay_buffer = MagicMock()
+
+    with (
+        patch("nemo_rl.algorithms.grpo.ray.get") as ray_get,
+        patch("nemo_rl.algorithms.grpo.torch.save") as torch_save,
+    ):
+        result = _save_async_replay_buffer_checkpoint(
+            replay_buffer, str(tmp_path), enabled=False
+        )
+
+    assert result is None
+    replay_buffer.state_dict.remote.assert_not_called()
+    ray_get.assert_not_called()
+    torch_save.assert_not_called()
+    assert "CHECKPOINT ASYNC_REPLAY_BUFFER_SKIPPED" in capsys.readouterr().out
+
+
+def test_async_checkpoint_saves_replay_buffer_by_default_path(tmp_path) -> None:
+    replay_buffer = MagicMock()
+    remote_state = replay_buffer.state_dict.remote.return_value
+    replay_buffer_state = {"trajectories": [object(), object()]}
+
+    with (
+        patch(
+            "nemo_rl.algorithms.grpo.ray.get", return_value=replay_buffer_state
+        ) as ray_get,
+        patch("nemo_rl.algorithms.grpo.torch.save") as torch_save,
+    ):
+        result = _save_async_replay_buffer_checkpoint(
+            replay_buffer, str(tmp_path), enabled=True
+        )
+
+    assert result == 2
+    ray_get.assert_called_once_with(remote_state)
+    torch_save.assert_called_once_with(
+        replay_buffer_state, str(tmp_path / "replay_buffer.pt")
+    )
 
 
 @patch("nemo_rl.algorithms.grpo.ray")

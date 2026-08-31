@@ -2674,6 +2674,36 @@ def _write_latest_checkpoint_status(
         json.dump(status, f)
 
 
+def _save_async_replay_buffer_checkpoint(
+    replay_buffer: Any,
+    checkpoint_path: str,
+    *,
+    enabled: bool,
+) -> Optional[int]:
+    """Persist async replay state, or intentionally resume with an empty buffer.
+
+    Disabling this does not change model, optimizer, dataloader, or rollout-cursor
+    checkpointing. The existing resume path already treats a missing
+    ``replay_buffer.pt`` as an empty buffer and refills it from the collector.
+    """
+    if not enabled:
+        print(
+            "CHECKPOINT ASYNC_REPLAY_BUFFER_SKIPPED "
+            "reason=checkpointing.save_replay_buffer_false"
+        )
+        return None
+
+    print("📦 Saving replay buffer state...")
+    replay_buffer_state = ray.get(replay_buffer.state_dict.remote())
+    torch.save(
+        replay_buffer_state,
+        os.path.join(checkpoint_path, "replay_buffer.pt"),
+    )
+    trajectory_count = len(replay_buffer_state["trajectories"])
+    print(f"✅ Saved replay buffer with {trajectory_count} trajectories")
+    return trajectory_count
+
+
 def _get_effort_config(master_config: MasterConfig) -> Optional[EffortLevelsConfig]:
     """Return the effort-levels reward-shaping config from env.nemo_gym, if set."""
     if "nemo_gym" not in master_config.env:
@@ -5106,6 +5136,11 @@ def async_grpo_train(
     print(f"✅ Buffer ready for step {step}! Starting training loop...")
 
     ft_save_period = master_config.checkpointing.get("ft_save_period")
+    save_replay_buffer = master_config.checkpointing.get(
+        "save_replay_buffer", True
+    )
+    if not isinstance(save_replay_buffer, bool):
+        raise ValueError("checkpointing.save_replay_buffer must be a boolean")
 
     # Main training loop
     try:
@@ -5932,15 +5967,10 @@ def async_grpo_train(
                             actual_dataloader_state,
                             os.path.join(checkpoint_path, "train_dataloader.pt"),
                         )
-                        print("📦 Saving replay buffer state...")
-                        replay_buffer_state = ray.get(replay_buffer.state_dict.remote())
-                        torch.save(
-                            replay_buffer_state,
-                            os.path.join(checkpoint_path, "replay_buffer.pt"),
-                        )
-                        print(
-                            "✅ Saved replay buffer with "
-                            f"{len(replay_buffer_state['trajectories'])} trajectories"
+                        _save_async_replay_buffer_checkpoint(
+                            replay_buffer,
+                            checkpoint_path,
+                            enabled=save_replay_buffer,
                         )
                         rollouts_state = ray.get(
                             trajectory_collector.get_rollouts_state.remote()
