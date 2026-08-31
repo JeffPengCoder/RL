@@ -96,6 +96,7 @@ from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
     backfill_missing_routed_experts,
     count_masked_nemo_gym_rollouts,
+    count_masked_nemo_gym_rollouts_without_exact_trace,
     get_nemo_gym_thinking_tags,
     run_async_multi_turn_rollout,
     run_multi_turn_rollout,
@@ -3491,22 +3492,37 @@ def grpo_train(
                     masked_rollout_count = count_masked_nemo_gym_rollouts(
                         repeated_batch
                     )
-                    if masked_rollout_count:
+                    untraceable_masked_rollout_count = (
+                        count_masked_nemo_gym_rollouts_without_exact_trace(
+                            repeated_batch
+                        )
+                        if masked_rollout_count
+                        else 0
+                    )
+                    all_rollouts_masked = masked_rollout_count == repeated_batch.size
+                    if untraceable_masked_rollout_count or all_rollouts_masked:
                         # Exact-trace GRPO needs every replica in the prompt
-                        # group. A rollout that failed before its first model
-                        # call has no trainable trace, so discard the complete
-                        # comparison group before reward/scoring and consume the
-                        # next dataloader prompt without advancing the optimizer
-                        # step. This is the synchronous counterpart of the
-                        # AsyncTrajectoryCollector admission gate.
+                        # group. A pre-model failure has no trace, so consume the
+                        # next prompt without advancing the optimizer step.
                         print(
                             "NRL_EXACT_TRACE_GROUP_DISCARDED "
+                            "mode=sync "
+                            f"masked_rollouts={masked_rollout_count} "
+                            "untraceable_masked_rollouts="
+                            f"{untraceable_masked_rollout_count} "
+                            f"all_rollouts_masked={str(all_rollouts_masked).lower()} "
+                            f"optimizer_step={total_steps + 1}",
+                            flush=True,
+                        )
+                        continue
+                    if masked_rollout_count:
+                        print(
+                            "NRL_EXACT_TRACE_MASKED_GROUP_ACCEPTED "
                             "mode=sync "
                             f"masked_rollouts={masked_rollout_count} "
                             f"optimizer_step={total_steps + 1}",
                             flush=True,
                         )
-                        continue
 
                 repeated_batch = scale_rewards(
                     repeated_batch, master_config.grpo.reward_scaling
@@ -3672,6 +3688,9 @@ def grpo_train(
                                 ],
                                 "context_compaction/physical_rows": trace_plan[
                                     "total_row_count"
+                                ],
+                                "num_mask_sample_filtered": trace_plan[
+                                    "masked_logical_rollout_count"
                                 ],
                                 "context_compaction/eligible_action_tokens": (
                                     trace_plan["eligible_action_token_count"]
@@ -5355,6 +5374,9 @@ def async_grpo_train(
                             ]["materialized_message_logs"]
                         ]
                         trace_plan = trace_scoring_preparation["plan"]
+                        num_mask_sample_filtered = int(
+                            trace_plan["masked_logical_rollout_count"]
+                        )
                         context_compaction_metrics = {
                             "context_compaction/logical_rollouts": trace_plan[
                                 "logical_rollout_count"
@@ -5367,6 +5389,9 @@ def async_grpo_train(
                             ],
                             "context_compaction/physical_rows": trace_plan[
                                 "total_row_count"
+                            ],
+                            "context_compaction/masked_logical_rollouts": trace_plan[
+                                "masked_logical_rollout_count"
                             ],
                             "context_compaction/eligible_action_tokens": trace_plan[
                                 "eligible_action_token_count"

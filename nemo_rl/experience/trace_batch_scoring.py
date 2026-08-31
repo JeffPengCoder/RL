@@ -79,12 +79,14 @@ def _require_rollout_aligned_sequence(
     return value
 
 
-def _require_unmasked_logical_rollouts(
+def _logical_rollout_sample_masks(
     rollout_batch: Mapping[str, Any],
     *,
-    rollout_count: int,
-) -> None:
-    """Reject masking semantics not yet represented by TraceBatchPlan."""
+    bundles: list[Mapping[str, Any]],
+) -> dict[str, float]:
+    """Resolve rollout-level loss eligibility without changing GRPO statistics."""
+    rollout_count = len(bundles)
+    sample_masks = [1.0] * rollout_count
     for key in ("loss_multiplier", "mask_sample", "truncated"):
         value = rollout_batch.get(key)
         if value is None:
@@ -102,14 +104,37 @@ def _require_unmasked_logical_rollouts(
                 f"Trace-aware rollout batch field {key!r} is not rollout-aligned"
             )
         if key == "loss_multiplier":
-            rejected = any(float(item) != 1.0 for item in values)
+            for index, item in enumerate(values):
+                sample_mask = _finite_binary_mask(
+                    item,
+                    field=f"{key}[{index}]",
+                )
+                sample_masks[index] *= sample_mask
         else:
-            rejected = any(bool(item) for item in values)
-        if rejected:
-            raise ValueError(
-                "Trace-aware GRPO currently rejects masked or truncated logical "
-                f"rollouts; unsupported field={key!r}"
-            )
+            for index, item in enumerate(values):
+                if bool(item):
+                    sample_masks[index] = 0.0
+
+    result: dict[str, float] = {}
+    for bundle, sample_mask in zip(bundles, sample_masks):
+        rollout_id = bundle.get("rollout_id")
+        if not isinstance(rollout_id, str) or not rollout_id:
+            raise ValueError("Trace bundle has no rollout identity")
+        if rollout_id in result:
+            raise ValueError(f"Duplicate logical rollout ID {rollout_id!r}")
+        result[rollout_id] = sample_mask
+    if not any(sample_mask == 1.0 for sample_mask in result.values()):
+        raise ValueError("Trace-aware GRPO batch has no trainable logical rollout")
+    return result
+
+
+def _finite_binary_mask(value: Any, *, field: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"Trace-aware {field} must be a finite binary number")
+    result = float(value)
+    if not math.isfinite(result) or result not in {0.0, 1.0}:
+        raise ValueError(f"Trace-aware {field} must be either 0 or 1")
+    return result
 
 
 def _validate_prompt_group_partition(
@@ -233,9 +258,10 @@ def prepare_trace_batch_for_scoring(
     """Compute logical GRPO advantages, then expand exact physical rows.
 
     This function deliberately stops before calling a policy/reference worker.
-    It also rejects rollout masking, truncation, reward rewriting, and
-    non-standard advantage estimators until their multi-trace semantics are
-    explicitly implemented.
+    Masked logical rollouts remain in their complete comparison group for GRPO
+    statistics, while every physical row they own receives ``sample_mask=0``.
+    Non-binary weighting, reward rewriting, and non-standard advantage
+    estimators remain fail-closed.
     """
     raw_bundles = rollout_batch.get("rollout_trace_bundle")
     if not isinstance(raw_bundles, list) or not raw_bundles:
@@ -251,9 +277,9 @@ def prepare_trace_batch_for_scoring(
         "physical_message_logs",
         rollout_count=rollout_count,
     )
-    _require_unmasked_logical_rollouts(
+    rollout_sample_masks = _logical_rollout_sample_masks(
         rollout_batch,
-        rollout_count=rollout_count,
+        bundles=bundles,
     )
 
     rewards = rollout_batch.get("total_reward")
@@ -269,6 +295,7 @@ def prepare_trace_batch_for_scoring(
     plan = build_trace_batch_plan(
         bundles,
         rollout_advantages=rollout_advantages,
+        rollout_sample_masks=rollout_sample_masks,
         expected_rollouts_per_group=expected_rollouts_per_group,
         batch_quantum=batch_quantum,
         optimizer_step_id=optimizer_step_id,
@@ -343,16 +370,18 @@ def apply_rollout_sequence_mask(
     """
     plan = preparation["plan"]
     enabled = bool(plan["sequence_level_clipping_enabled"])
+    logical_rollouts = int(plan["logical_rollout_count"])
+    pre_masked_rollouts = int(plan["masked_logical_rollout_count"])
+    pre_masked_physical_rows = int(plan["masked_physical_trace_count"])
     metrics = {
         "rollout_sequence_mask/enabled": float(enabled),
-        "rollout_sequence_mask/logical_rollouts": float(
-            plan["logical_rollout_count"]
-        ),
+        "rollout_sequence_mask/logical_rollouts": float(logical_rollouts),
+        "rollout_sequence_mask/pre_masked_rollouts": float(pre_masked_rollouts),
         "rollout_sequence_mask/kept_rollouts": float(
-            plan["logical_rollout_count"]
+            logical_rollouts - pre_masked_rollouts
         ),
-        "rollout_sequence_mask/masked_rollouts": 0.0,
-        "rollout_sequence_mask/masked_physical_rows": 0.0,
+        "rollout_sequence_mask/masked_rollouts": float(pre_masked_rollouts),
+        "rollout_sequence_mask/masked_physical_rows": float(pre_masked_physical_rows),
         "rollout_sequence_mask/ratio_min": 1.0,
         "rollout_sequence_mask/ratio_mean": 1.0,
         "rollout_sequence_mask/ratio_max": 1.0,
@@ -388,7 +417,7 @@ def apply_rollout_sequence_mask(
     updated_sample_mask = sample_mask.clone()
     ratios: list[torch.Tensor] = []
     kept_rollouts = 0
-    masked_physical_rows = 0
+    masked_physical_rows = pre_masked_physical_rows
     for rollout_index, row_indices in enumerate(plan["rollout_to_rows"]):
         if not row_indices:
             raise ValueError("Rollout sequence mask found a rollout with no rows")
@@ -402,10 +431,17 @@ def apply_rollout_sequence_mask(
         )
         eligible_count = int(torch.count_nonzero(eligible).item())
         expected_count = sum(
-            int(plan["rows"][index]["eligible_token_count"])
-            for index in row_indices
+            int(plan["rows"][index]["eligible_token_count"]) for index in row_indices
         )
-        if eligible_count <= 0 or eligible_count != expected_count:
+        if expected_count == 0:
+            if (
+                eligible_count != 0
+                or torch.count_nonzero(sample_mask.index_select(0, row_index)).item()
+                != 0
+            ):
+                raise ValueError("Pre-masked rollout changed its planned sample mask")
+            continue
+        if eligible_count != expected_count:
             raise ValueError(
                 "Rollout sequence mask disagrees with planned eligible-token ownership"
             )
@@ -429,16 +465,13 @@ def apply_rollout_sequence_mask(
 
     ratio_tensor = torch.stack(ratios).float()
     train_data["sample_mask"] = updated_sample_mask
-    logical_rollouts = int(plan["logical_rollout_count"])
     metrics.update(
         {
             "rollout_sequence_mask/kept_rollouts": float(kept_rollouts),
             "rollout_sequence_mask/masked_rollouts": float(
                 logical_rollouts - kept_rollouts
             ),
-            "rollout_sequence_mask/masked_physical_rows": float(
-                masked_physical_rows
-            ),
+            "rollout_sequence_mask/masked_physical_rows": float(masked_physical_rows),
             "rollout_sequence_mask/ratio_min": float(ratio_tensor.min().item()),
             "rollout_sequence_mask/ratio_mean": float(ratio_tensor.mean().item()),
             "rollout_sequence_mask/ratio_max": float(ratio_tensor.max().item()),

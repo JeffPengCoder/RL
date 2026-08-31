@@ -21,7 +21,7 @@ import json
 import statistics
 import warnings
 from collections import defaultdict
-from collections.abc import AsyncGenerator, Sequence
+from collections.abc import AsyncGenerator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -113,6 +113,53 @@ def count_masked_nemo_gym_rollouts(
     if not isinstance(mask_sample, torch.Tensor):
         mask_sample = torch.tensor(mask_sample, dtype=torch.bool)
     return int(mask_sample.bool().sum().item())
+
+
+def count_masked_nemo_gym_rollouts_without_exact_trace(
+    rollout_batch: BatchedDataDict[DatumSpec],
+) -> int:
+    """Count masked rollouts that cannot be represented as zero-weight traces."""
+    mask_sample = rollout_batch.get("mask_sample")
+    if mask_sample is None:
+        return 0
+    if not isinstance(mask_sample, torch.Tensor):
+        mask_sample = torch.tensor(mask_sample, dtype=torch.bool)
+    mask_sample = mask_sample.bool()
+    if mask_sample.ndim != 1:
+        raise ValueError("mask_sample must be rollout-aligned")
+    masked_indices = mask_sample.nonzero(as_tuple=False).flatten().tolist()
+    if not masked_indices:
+        return 0
+
+    bundles = rollout_batch.get("rollout_trace_bundle")
+    physical_message_logs = rollout_batch.get("physical_message_logs")
+    if (
+        not isinstance(bundles, list)
+        or not isinstance(physical_message_logs, list)
+        or len(bundles) != mask_sample.shape[0]
+        or len(physical_message_logs) != mask_sample.shape[0]
+    ):
+        return len(masked_indices)
+
+    untraceable = 0
+    for index in masked_indices:
+        bundle = bundles[index]
+        message_logs = physical_message_logs[index]
+        traces = bundle.get("physical_traces") if isinstance(bundle, Mapping) else None
+        if (
+            not isinstance(traces, list)
+            or not traces
+            or not isinstance(message_logs, list)
+            or len(message_logs) != len(traces)
+            or not all(
+                isinstance(trace, Mapping)
+                and isinstance(trace.get("trainable_token_count"), int)
+                and trace["trainable_token_count"] > 0
+                for trace in traces
+            )
+        ):
+            untraceable += 1
+    return untraceable
 
 
 def _attach_routed_experts_to_message_log_prefix(

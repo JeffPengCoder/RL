@@ -1929,7 +1929,7 @@ class TestAsyncTrajectoryCollector:
     def test_nemo_gym_masked_exact_group_is_discarded_for_next_prompt(
         self, monkeypatch, capsys
     ):
-        """A failed replica cannot enter replay or trigger same-prompt stream retry."""
+        """A pre-model masked replica cannot enter replay or trigger a retry."""
 
         class RemoteMethod:
             def __init__(self):
@@ -1996,6 +1996,152 @@ class TestAsyncTrajectoryCollector:
         assert replay_buffer.add.calls == []
         assert target_weight not in collector._generating_targets
         assert "NRL_EXACT_TRACE_GROUP_DISCARDED" in capsys.readouterr().out
+
+    def test_nemo_gym_masked_group_with_exact_trace_enters_replay(
+        self, monkeypatch, capsys
+    ):
+        """A traced masked replica keeps comparison-group cardinality."""
+
+        class RemoteMethod:
+            def __init__(self):
+                self.calls = []
+
+            async def remote(self, *args):
+                self.calls.append(args)
+                return "success"
+
+        class FakeReplayBuffer:
+            def __init__(self):
+                self.add = RemoteMethod()
+
+        replay_buffer = FakeReplayBuffer()
+        collector = self.create_local_collector(replay_buffer=replay_buffer)
+        collector.running = True
+        collector.master_config.grpo.context_compaction_training.enabled = True
+        collector.master_config.policy["generation"] = {
+            "stop_token_ids": [1],
+            "stop_strings": ["stop"],
+        }
+        target_weight = 17
+        collector._generating_targets.add(target_weight)
+        repeated_batch = BatchedDataDict(
+            {
+                "extra_env_info": [
+                    {"_ng_task_index": 7},
+                    {"_ng_task_index": 7},
+                ],
+                "loss_multiplier": torch.ones(2),
+            }
+        )
+
+        async def fake_rollouts(**kwargs):
+            yield SimpleNamespace(
+                task_index=7,
+                final_batch=BatchedDataDict(
+                    {
+                        "loss_multiplier": torch.ones(2),
+                        "mask_sample": torch.tensor([False, True]),
+                        "rollout_trace_bundle": [
+                            {"physical_traces": [{"trainable_token_count": 1}]},
+                            {"physical_traces": [{"trainable_token_count": 1}]},
+                        ],
+                        "physical_message_logs": [[[{}]], [[{}]]],
+                    }
+                ),
+                rollout_metrics={},
+            )
+
+        import nemo_rl.experience.rollouts as rollouts_mod
+
+        monkeypatch.setattr(rollouts_mod, "run_async_nemo_gym_rollout", fake_rollouts)
+
+        asyncio.run(
+            collector._run_rollout_batch_worker(
+                repeated_batch=repeated_batch,
+                generation_weight_version=3,
+                target_weight_version=target_weight,
+                num_generations=2,
+                use_nemo_gym=True,
+            )
+        )
+
+        assert len(replay_buffer.add.calls) == 1
+        assert target_weight not in collector._generating_targets
+        output = capsys.readouterr().out
+        assert "NRL_EXACT_TRACE_MASKED_GROUP_ACCEPTED" in output
+        assert "masked_rollouts=1" in output
+
+    def test_nemo_gym_fully_masked_traced_group_is_discarded(self, monkeypatch, capsys):
+        """A fully masked group has no trainable token even when traces exist."""
+
+        class RemoteMethod:
+            def __init__(self):
+                self.calls = []
+
+            async def remote(self, *args):
+                self.calls.append(args)
+                return "success"
+
+        class FakeReplayBuffer:
+            def __init__(self):
+                self.add = RemoteMethod()
+
+        replay_buffer = FakeReplayBuffer()
+        collector = self.create_local_collector(replay_buffer=replay_buffer)
+        collector.running = True
+        collector.master_config.grpo.context_compaction_training.enabled = True
+        collector.master_config.policy["generation"] = {
+            "stop_token_ids": [1],
+            "stop_strings": ["stop"],
+        }
+        target_weight = 19
+        collector._generating_targets.add(target_weight)
+        repeated_batch = BatchedDataDict(
+            {
+                "extra_env_info": [
+                    {"_ng_task_index": 9},
+                    {"_ng_task_index": 9},
+                ],
+                "loss_multiplier": torch.ones(2),
+            }
+        )
+
+        async def fake_rollouts(**kwargs):
+            yield SimpleNamespace(
+                task_index=9,
+                final_batch=BatchedDataDict(
+                    {
+                        "loss_multiplier": torch.ones(2),
+                        "mask_sample": torch.tensor([True, True]),
+                        "rollout_trace_bundle": [
+                            {"physical_traces": [{"trainable_token_count": 1}]},
+                            {"physical_traces": [{"trainable_token_count": 1}]},
+                        ],
+                        "physical_message_logs": [[[{}]], [[{}]]],
+                    }
+                ),
+                rollout_metrics={},
+            )
+
+        import nemo_rl.experience.rollouts as rollouts_mod
+
+        monkeypatch.setattr(rollouts_mod, "run_async_nemo_gym_rollout", fake_rollouts)
+
+        asyncio.run(
+            collector._run_rollout_batch_worker(
+                repeated_batch=repeated_batch,
+                generation_weight_version=3,
+                target_weight_version=target_weight,
+                num_generations=2,
+                use_nemo_gym=True,
+            )
+        )
+
+        assert replay_buffer.add.calls == []
+        assert target_weight not in collector._generating_targets
+        output = capsys.readouterr().out
+        assert "NRL_EXACT_TRACE_GROUP_DISCARDED" in output
+        assert "all_rollouts_masked=true" in output
 
     def test_invalid_gym_batch_releases_target(self):
         """Validation errors cannot leave a target reservation stuck."""

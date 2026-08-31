@@ -483,9 +483,9 @@ def validate_trace_batch_materialization(
             raise ValueError(
                 f"Materialized trace {trace['trace_id']!r} advantage is corrupted"
             )
-        if sample_mask[row_index].item() != 1.0:
+        if sample_mask[row_index].item() != row["sample_mask"]:
             raise ValueError(
-                f"Materialized trace {trace['trace_id']!r} is sample-masked"
+                f"Materialized trace {trace['trace_id']!r} changed its sample mask"
             )
         if torch.any(input_ids[row_index, length:] != pad_token_id):
             raise ValueError(

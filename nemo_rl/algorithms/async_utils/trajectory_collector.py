@@ -40,6 +40,7 @@ from nemo_rl.experience.rollout_identity import new_sampling_event_id
 from nemo_rl.experience.rollouts import (
     RolloutGroupResult,
     count_masked_nemo_gym_rollouts,
+    count_masked_nemo_gym_rollouts_without_exact_trace,
     run_async_multi_turn_rollout_groups,
 )
 from nemo_rl.models.generation.interfaces import GenerationConfig, GenerationInterface
@@ -1098,21 +1099,40 @@ class AsyncTrajectoryCollector:
                         if trace_training_enabled
                         else 0
                     )
-                    if masked_rollout_count:
+                    untraceable_masked_rollout_count = (
+                        count_masked_nemo_gym_rollouts_without_exact_trace(
+                            rollout_result.final_batch
+                        )
+                        if masked_rollout_count
+                        else 0
+                    )
+                    all_rollouts_masked = (
+                        masked_rollout_count == rollout_result.final_batch.size
+                    )
+                    if untraceable_masked_rollout_count or all_rollouts_masked:
                         # GRPO statistics require every replica in a prompt
-                        # group.  A Gym failure has no trainable exact trace, so
+                        # group. A pre-model Gym failure has no exact trace, so
                         # do not enqueue a partial group or fabricate a sample.
-                        # Releasing this target lets the next dataloader prompt
-                        # fill the still-missing replay-buffer slot.
                         discarded_group_indices.add(group_index)
                         print(
                             "NRL_EXACT_TRACE_GROUP_DISCARDED "
                             f"group_index={group_index} "
                             f"masked_rollouts={masked_rollout_count} "
+                            "untraceable_masked_rollouts="
+                            f"{untraceable_masked_rollout_count} "
+                            f"all_rollouts_masked={str(all_rollouts_masked).lower()} "
                             f"target_weight={target_weight_version}",
                             flush=True,
                         )
                         continue
+                    if masked_rollout_count:
+                        print(
+                            "NRL_EXACT_TRACE_MASKED_GROUP_ACCEPTED "
+                            f"group_index={group_index} "
+                            f"masked_rollouts={masked_rollout_count} "
+                            f"target_weight={target_weight_version}",
+                            flush=True,
+                        )
                     push_tasks.append(
                         asyncio.create_task(
                             self._enqueue_rollout_group(

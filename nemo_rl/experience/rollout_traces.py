@@ -33,7 +33,7 @@ from nemo_rl.environments.nemo_gym_trace import (
 )
 
 
-_TRACE_BATCH_PLAN_SCHEMA_VERSION = 2
+_TRACE_BATCH_PLAN_SCHEMA_VERSION = 3
 _LOSS_NORMALIZATION = "global_action_token_mean"
 _SUPPORTED_ADVANTAGE_ESTIMATORS = frozenset({"grpo"})
 
@@ -77,13 +77,16 @@ class TraceBatchPlan(TypedDict):
     batch_quantum: int
     comparison_group_count: int
     logical_rollout_count: int
+    masked_logical_rollout_count: int
     physical_trace_count: int
+    masked_physical_trace_count: int
     padding_row_count: int
     total_row_count: int
     eligible_action_token_count: int
     duplicate_retry_count: int
     group_ids: list[str]
     rollout_ids: list[str]
+    rollout_sample_masks: list[float]
     parent_indices: list[int]
     rollout_to_rows: list[list[int]]
     rows: list[TraceBatchRowPlan]
@@ -119,6 +122,7 @@ def build_trace_batch_plan(
     bundles: Sequence[Mapping[str, Any]],
     *,
     rollout_advantages: Mapping[str, float],
+    rollout_sample_masks: Mapping[str, float] | None = None,
     expected_rollouts_per_group: int,
     batch_quantum: int,
     optimizer_step_id: str,
@@ -263,6 +267,29 @@ def build_trace_batch_plan(
         )
         for rollout_id in seen_rollout_groups
     }
+    if rollout_sample_masks is None:
+        sample_masks = {rollout_id: 1.0 for rollout_id in seen_rollout_groups}
+    else:
+        observed_mask_ids = set(rollout_sample_masks)
+        if observed_mask_ids != expected_advantage_ids:
+            missing = sorted(expected_advantage_ids - observed_mask_ids)
+            extra = sorted(observed_mask_ids - expected_advantage_ids)
+            raise ValueError(
+                "Rollout sample masks must match unique logical rollouts exactly: "
+                f"missing={missing!r}, extra={extra!r}"
+            )
+        sample_masks = {}
+        for rollout_id in seen_rollout_groups:
+            sample_mask = _finite_float(
+                rollout_sample_masks[rollout_id],
+                field=f"sample_mask[{rollout_id!r}]",
+            )
+            if sample_mask not in {0.0, 1.0}:
+                raise ValueError(
+                    "Trace-aware rollout sample masks must be binary; "
+                    f"rollout_id={rollout_id!r}, value={sample_mask!r}"
+                )
+            sample_masks[rollout_id] = sample_mask
 
     rows: list[TraceBatchRowPlan] = []
     rollout_ids: list[str] = []
@@ -272,12 +299,15 @@ def build_trace_batch_plan(
         rollout_id = str(bundle["rollout_id"])
         group_id = str(bundle["group_id"])
         reward = _finite_float(bundle.get("reward"), field=f"reward[{rollout_id!r}]")
+        sample_mask = sample_masks[rollout_id]
         rollout_ids.append(rollout_id)
         owned_rows: list[int] = []
         for trace in bundle["physical_traces"]:
             row_index = len(rows)
             token_count = int(trace["token_count"])
-            eligible_token_count = int(trace["trainable_token_count"])
+            eligible_token_count = (
+                int(trace["trainable_token_count"]) if sample_mask == 1.0 else 0
+            )
             completion_ids = [
                 str(span["completion_id"]) for span in trace["completion_spans"]
             ]
@@ -292,7 +322,7 @@ def build_trace_batch_plan(
                 "trace_index": int(trace["trace_index"]),
                 "reward": reward,
                 "advantage": advantages[rollout_id],
-                "sample_mask": 1.0,
+                "sample_mask": sample_mask,
                 "token_count": token_count,
                 "eligible_token_count": eligible_token_count,
                 "completion_ids": completion_ids,
@@ -306,6 +336,10 @@ def build_trace_batch_plan(
         rollout_to_rows.append(owned_rows)
 
     physical_trace_count = len(rows)
+    masked_logical_rollout_count = sum(
+        sample_mask == 0.0 for sample_mask in sample_masks.values()
+    )
+    masked_physical_trace_count = sum(row["sample_mask"] == 0.0 for row in rows)
     if eligible_action_token_count <= 0:
         raise ValueError("TraceBatchPlan has no eligible action tokens")
     padding_row_count = (-physical_trace_count) % batch_quantum
@@ -350,13 +384,18 @@ def build_trace_batch_plan(
         "batch_quantum": batch_quantum,
         "comparison_group_count": len(grouped),
         "logical_rollout_count": len(unique_bundles),
+        "masked_logical_rollout_count": masked_logical_rollout_count,
         "physical_trace_count": physical_trace_count,
+        "masked_physical_trace_count": masked_physical_trace_count,
         "padding_row_count": padding_row_count,
         "total_row_count": len(rows),
         "eligible_action_token_count": eligible_action_token_count,
         "duplicate_retry_count": duplicate_retry_count,
         "group_ids": list(grouped),
         "rollout_ids": rollout_ids,
+        "rollout_sample_masks": [
+            sample_masks[rollout_id] for rollout_id in rollout_ids
+        ],
         "parent_indices": [row["parent_rollout_index"] for row in rows],
         "rollout_to_rows": rollout_to_rows,
         "rows": rows,
@@ -413,9 +452,7 @@ def validate_trace_batch_plan(
             field="rollout_sequence_mask_ratio_max",
         )
         if ratio_min <= 0 or ratio_max <= 0 or ratio_min > ratio_max:
-            raise ValueError(
-                "TraceBatchPlan rollout sequence-mask bounds are invalid"
-            )
+            raise ValueError("TraceBatchPlan rollout sequence-mask bounds are invalid")
     elif ratio_min is not None or ratio_max is not None:
         raise ValueError(
             "TraceBatchPlan has rollout sequence-mask bounds while masking is disabled"
@@ -450,6 +487,7 @@ def validate_trace_batch_plan(
 
     rows = plan.get("rows")
     rollout_ids = plan.get("rollout_ids")
+    rollout_sample_masks = plan.get("rollout_sample_masks")
     rollout_to_rows = plan.get("rollout_to_rows")
     parent_indices = plan.get("parent_indices")
     group_ids = plan.get("group_ids")
@@ -457,6 +495,19 @@ def validate_trace_batch_plan(
         raise ValueError("TraceBatchPlan rows must be a list")
     if not isinstance(rollout_ids, list) or len(set(rollout_ids)) != len(rollout_ids):
         raise ValueError("TraceBatchPlan rollout IDs must be a unique list")
+    if not isinstance(rollout_sample_masks, list) or len(rollout_sample_masks) != len(
+        rollout_ids
+    ):
+        raise ValueError("TraceBatchPlan rollout sample masks are incomplete")
+    validated_rollout_sample_masks = []
+    for rollout_index, value in enumerate(rollout_sample_masks):
+        sample_mask = _finite_float(
+            value,
+            field=f"rollout_sample_masks[{rollout_index}]",
+        )
+        if sample_mask not in {0.0, 1.0}:
+            raise ValueError("TraceBatchPlan rollout sample masks must be binary")
+        validated_rollout_sample_masks.append(sample_mask)
     if not isinstance(rollout_to_rows, list):
         raise ValueError("TraceBatchPlan rollout_to_rows must be a list")
     if not isinstance(parent_indices, list):
@@ -489,6 +540,7 @@ def validate_trace_batch_plan(
     rollout_advantages: list[float | None] = [None] * logical_rollout_count
     rollout_trace_indices: list[list[int]] = [[] for _ in range(logical_rollout_count)]
     physical_trace_count = 0
+    masked_physical_trace_count = 0
     padding_row_count = 0
     eligible_action_token_count = 0
     padding_started = False
@@ -543,8 +595,22 @@ def validate_trace_batch_plan(
                 raise ValueError(
                     f"Physical row {row_index} has an invalid eligible-token count"
                 )
-            if row.get("sample_mask") != 1.0:
-                raise ValueError(f"Physical row {row_index} is sample-masked")
+            sample_mask = _finite_float(
+                row.get("sample_mask"),
+                field=f"rows[{row_index}].sample_mask",
+            )
+            if sample_mask != validated_rollout_sample_masks[parent_index]:
+                raise ValueError(
+                    f"Physical row {row_index} changed its logical sample mask"
+                )
+            if sample_mask == 0.0:
+                if eligible_token_count != 0:
+                    raise ValueError(
+                        f"Masked physical row {row_index} has eligible tokens"
+                    )
+                masked_physical_trace_count += 1
+            elif sample_mask != 1.0 or eligible_token_count <= 0:
+                raise ValueError(f"Physical row {row_index} has an invalid sample mask")
             reward = _finite_float(
                 row.get("reward"),
                 field=f"rows[{row_index}].reward",
@@ -635,6 +701,12 @@ def validate_trace_batch_plan(
         raise ValueError("TraceBatchPlan comparison group is incomplete")
     if plan.get("physical_trace_count") != physical_trace_count:
         raise ValueError("TraceBatchPlan physical trace count is corrupted")
+    if plan.get("masked_logical_rollout_count") != sum(
+        sample_mask == 0.0 for sample_mask in validated_rollout_sample_masks
+    ):
+        raise ValueError("TraceBatchPlan masked logical rollout count is corrupted")
+    if plan.get("masked_physical_trace_count") != masked_physical_trace_count:
+        raise ValueError("TraceBatchPlan masked physical trace count is corrupted")
     if plan.get("padding_row_count") != padding_row_count:
         raise ValueError("TraceBatchPlan padding row count is corrupted")
     if padding_row_count != (-physical_trace_count) % batch_quantum:
@@ -674,6 +746,7 @@ def validate_trace_batch_plan(
                 bundle.get("reward"),
                 field=f"reward[{rollout_id!r}]",
             )
+            sample_mask = validated_rollout_sample_masks[parent_rollout_index]
             for trace in bundle["physical_traces"]:
                 expected_rows.append(
                     (
@@ -683,8 +756,13 @@ def validate_trace_batch_plan(
                         str(trace["trace_id"]),
                         int(trace["trace_index"]),
                         reward,
+                        sample_mask,
                         int(trace["token_count"]),
-                        int(trace["trainable_token_count"]),
+                        (
+                            int(trace["trainable_token_count"])
+                            if sample_mask == 1.0
+                            else 0
+                        ),
                         [
                             str(span["completion_id"])
                             for span in trace["completion_spans"]
@@ -700,6 +778,7 @@ def validate_trace_batch_plan(
                 row["trace_id"],
                 row["trace_index"],
                 row["reward"],
+                row["sample_mask"],
                 row["token_count"],
                 row["eligible_token_count"],
                 row["completion_ids"],
