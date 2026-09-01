@@ -105,7 +105,6 @@ class AsyncTrajectoryCollector:
         self._refit_pause_cleared.set()  # Start in cleared state
 
         self.current_weight_version: int = start_step
-        self.initial_weight_version: int = start_step
         self.dataloader: StatefulDataLoader | None = None
         self.collection_thread: _threading.Thread | None = None
 
@@ -137,25 +136,22 @@ class AsyncTrajectoryCollector:
         step they can target. If all target versions are exhausted, this generation
         server will remain idle until the next weight update.
 
+        Include the current training target as a gap-fill candidate. In the
+        steady state it is already complete (or consumed) and is skipped by
+        the replay-buffer checks. After checkpoint resume or a slow lookahead,
+        however, this lets the current policy fill a missing current target
+        instead of advancing past it and deadlocking training.
+
         Example:
         generation_weight_version = 10
         max_trajectory_age_steps = 4
 
         Returns:
-            [11, 12, 13, 14]  # Meaning this generation server can create trajectories for training step 11, 12, 13, 14
+            [10, 11, 12, 13, 14]
         """
         # Read async config strictly from grpo.async_grpo
         max_trajectory_age = self.master_config.grpo.async_grpo.max_trajectory_age_steps
-        if generation_weight_version == self.initial_weight_version:
-            return [
-                i
-                for i in range(
-                    self.initial_weight_version,
-                    self.initial_weight_version + max_trajectory_age + 1,
-                )
-            ]
-
-        return [generation_weight_version + i for i in range(1, max_trajectory_age + 1)]
+        return [generation_weight_version + i for i in range(max_trajectory_age + 1)]
 
     def _get_next_target_for_generation(
         self, generation_weight_version: int

@@ -1041,8 +1041,8 @@ class TestReplayBuffer:
         os.unlink(checkpoint_path)
         ray.kill(buffer2)
 
-    def test_resume_deadlock_precondition_detectable(self):
-        """Regression: restored buffer can expose the async-GRPO resume deadlock.
+    def test_resume_missing_lookahead_is_gap_fillable(self):
+        """Regression: a restored buffer must not require a startup lookahead barrier.
 
         After PR #2651 introduced replay-buffer checkpointing, resuming from a
         checkpoint where target N is complete but target N+1 is absent caused an
@@ -1053,11 +1053,12 @@ class TestReplayBuffer:
           3. Collector's post-refit target window becomes [N+2, ...] (skipping N+1).
           4. Training waits for target N+1, which nobody generates — stall forever.
 
-        The fix is a startup pipeline barrier: before breaking, also require
-        has_complete_batch(N+1) to be True (or N+1 >= max_steps).  This test
-        constructs the exact precondition state — current step complete, lookahead
-        absent — to ensure it remains detectable and to document the expected
-        buffer readiness values that the barrier logic branches on.
+        The collector now treats its current weight version as a gap-fill
+        candidate after every refit. Training may therefore consume N as soon
+        as it is ready; after the refit to N+1 the collector can generate the
+        missing N+1 batch instead of skipping directly to N+2. This test keeps
+        the restored-buffer precondition explicit; the collector target-window
+        test below proves the recovery path.
         """
         num_prompts = 8
         resume_step = 30
@@ -1093,12 +1094,11 @@ class TestReplayBuffer:
             buffer2.has_complete_batch.remote(resume_step, num_prompts, max_age)
         ), "target step must be complete after restore"
 
-        # Step 31 is absent — this is the deadlock precondition.
-        # The startup pipeline barrier must detect this and continue waiting
-        # instead of breaking, giving the collector time to generate step 31.
+        # Step 31 is absent. Startup is allowed to train step 30 because the
+        # collector can gap-fill step 31 after the refit.
         assert not ray.get(
             buffer2.has_complete_batch.remote(resume_step + 1, num_prompts, max_age)
-        ), "lookahead step must be absent; barrier should block here"
+        ), "lookahead step should remain absent in the restored precondition"
 
         ray.kill(buffer2)
 
@@ -1388,31 +1388,38 @@ class TestAsyncTrajectoryCollector:
 
         collector.policy_generation.invalidate_kv_cache.assert_not_called()
 
-    def test_calculate_target_weights(self):
-        """Test target weight calculation logic."""
-        buffer = ReplayBuffer.remote(max_size=10)
-        mock_generation = MockGenerationInterface()
-        mock_tokenizer = mock.MagicMock()
-        mock_env = MockEnvironment.remote(rewards=[1.0, 2.0])
-        task_to_env = {"test": mock_env}
-        master_config = self.create_mock_config()
+    def test_calculate_target_weights_includes_current_gap_fill_target(self):
+        """Every weight version can fill its own missing training target."""
+        collector = self.create_local_collector()
+        collector.master_config.grpo.async_grpo.max_trajectory_age_steps = 1
 
-        collector = AsyncTrajectoryCollector.remote(
-            policy_generation=mock_generation,
-            tokenizer=mock_tokenizer,
-            task_to_env=task_to_env,
-            master_config=master_config,
-            replay_buffer=buffer,
-            start_step=0,
+        assert collector._calculate_target_weights(0) == [0, 1]
+        collector.set_weight_version(1)
+        assert collector._calculate_target_weights(1) == [1, 2]
+
+        collector.master_config.grpo.async_grpo.max_trajectory_age_steps = 4
+        collector.set_weight_version(10)
+        assert collector._calculate_target_weights(10) == [10, 11, 12, 13, 14]
+
+    def test_refit_can_reserve_missing_current_target(self):
+        """After refit, a missing current target is reserved before lookahead."""
+        replay_buffer = mock.MagicMock()
+        replay_buffer.get_last_target_weight_already_generated.remote.return_value = 0
+        replay_buffer.get_trajectories_needed.remote.side_effect = (
+            lambda target, _num_prompts, _max_age: 3 if target == 1 else 8
         )
+        collector = self.create_local_collector(replay_buffer=replay_buffer)
+        collector.master_config.grpo.async_grpo.max_trajectory_age_steps = 1
+        collector.set_weight_version(1)
 
-        # Test target weight calculation with different scenarios
-        # Note: We can't directly test the private method, but we can test its effects
-        # through the public interface behavior
+        with mock.patch(
+            "nemo_rl.algorithms.async_utils.trajectory_collector.ray.get",
+            side_effect=lambda value: value,
+        ):
+            assert collector._get_next_target_for_generation(1) == 1
 
-        ray.kill(collector)
-        ray.kill(buffer)
-        ray.kill(mock_env)
+        assert collector._generating_targets == {1}
+        replay_buffer.get_trajectories_needed.remote.assert_called_once_with(1, 2, 1)
 
     def test_release_target_is_idempotent(self):
         """A batch worker can safely release its target exactly once."""
