@@ -366,11 +366,9 @@ class AsyncTrajectoryCollector:
                             self._last_limit_warning_version
                             != self.current_weight_version
                         ):
-                            max_trajectory_age = self.master_config.grpo.async_grpo.max_trajectory_age_steps
-                            target_weights = [
-                                self.current_weight_version + i
-                                for i in range(max_trajectory_age)
-                            ]
+                            target_weights = self._calculate_target_weights(
+                                self.current_weight_version
+                            )
 
                             print(
                                 f"⏸️ Pausing collection: all target weights {target_weights} for weight version {self.current_weight_version} "

@@ -1145,6 +1145,13 @@ class TestAsyncTrajectoryCollector:
         with pytest.raises(ValueError, match="greater than or equal to 1"):
             AsyncGRPOConfig(max_concurrent_generation_batches=0)
 
+    def test_zero_trajectory_age_selects_strict_on_policy(self):
+        config = AsyncGRPOConfig(max_trajectory_age_steps=0)
+        assert config.max_trajectory_age_steps == 0
+
+        with pytest.raises(ValueError, match="greater than or equal to 0"):
+            AsyncGRPOConfig(max_trajectory_age_steps=-1)
+
     def test_generation_batch_cap_waits_until_worker_releases(self):
         """A memory cap blocks a second whole batch without busy polling."""
         collector = self.create_local_collector()
@@ -1428,6 +1435,9 @@ class TestAsyncTrajectoryCollector:
     def test_calculate_target_weights_includes_current_gap_fill_target(self):
         """Every weight version can fill its own missing training target."""
         collector = self.create_local_collector()
+        collector.master_config.grpo.async_grpo.max_trajectory_age_steps = 0
+        assert collector._calculate_target_weights(7) == [7]
+
         collector.master_config.grpo.async_grpo.max_trajectory_age_steps = 1
 
         assert collector._calculate_target_weights(0) == [0, 1]
@@ -1437,6 +1447,18 @@ class TestAsyncTrajectoryCollector:
         collector.master_config.grpo.async_grpo.max_trajectory_age_steps = 4
         collector.set_weight_version(10)
         assert collector._calculate_target_weights(10) == [10, 11, 12, 13, 14]
+
+    @pytest.mark.parametrize(
+        ("max_age_steps", "expected_capacity"),
+        [(0, 8), (1, 16), (4, 64)],
+    )
+    def test_async_replay_buffer_capacity_keeps_one_current_batch(
+        self, max_age_steps, expected_capacity
+    ):
+        assert (
+            grpo_mod._calculate_async_replay_buffer_capacity(8, max_age_steps)
+            == expected_capacity
+        )
 
     def test_refit_can_reserve_missing_current_target(self):
         """After refit, a missing current target is reserved before lookahead."""

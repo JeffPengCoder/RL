@@ -188,8 +188,10 @@ class AsyncGRPOConfig(BaseModel, extra="allow"):
     enabled: bool = False
     # Maximum trajectory age in training steps for samples drawn from the
     # async replay buffer. Trajectories older than this are excluded during
-    # sampling; buffer sizing also scales with this value.
-    max_trajectory_age_steps: int = 1
+    # sampling; zero selects strict on-policy collection for the current
+    # training target only. Buffer sizing also scales with this value while
+    # always retaining capacity for one complete current-step batch.
+    max_trajectory_age_steps: int = Field(default=1, ge=0)
     # Bound the number of complete generation batches retained concurrently.
     # ``None`` preserves the historical one-reservation-per-target behavior.
     # Memory-heavy multimodal flows can use 1 while still overlapping the next
@@ -4746,6 +4748,25 @@ def aggregate_rollout_metrics(
     return aggregated
 
 
+def _calculate_async_replay_buffer_capacity(
+    num_prompts_per_step: int,
+    max_trajectory_age_steps: int,
+    late_arrival_slack: int = 2,
+) -> int:
+    """Size async replay without making strict on-policy capacity zero."""
+    if num_prompts_per_step <= 0:
+        raise ValueError("num_prompts_per_step must be positive")
+    if max_trajectory_age_steps < 0:
+        raise ValueError("max_trajectory_age_steps must be non-negative")
+    if late_arrival_slack <= 0:
+        raise ValueError("late_arrival_slack must be positive")
+
+    age_window_capacity = (
+        num_prompts_per_step * max_trajectory_age_steps * late_arrival_slack
+    )
+    return max(num_prompts_per_step, age_window_capacity)
+
+
 def async_grpo_train(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
@@ -4899,8 +4920,10 @@ def async_grpo_train(
     # With max_age_steps, we keep trajectories from multiple weight versions
     num_prompts_per_step = master_config.grpo.num_prompts_per_step
     late_arrival_slack = 2
-    optimal_buffer_size = (
-        num_prompts_per_step * max_trajectory_age_steps * late_arrival_slack
+    optimal_buffer_size = _calculate_async_replay_buffer_capacity(
+        num_prompts_per_step,
+        max_trajectory_age_steps,
+        late_arrival_slack,
     )
 
     replay_buffer_options = _control_actor_options(
