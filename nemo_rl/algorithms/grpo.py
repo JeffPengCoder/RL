@@ -367,6 +367,31 @@ def _add_role_node_resource(
     ]
 
 
+def _control_actor_options(
+    runtime_env: dict[str, Any],
+    cluster_config: ClusterConfig,
+    actor_resource_key: str,
+) -> dict[str, Any]:
+    """Return Ray options that keep a data-bearing control actor on trainers.
+
+    ReplayBuffer and AsyncTrajectoryCollector carry CPU copies of multimodal
+    training batches.  Leaving them unconstrained lets Ray place them on an
+    inference node whose host memory is already dominated by vLLM.  A
+    per-actor resource may select a more specific trainer node; otherwise the
+    common training role label is the safe default.  Clusters without role
+    labels retain Ray's original unconstrained placement behavior.
+    """
+    resource_name = cluster_config.get(actor_resource_key) or cluster_config.get(
+        "training_node_resource"
+    )
+    options: dict[str, Any] = {"runtime_env": runtime_env}
+    if resource_name is not None:
+        constraints = _add_role_node_resource(None, 1, resource_name)
+        assert constraints is not None
+        options["resources"] = constraints[0]
+    return options
+
+
 def _initial_grpo_save_state() -> GRPOSaveState:
     return GRPOSaveState(
         consumed_samples=0,
@@ -4873,7 +4898,17 @@ def async_grpo_train(
         num_prompts_per_step * max_trajectory_age_steps * late_arrival_slack
     )
 
-    replay_buffer = ReplayBuffer.options(runtime_env=_replay_runtime_env).remote(
+    replay_buffer_options = _control_actor_options(
+        _replay_runtime_env,
+        master_config.cluster,
+        "replay_buffer_node_resource",
+    )
+    print(
+        "NRL_CONTROL_ACTOR_PLACEMENT "
+        f"actor=ReplayBuffer resources={replay_buffer_options.get('resources', {})}",
+        flush=True,
+    )
+    replay_buffer = ReplayBuffer.options(**replay_buffer_options).remote(
         max_size=optimal_buffer_size
     )
 
@@ -4935,8 +4970,19 @@ def async_grpo_train(
     }
 
     # Initialize trajectory collector with synchronized collection
+    trajectory_collector_options = _control_actor_options(
+        _tc_runtime_env,
+        master_config.cluster,
+        "trajectory_collector_node_resource",
+    )
+    print(
+        "NRL_CONTROL_ACTOR_PLACEMENT "
+        "actor=AsyncTrajectoryCollector "
+        f"resources={trajectory_collector_options.get('resources', {})}",
+        flush=True,
+    )
     trajectory_collector = AsyncTrajectoryCollector.options(
-        runtime_env=_tc_runtime_env
+        **trajectory_collector_options
     ).remote(
         policy_generation=policy_generation,
         tokenizer=tokenizer,

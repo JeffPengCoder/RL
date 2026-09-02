@@ -45,6 +45,13 @@ class ClusterConfig(TypedDict):
     segment_size: NotRequired[
         int | None
     ]  # Nodes per NVLink domain segment for topology-aware alignment; None to disable
+    # Optional custom Ray resources used to keep CPU-side control actors off
+    # memory-saturated inference nodes.  When the actor-specific resources are
+    # absent, GRPO falls back to ``training_node_resource`` for both actors.
+    training_node_resource: NotRequired[str]
+    inference_node_resource: NotRequired[str]
+    replay_buffer_node_resource: NotRequired[str]
+    trajectory_collector_node_resource: NotRequired[str]
 
 
 # Get the directory path of the current module and the root of the package

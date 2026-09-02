@@ -42,6 +42,7 @@ from nemo_rl.algorithms.grpo import (
     _apply_message_level_advantage_penalties,
     _assign_trajectory_generation_replica_indices,
     _context_compaction_batch_quantum,
+    _control_actor_options,
     _dedup_cc_replay_groups,
     _get_grpo_save_state,
     _initial_grpo_save_state,
@@ -111,6 +112,48 @@ def test_add_role_node_resource_rejects_invalid_input():
         _add_role_node_resource(None, 1, " ")
     with pytest.raises(ValueError, match="Expected 2"):
         _add_role_node_resource([{}], 2, "nrl_trainer_node")
+
+
+def test_control_actor_options_prefers_actor_specific_resource():
+    runtime_env = {"py_executable": "/venv/bin/python"}
+    cluster_config = {
+        "gpus_per_node": 8,
+        "num_nodes": 4,
+        "training_node_resource": "nrl_trainer_node",
+        "replay_buffer_node_resource": "nrl_replay_node",
+    }
+
+    assert _control_actor_options(
+        runtime_env, cluster_config, "replay_buffer_node_resource"
+    ) == {
+        "runtime_env": runtime_env,
+        "resources": {"nrl_replay_node": 0.001},
+    }
+
+
+def test_control_actor_options_falls_back_to_training_resource():
+    runtime_env = {"py_executable": "/venv/bin/python"}
+    cluster_config = {
+        "gpus_per_node": 8,
+        "num_nodes": 4,
+        "training_node_resource": "nrl_trainer_node",
+    }
+
+    assert _control_actor_options(
+        runtime_env, cluster_config, "trajectory_collector_node_resource"
+    ) == {
+        "runtime_env": runtime_env,
+        "resources": {"nrl_trainer_node": 0.001},
+    }
+
+
+def test_control_actor_options_preserves_unconstrained_clusters():
+    runtime_env = {"py_executable": "/venv/bin/python"}
+    cluster_config = {"gpus_per_node": 8, "num_nodes": 1}
+
+    assert _control_actor_options(
+        runtime_env, cluster_config, "replay_buffer_node_resource"
+    ) == {"runtime_env": runtime_env}
 
 
 def test_async_checkpoint_can_intentionally_skip_replay_buffer(
