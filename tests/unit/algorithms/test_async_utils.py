@@ -1141,6 +1141,43 @@ class TestAsyncTrajectoryCollector:
         collector._should_pause_for_generation_limits = lambda: False
         collector.running = True
 
+    def test_generation_batch_cap_requires_positive_limit(self):
+        with pytest.raises(ValueError, match="greater than or equal to 1"):
+            AsyncGRPOConfig(max_concurrent_generation_batches=0)
+
+    def test_generation_batch_cap_waits_until_worker_releases(self):
+        """A memory cap blocks a second whole batch without busy polling."""
+        collector = self.create_local_collector()
+        collector.running = True
+        collector._max_concurrent_generation_batches = 1
+        active_worker = object()
+        collector._inflight_threads.add(active_worker)
+
+        class ReleasingEvent:
+            def __init__(self):
+                self.clear_calls = 0
+                self.wait_calls = 0
+
+            def clear(self):
+                self.clear_calls += 1
+
+            def set(self):
+                pass
+
+            def wait(self):
+                self.wait_calls += 1
+                with collector._threads_lock:
+                    collector._inflight_threads.discard(active_worker)
+
+        capacity_event = ReleasingEvent()
+        collector._generation_batch_capacity_available = capacity_event
+
+        collector._wait_for_generation_batch_capacity()
+
+        assert capacity_event.clear_calls == 1
+        assert capacity_event.wait_calls == 1
+        assert collector._inflight_threads == set()
+
     def test_collection_loop_marks_data_exhausted_on_natural_completion(self):
         """for...else path: iterator drains cleanly -> data_exhausted, not errored."""
         collector = self.create_local_collector()

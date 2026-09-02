@@ -118,6 +118,18 @@ class AsyncTrajectoryCollector:
         # Track threads
         self._inflight_threads: set[_threading.Thread] = set()
         self._threads_lock: _threading.Lock = _threading.Lock()
+        self._generation_batch_capacity_available = _threading.Event()
+        self._generation_batch_capacity_available.set()
+        self._max_concurrent_generation_batches: int | None = getattr(
+            self.master_config.grpo.async_grpo,
+            "max_concurrent_generation_batches",
+            None,
+        )
+        print(
+            "NRL_ASYNC_GENERATION_BATCH_CAP|limit="
+            f"{self._max_concurrent_generation_batches or 'unbounded'}",
+            flush=True,
+        )
 
         # Simple lock to prevent race conditions when checking/spawning workers
         self._generation_check_lock: _threading.Lock = _threading.Lock()
@@ -262,7 +274,48 @@ class AsyncTrajectoryCollector:
             "data_exhausted": self.data_exhausted,
             "errored": self.collection_failed,
             "inflight_workers": inflight_workers,
+            "max_concurrent_generation_batches": (
+                self._max_concurrent_generation_batches
+            ),
         }
+
+    def _wait_for_generation_batch_capacity(self) -> None:
+        """Wait until another full generation batch may start.
+
+        NeMo-Gym batches can retain hundreds of long multimodal trajectories
+        while waiting for the last prompt-group stragglers. Bounding whole
+        batch workers prevents async lookahead from multiplying that host
+        memory footprint. The clear/recheck sequence closes the event race
+        without polling.
+        """
+        limit = self._max_concurrent_generation_batches
+        if limit is None:
+            return
+
+        logged = False
+        while self.running:
+            with self._threads_lock:
+                active_workers = len(self._inflight_threads)
+            if active_workers < limit:
+                return
+
+            if not logged:
+                print(
+                    "NRL_ASYNC_GENERATION_BATCH_CAP_WAIT|"
+                    f"active={active_workers}|limit={limit}",
+                    flush=True,
+                )
+                logged = True
+
+            self._generation_batch_capacity_available.clear()
+            with self._threads_lock:
+                active_workers = len(self._inflight_threads)
+            if active_workers < limit:
+                self._generation_batch_capacity_available.set()
+                return
+
+            with self._efficiency_timer.time("idle/generation_batch_capacity"):
+                self._generation_batch_capacity_available.wait()
 
     def _collection_loop(self):
         """Run the collection loop in background thread."""
@@ -296,6 +349,12 @@ class AsyncTrajectoryCollector:
                         with self._efficiency_timer.time("idle/refit_event_wait"):
                             self._refit_pause_cleared.wait()
                         print("▶️ Refit completed, resuming collection")
+
+                    # A cap of one still permits rollout/training overlap: after
+                    # target N becomes trainable, target N+1 may run during its
+                    # optimizer step. It only forbids retaining both complete
+                    # generation batches before target N is trainable.
+                    self._wait_for_generation_batch_capacity()
 
                     # Check if generation limits require pausing collection. Recheck
                     # after every wakeup: a completed target should remain paused,
@@ -498,6 +557,7 @@ class AsyncTrajectoryCollector:
             except Exception:
                 with self._threads_lock:
                     self._inflight_threads.discard(worker)
+                self._generation_batch_capacity_available.set()
                 raise
 
             backend = "NeMo-Gym" if use_nemo_gym else "native"
@@ -624,6 +684,8 @@ class AsyncTrajectoryCollector:
                 finished = {t for t in self._inflight_threads if not t.is_alive()}
                 for t in finished:
                     self._inflight_threads.remove(t)
+                if finished:
+                    self._generation_batch_capacity_available.set()
 
                 pending_count = len(self._inflight_threads)
 
@@ -662,6 +724,8 @@ class AsyncTrajectoryCollector:
             finished = {t for t in self._inflight_threads if not t.is_alive()}
             for t in finished:
                 self._inflight_threads.remove(t)
+            if finished:
+                self._generation_batch_capacity_available.set()
 
     def _release_target(self, target_weight_version: int) -> None:
         """Release the reservation owned by a completed batch worker."""
@@ -897,6 +961,7 @@ class AsyncTrajectoryCollector:
             self._release_target(target_weight_version)
             with self._threads_lock:
                 self._inflight_threads.discard(_threading.current_thread())
+            self._generation_batch_capacity_available.set()
 
     @staticmethod
     def _build_task_index_map(

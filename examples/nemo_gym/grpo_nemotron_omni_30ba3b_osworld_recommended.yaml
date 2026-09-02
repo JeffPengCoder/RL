@@ -30,6 +30,11 @@ grpo:
     # Keep replay bounded to the immediately preceding policy version until a
     # wider staleness window has selected-workload evidence.
     max_trajectory_age_steps: 1
+    # A 128-rollout multimodal batch may retain hundreds of GiB while its last
+    # long-horizon replicas finish. Keep one batch in flight at a time; after a
+    # target becomes trainable, generation of the next target still overlaps
+    # that optimizer step.
+    max_concurrent_generation_batches: 1
   context_compaction_training:
     rollout_sequence_mask:
       enabled: true

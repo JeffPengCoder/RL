@@ -190,6 +190,11 @@ class AsyncGRPOConfig(BaseModel, extra="allow"):
     # async replay buffer. Trajectories older than this are excluded during
     # sampling; buffer sizing also scales with this value.
     max_trajectory_age_steps: int = 1
+    # Bound the number of complete generation batches retained concurrently.
+    # ``None`` preserves the historical one-reservation-per-target behavior.
+    # Memory-heavy multimodal flows can use 1 while still overlapping the next
+    # target's generation with the current target's optimizer step.
+    max_concurrent_generation_batches: Optional[int] = Field(default=None, ge=1)
     # Does the weight synchronization as soon as the training is done
     # without waiting for the pending generations to finish.
     in_flight_weight_updates: bool = False
