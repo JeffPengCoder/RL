@@ -342,6 +342,25 @@ class TestWandbLogger:
         )
 
     @patch("nemo_rl.utils.logger.wandb")
+    def test_init_resume_safe_step_metric(self, mock_wandb, temp_dir):
+        cfg = {
+            "project": "custom-project",
+            "resume_safe_step_metric": "trainer/global_step",
+        }
+
+        WandbLogger(cfg, log_dir=temp_dir)
+
+        mock_wandb.init.assert_called_once_with(
+            project="custom-project",
+            dir=temp_dir,
+        )
+        mock_run = mock_wandb.init.return_value
+        assert mock_run.define_metric.call_args_list == [
+            call("trainer/global_step"),
+            call("*", step_metric="trainer/global_step"),
+        ]
+
+    @patch("nemo_rl.utils.logger.wandb")
     def test_log_metrics(self, mock_wandb):
         """Test logging metrics to WandbLogger."""
         cfg = {}
@@ -370,6 +389,55 @@ class TestWandbLogger:
         mock_run = mock_wandb.init.return_value
         expected_metrics = {"train/loss": 0.5, "train/accuracy": 0.8}
         mock_run.log.assert_called_once_with(expected_metrics, step=step)
+
+    @patch("nemo_rl.utils.logger.wandb")
+    def test_log_metrics_with_resume_safe_step_metric(self, mock_wandb):
+        logger = WandbLogger(
+            {"resume_safe_step_metric": "trainer/global_step"}
+        )
+        mock_run = mock_wandb.init.return_value
+        mock_run.reset_mock()
+
+        logger.log_metrics({"loss": 0.5}, 10, prefix="train")
+        logger.log_metrics(
+            {"total_step_time": 3.0},
+            10,
+            prefix="timing/train",
+            step_finished=True,
+        )
+
+        assert mock_run.log.call_args_list == [
+            call(
+                {"train/loss": 0.5, "trainer/global_step": 10},
+                commit=True,
+            ),
+            call(
+                {
+                    "timing/train/total_step_time": 3.0,
+                    "trainer/global_step": 10,
+                },
+                commit=True,
+            ),
+        ]
+
+    @patch("nemo_rl.utils.logger.wandb")
+    def test_resume_safe_step_metric_commits_each_payload(self, mock_wandb):
+        logger = WandbLogger(
+            {"resume_safe_step_metric": "trainer/global_step"}
+        )
+        mock_run = mock_wandb.init.return_value
+        mock_run.reset_mock()
+
+        logger.log_metrics({"setup": 1.0}, 0, prefix="timing")
+        logger.log_metrics({"reward": 0.75}, 3, prefix="train")
+
+        assert mock_run.log.call_args_list == [
+            call(
+                {"timing/setup": 1.0, "trainer/global_step": 0},
+                commit=True,
+            ),
+            call({"train/reward": 0.75, "trainer/global_step": 3}, commit=True),
+        ]
 
     @patch("nemo_rl.utils.logger.wandb")
     def test_log_metrics_with_step_metric(self, mock_wandb):

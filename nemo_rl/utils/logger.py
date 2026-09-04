@@ -54,6 +54,10 @@ class WandbConfig(TypedDict):
     # Log complete NeMo Gym result payloads as W&B Tables. These payloads can be
     # very large, so the recommended default is false.
     log_nemo_gym_full_result_tables: NotRequired[bool]
+    # Optional logical step axis for runs that resume across process or
+    # allocation boundaries. W&B's internal row index can advance when an
+    # independent monitor flushes, so it is not a checkpoint identity.
+    resume_safe_step_metric: NotRequired[str]
 
 
 class SwanlabConfig(TypedDict):
@@ -219,7 +223,16 @@ class WandbLogger(LoggerInterface):
         # NeMo RL logging controls are not valid wandb.init keyword arguments.
         wandb_init_config = dict(cfg)
         wandb_init_config.pop("log_nemo_gym_full_result_tables", None)
+        self._resume_safe_step_metric = wandb_init_config.pop(
+            "resume_safe_step_metric", None
+        )
         self.run = wandb.init(**wandb_init_config, dir=log_dir)
+
+        if self._resume_safe_step_metric:
+            self.run.define_metric(self._resume_safe_step_metric)
+            self.run.define_metric(
+                "*", step_metric=self._resume_safe_step_metric
+            )
 
         if os.environ.get("RAY_BACKEND_LOG_LEVEL", "").lower() == "debug":
             print(
@@ -355,6 +368,19 @@ class WandbLogger(LoggerInterface):
         """
         self.run.define_metric(name, step_metric=step_metric)
 
+    def _log_with_resume_safe_step(
+        self, metrics: dict[str, Any], step: int
+    ) -> None:
+        """Log against a checkpoint-owned axis instead of W&B's row index."""
+        assert self._resume_safe_step_metric is not None
+        metrics = {**metrics, self._resume_safe_step_metric: step}
+        # Commit every payload independently. GPU monitoring can log from a
+        # background thread, so relying on one shared pending W&B row would
+        # allow unrelated metrics to interleave with a training step. Multiple
+        # rows may share the logical axis value; each training metric still has
+        # exactly one value per checkpoint-owned step.
+        self.run.log(metrics, commit=True)
+
     def log_metrics(
         self,
         metrics: dict[str, Any],
@@ -382,6 +408,13 @@ class WandbLogger(LoggerInterface):
         if step_metric and step_metric in metrics:
             # commit=False so the step does not get incremented
             self.run.log(metrics, commit=False)
+        elif self._resume_safe_step_metric:
+            # Do not use W&B's internal row index as the training step. An
+            # independent logger (for example the Ray GPU monitor) can leave a
+            # row to be committed during shutdown, advancing that index beyond
+            # the last durable checkpoint. A named logical axis remains valid
+            # when the same W&B run resumes in a successor process.
+            self._log_with_resume_safe_step(metrics, step)
         elif step_finished:
             # Commit param defaults to None. By default if step is set, then commit defaults to False
             # Here, we have an explicit fork for commit in case W&B ever decides to change their default logic.
@@ -404,7 +437,10 @@ class WandbLogger(LoggerInterface):
             figure: Matplotlib figure to log
             step: Global step value
         """
-        self.run.log({name: figure}, step=step)
+        if self._resume_safe_step_metric:
+            self._log_with_resume_safe_step({name: figure}, step)
+        else:
+            self.run.log({name: figure}, step=step)
 
     def finish(self) -> None:
         """Flush queued metrics and close the wandb service.
@@ -425,11 +461,15 @@ class WandbLogger(LoggerInterface):
             name: Name of the metric
         """
         try:
-            self.run.log({name: wandb.Histogram(histogram)}, step=step)
+            value = wandb.Histogram(histogram)
         except ValueError:
             # When all values are identical, numpy cannot create finite-sized bins.
             # Log the scalar value instead.
-            self.run.log({name: histogram[0] if len(histogram) > 0 else 0}, step=step)
+            value = histogram[0] if len(histogram) > 0 else 0
+        if self._resume_safe_step_metric:
+            self._log_with_resume_safe_step({name: value}, step)
+        else:
+            self.run.log({name: value}, step=step)
 
 
 class SwanlabLogger(LoggerInterface):
