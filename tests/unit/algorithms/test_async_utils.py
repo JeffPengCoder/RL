@@ -2209,6 +2209,107 @@ class TestAsyncTrajectoryCollector:
         assert "NRL_EXACT_TRACE_GROUP_DISCARDED" in output
         assert "all_rollouts_masked=true" in output
 
+    @pytest.mark.parametrize(
+        ("trace_token_counts", "expected_buffered"),
+        [
+            ([64, 63], True),
+            ([64, 65], False),
+        ],
+    )
+    def test_nemo_gym_exact_trace_group_obeys_dynamic_train_capacity(
+        self,
+        monkeypatch,
+        capsys,
+        trace_token_counts,
+        expected_buffered,
+    ):
+        """Admission derives the single-row limit from the trainer runtime."""
+
+        class RemoteMethod:
+            def __init__(self):
+                self.calls = []
+
+            async def remote(self, *args):
+                self.calls.append(args)
+                return "success"
+
+        class FakeReplayBuffer:
+            def __init__(self):
+                self.add = RemoteMethod()
+
+        replay_buffer = FakeReplayBuffer()
+        collector = self.create_local_collector(replay_buffer=replay_buffer)
+        collector.running = True
+        collector.master_config.grpo.context_compaction_training.enabled = True
+        collector.master_config.policy.update(
+            {
+                "generation": {
+                    "stop_token_ids": [1],
+                    "stop_strings": ["stop"],
+                },
+                "dynamic_batching": {
+                    "enabled": True,
+                    "train_mb_tokens": 64,
+                    "sequence_length_round": 16,
+                },
+            }
+        )
+        target_weight = 20
+        collector._generating_targets.add(target_weight)
+        repeated_batch = BatchedDataDict(
+            {
+                "extra_env_info": [
+                    {"_ng_task_index": 10},
+                    {"_ng_task_index": 10},
+                ],
+                "loss_multiplier": torch.ones(2),
+            }
+        )
+
+        async def fake_rollouts(**kwargs):
+            yield SimpleNamespace(
+                task_index=10,
+                final_batch=BatchedDataDict(
+                    {
+                        "loss_multiplier": torch.ones(2),
+                        "mask_sample": torch.tensor([False, False]),
+                        "rollout_trace_bundle": [
+                            {
+                                "rollout_id": f"rollout-{index}",
+                                "physical_traces": [{"token_count": token_count}],
+                            }
+                            for index, token_count in enumerate(trace_token_counts)
+                        ],
+                    }
+                ),
+                rollout_metrics={},
+            )
+
+        import nemo_rl.experience.rollouts as rollouts_mod
+
+        monkeypatch.setattr(rollouts_mod, "run_async_nemo_gym_rollout", fake_rollouts)
+
+        asyncio.run(
+            collector._run_rollout_batch_worker(
+                repeated_batch=repeated_batch,
+                generation_weight_version=3,
+                target_weight_version=target_weight,
+                num_generations=2,
+                use_nemo_gym=True,
+            )
+        )
+
+        assert bool(replay_buffer.add.calls) is expected_buffered
+        assert target_weight not in collector._generating_targets
+        output = capsys.readouterr().out
+        if expected_buffered:
+            assert "physical_trace_exceeds_train_mb_tokens" not in output
+        else:
+            assert "reason=physical_trace_exceeds_train_mb_tokens" in output
+            assert "trace_tokens=65" in output
+            assert "padded_trace_tokens=80" in output
+            assert "train_mb_tokens=64" in output
+
     def test_invalid_gym_batch_releases_target(self):
         """Validation errors cannot leave a target reservation stuck."""
         collector = self.create_local_collector()

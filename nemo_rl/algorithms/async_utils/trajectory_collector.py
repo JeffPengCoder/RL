@@ -19,7 +19,8 @@ import concurrent.futures
 import threading as _threading
 import time
 from collections import defaultdict
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Mapping
+from dataclasses import dataclass
 from typing import Any, Optional, cast
 
 import ray
@@ -51,6 +52,107 @@ TokenizerType = PreTrainedTokenizerBase
 _MAX_NEMO_GYM_STREAM_RETRIES = 3
 _NEMO_GYM_RETRY_DELAY_BASE_SECONDS = 1.0
 _REPLAY_BUFFER_MAX_BACKOFF_SECONDS = 0.5
+
+
+@dataclass(frozen=True)
+class ExactTraceCapacityViolation:
+    """One physical trace that cannot fit the configured trainer microbatch."""
+
+    rollout_id: str
+    trace_index: int
+    token_count: int
+    padded_token_count: int
+
+
+def _exact_trace_dynamic_train_capacity(
+    master_config: MasterConfig,
+) -> tuple[int, int] | None:
+    """Return the trainer's single-row token capacity and rounding quantum.
+
+    Dynamic batching cannot place one padded physical trace into a microbatch
+    when that row alone exceeds ``train_mb_tokens``.  Keep this runtime
+    capacity separate from Gym's semantic ``mask_sample`` decision and derive
+    it from the actual trainer configuration so the two values cannot drift.
+    """
+    dynamic_batching = master_config.policy.get("dynamic_batching")
+    if dynamic_batching is None:
+        return None
+    if not isinstance(dynamic_batching, Mapping):
+        raise TypeError("policy.dynamic_batching must be a mapping")
+    if not dynamic_batching["enabled"]:
+        return None
+
+    train_mb_tokens = dynamic_batching["train_mb_tokens"]
+    sequence_length_round = dynamic_batching["sequence_length_round"]
+    for value, field in (
+        (train_mb_tokens, "policy.dynamic_batching.train_mb_tokens"),
+        (
+            sequence_length_round,
+            "policy.dynamic_batching.sequence_length_round",
+        ),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{field} must be a positive integer")
+    return train_mb_tokens, sequence_length_round
+
+
+def _exact_trace_group_capacity_violation(
+    batch: BatchedDataDict[DatumSpec],
+    *,
+    train_mb_tokens: int,
+    sequence_length_round: int,
+) -> ExactTraceCapacityViolation | None:
+    """Describe the largest physical row when a complete group cannot train."""
+    bundles = batch.get("rollout_trace_bundle")
+    if not isinstance(bundles, list) or len(bundles) != batch.size:
+        raise ValueError(
+            "Exact-trace dynamic-batch admission requires one rollout trace "
+            "bundle per logical rollout"
+        )
+
+    largest: ExactTraceCapacityViolation | None = None
+    for bundle_index, bundle in enumerate(bundles):
+        if not isinstance(bundle, Mapping):
+            raise TypeError(f"rollout_trace_bundle[{bundle_index}] is not a mapping")
+        rollout_id = bundle.get("rollout_id")
+        traces = bundle.get("physical_traces")
+        if not isinstance(traces, list) or not traces:
+            raise ValueError(
+                f"Exact-trace rollout {rollout_id!r} has no physical traces"
+            )
+        for trace_index, trace in enumerate(traces):
+            if not isinstance(trace, Mapping):
+                raise TypeError(
+                    f"physical trace {rollout_id!r}:{trace_index} is not a mapping"
+                )
+            token_count = trace.get("token_count")
+            if (
+                isinstance(token_count, bool)
+                or not isinstance(token_count, int)
+                or token_count <= 0
+            ):
+                raise ValueError(
+                    f"physical trace {rollout_id!r}:{trace_index} has invalid "
+                    "token_count"
+                )
+            padded_token_count = (
+                (token_count + sequence_length_round - 1) // sequence_length_round
+            ) * sequence_length_round
+            if not isinstance(rollout_id, str) or not rollout_id:
+                raise ValueError(
+                    f"rollout_trace_bundle[{bundle_index}] has no rollout_id"
+                )
+            if largest is None or padded_token_count > largest.padded_token_count:
+                largest = ExactTraceCapacityViolation(
+                    rollout_id=rollout_id,
+                    trace_index=trace_index,
+                    token_count=token_count,
+                    padded_token_count=padded_token_count,
+                )
+
+    if largest is not None and largest.padded_token_count > train_mb_tokens:
+        return largest
+    return None
 
 
 @ray.remote  # pragma: no cover
@@ -1180,6 +1282,43 @@ class AsyncTrajectoryCollector:
                             "untraceable_masked_rollouts="
                             f"{untraceable_masked_rollout_count} "
                             f"all_rollouts_masked={str(all_rollouts_masked).lower()} "
+                            f"target_weight={target_weight_version}",
+                            flush=True,
+                        )
+                        continue
+                    dynamic_train_capacity = (
+                        _exact_trace_dynamic_train_capacity(self.master_config)
+                        if trace_training_enabled
+                        else None
+                    )
+                    capacity_violation = (
+                        _exact_trace_group_capacity_violation(
+                            rollout_result.final_batch,
+                            train_mb_tokens=dynamic_train_capacity[0],
+                            sequence_length_round=dynamic_train_capacity[1],
+                        )
+                        if dynamic_train_capacity is not None
+                        else None
+                    )
+                    if capacity_violation is not None:
+                        # Capacity is a trainer-runtime admission decision, not
+                        # a Gym reward or semantic sample mask.  GRPO still
+                        # requires an intact comparison group, so reject the
+                        # whole group and let the existing gap-fill path sample
+                        # a replacement prompt.
+                        discarded_group_indices.add(group_index)
+                        print(
+                            "NRL_EXACT_TRACE_GROUP_DISCARDED "
+                            f"group_index={group_index} "
+                            "reason=physical_trace_exceeds_train_mb_tokens "
+                            f"rollout_id={capacity_violation.rollout_id} "
+                            f"trace_index={capacity_violation.trace_index} "
+                            f"trace_tokens={capacity_violation.token_count} "
+                            "padded_trace_tokens="
+                            f"{capacity_violation.padded_token_count} "
+                            f"train_mb_tokens={dynamic_train_capacity[0]} "
+                            "sequence_length_round="
+                            f"{dynamic_train_capacity[1]} "
                             f"target_weight={target_weight_version}",
                             flush=True,
                         )
