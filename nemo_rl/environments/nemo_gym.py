@@ -93,7 +93,6 @@ _EXACT_TRACE_RESPONSE_PROJECTION_FIELDS = (
     "boundary_events",
     "guard_records",
     "trajectory_transitions",
-    "execution_context",
 )
 _MEDIA_PART_TYPES = frozenset({"input_image", "image", "image_url"})
 
@@ -1149,7 +1148,13 @@ def _stamp_trajectory_rollout_ids(
         if rollout_id in stamped_ids:
             raise ValueError(f"Duplicate context compaction rollout ID {rollout_id!r}")
         stamped_ids.add(rollout_id)
-        if generic_identity is None:
+        if generic_identity is not None:
+            # Gym already has a request-scoped capture key. Reuse the
+            # controller-owned rollout identity instead of introducing a
+            # parallel physical-execution identifier. Explicit caller capture
+            # keys remain authoritative.
+            row.setdefault("_ng_rollout_id", rollout_id)
+        else:
             row["context_compaction_rollout_id"] = rollout_id
         if runtime_contract is not None:
             row["trajectory_runtime_contract"] = runtime_contract
@@ -1442,72 +1447,6 @@ Depending on your data shape, you may want to change these values."""
 
         processor = getattr(self, "_processor", None)
         response = nemo_gym_result["response"]
-        expected_execution_id = nemo_gym_row.get("_ng_execution_id")
-        observed_execution_id = nemo_gym_result.get("_ng_execution_id")
-        response_trajectory_contract = response.get("trajectory_contract")
-        verifier_metadata = nemo_gym_result.get("verifier_metadata")
-        is_osworld_response = (
-            isinstance(response_trajectory_contract, dict)
-            and response_trajectory_contract.get("mode")
-            == "osworld_semantic_trajectory"
-        ) or (
-            isinstance(response.get("id"), str)
-            and response["id"].startswith("osworld-")
-        )
-        if (expected_execution_id is None) != (
-            observed_execution_id is None
-        ) or observed_execution_id != expected_execution_id:
-            raise ValueError(
-                "Gym returned the wrong physical execution: "
-                f"expected={expected_execution_id!r}, "
-                f"observed={observed_execution_id!r}"
-            )
-        if expected_execution_id is not None and is_osworld_response:
-            execution_context = response.get("execution_context")
-            if (
-                not isinstance(execution_context, dict)
-                or execution_context.get("execution_id") != expected_execution_id
-            ):
-                raise ValueError(
-                    "Gym response execution_context disagrees with its request"
-                )
-            if (
-                not isinstance(verifier_metadata, dict)
-                or verifier_metadata.get("osworld_execution_id")
-                != expected_execution_id
-            ):
-                raise ValueError(
-                    "Gym verifier metadata disagrees with its request execution"
-                )
-            request_identity = nemo_gym_row.get("trajectory_identity")
-            if isinstance(request_identity, dict):
-                for field in (
-                    "sampling_event_id",
-                    "source_group_id",
-                    "rollout_id",
-                    "group_id",
-                    "task_id",
-                ):
-                    if execution_context.get(field) != request_identity.get(field):
-                        raise ValueError(
-                            "Gym response execution_context disagrees with its "
-                            f"request {field}"
-                        )
-            if isinstance(response_trajectory_contract, dict):
-                for field in (
-                    "sampling_event_id",
-                    "source_group_id",
-                    "rollout_id",
-                    "group_id",
-                    "task_id",
-                ):
-                    if execution_context.get(field) != response_trajectory_contract.get(
-                        field
-                    ):
-                        raise ValueError(
-                            "Gym response execution_context disagrees with its "
-                            f"trajectory contract {field}"
-                        )
         trajectory_contract = response.get("trajectory_contract")
         contract = response.get("context_compaction_contract")
         exact_trace_authority = contract is not None

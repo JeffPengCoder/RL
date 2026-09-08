@@ -103,10 +103,6 @@ def test_run_success_then_logger_failure_never_replays_run(monkeypatch):
             "message_log": logical_logs,
             "physical_message_logs": [[row] for row in logical_logs],
             "rollout_trace_bundle": [{"rollout_id": "r0"}, {"rollout_id": "r1"}],
-            "rollout_execution_context": [
-                {"execution_id": "e0"},
-                {"execution_id": "e1"},
-            ],
             "length": torch.tensor([1, 1]),
             "total_reward": torch.tensor([0.0, 1.0]),
         }
@@ -165,7 +161,6 @@ def test_run_success_then_logger_failure_never_replays_run(monkeypatch):
         "logical_rollout_count": 2,
         "eligible_action_token_count": 2,
         "scheduler_step_increment": 2,
-        "execution_ids_by_rollout": {"r0": "e0", "r1": "e1"},
     }
 
     monkeypatch.setattr(grpo_mod, "_should_use_nemo_gym", lambda cfg: True)
@@ -239,7 +234,7 @@ def test_lost_first_put_ack_is_not_replayed_and_plan_ids_are_cleared(monkeypatch
     }
     actor._exact_trace_pending = {
         "pending_identity": pending_identity,
-        "controller_summary": {"execution_ids_by_rollout": {"r0": "e0"}},
+        "controller_summary": {},
         "preparation": {
             "plan": {"plan_id": "plan"},
             "materialization": {

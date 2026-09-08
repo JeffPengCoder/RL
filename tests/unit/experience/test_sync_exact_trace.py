@@ -185,19 +185,6 @@ def _multi_trace_plan() -> tuple[dict, list[dict]]:
     return plan, bundles
 
 
-def _execution_contexts(bundles: list[dict]) -> list[dict]:
-    return [
-        {
-            "schema_version": 1,
-            "execution_id": f"execution-{index}",
-            "sampling_event_id": bundle["sampling_event_id"],
-            "rollout_id": bundle["rollout_id"],
-            "group_id": bundle["group_id"],
-        }
-        for index, bundle in enumerate(bundles)
-    ]
-
-
 def test_pending_handle_is_retry_stable_and_event_scoped():
     common = {
         "generation_policy_version": "sync-policy-step-00000000",
@@ -236,7 +223,6 @@ def test_physical_count_and_logical_scheduler_increment_stay_distinct():
         plan,
         pending_identity=pending,
         bundles=bundles,
-        execution_contexts=_execution_contexts(bundles),
     )
 
     assert plan["physical_trace_count"] == 5
@@ -276,7 +262,6 @@ def test_plan_admission_must_match_controller_identity(overrides, match):
             plan,
             pending_identity=pending,
             bundles=bundles,
-            execution_contexts=_execution_contexts(bundles),
         )
 
 
@@ -296,12 +281,11 @@ def test_plan_must_be_training_admitted():
             plan,
             pending_identity=pending,
             bundles=bundles,
-            execution_contexts=_execution_contexts(bundles),
         )
 
 
 def test_wire_rows_are_plan_derived_and_joinable():
-    plan, bundles = _multi_trace_plan()
+    plan, _ = _multi_trace_plan()
     pending = build_exact_trace_pending_identity(
         sampling_event_id="sampling-event-a",
         generation_policy_version="sync-policy-step-00000000",
@@ -313,10 +297,6 @@ def test_wire_rows_are_plan_derived_and_joinable():
     sample_ids, tags, extra = build_exact_trace_wire_identity(
         plan,
         pending_identity=pending,
-        execution_ids_by_rollout={
-            context["rollout_id"]: context["execution_id"]
-            for context in _execution_contexts(bundles)
-        },
     )
 
     assert sample_ids == [f"{plan['plan_id']}:{row_index}" for row_index in range(8)]
@@ -347,25 +327,16 @@ def test_wire_rows_are_plan_derived_and_joinable():
         == plan["training_admission_contract_id"]
     )
     assert extra["generation_contract_id"] == plan["generation_contract_id"]
-    assert [tag["execution_id"] for tag in tags[:5]] == [
-        "execution-0",
-        "execution-0",
-        "execution-1",
-        "execution-1",
-        "execution-1",
-    ]
     for tag in tags[-3:]:
         assert tag["rollout_id"] is None
         assert tag["group_id"] is None
         assert tag["trace_id"] is None
-        assert tag["execution_id"] is None
     validate_exact_trace_committed_meta(
         sample_ids=sample_ids,
         tags=tags,
         extra_info=extra,
         plan=plan,
         pending_identity=pending,
-        execution_ids_by_rollout=extra["execution_ids_by_rollout"],
     )
 
     corrupted = deepcopy(tags)
@@ -377,47 +348,6 @@ def test_wire_rows_are_plan_derived_and_joinable():
             extra_info=extra,
             plan=plan,
             pending_identity=pending,
-            execution_ids_by_rollout=extra["execution_ids_by_rollout"],
-        )
-
-
-def test_execution_identity_is_observability_only_and_fail_closed():
-    plan, bundles = _multi_trace_plan()
-    pending = build_exact_trace_pending_identity(
-        sampling_event_id="sampling-event-a",
-        generation_policy_version="sync-policy-step-00000000",
-        optimizer_step_id="grpo-step-00000001",
-        logical_rollout_count=2,
-        group_size=2,
-    )
-    original_plan_id = plan["plan_id"]
-    contexts = _execution_contexts(bundles)
-    first = summarize_exact_trace_plan(
-        plan,
-        pending_identity=pending,
-        bundles=bundles,
-        execution_contexts=contexts,
-    )
-    changed = deepcopy(contexts)
-    changed[0]["execution_id"] = "execution-new"
-    second = summarize_exact_trace_plan(
-        plan,
-        pending_identity=pending,
-        bundles=bundles,
-        execution_contexts=changed,
-    )
-
-    assert plan["plan_id"] == original_plan_id
-    assert first["pending_identity"] == second["pending_identity"]
-    assert first["execution_ids_by_rollout"] != second["execution_ids_by_rollout"]
-    wrong_event = deepcopy(contexts)
-    wrong_event[0]["sampling_event_id"] = "wrong-event"
-    with pytest.raises(ValueError, match="sampling event"):
-        summarize_exact_trace_plan(
-            plan,
-            pending_identity=pending,
-            bundles=bundles,
-            execution_contexts=wrong_event,
         )
 
 

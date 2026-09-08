@@ -174,7 +174,6 @@ def _build_exact_trace_controller_authority(
     intended_ids, intended_tags, intended_extra = build_exact_trace_wire_identity(
         plan,
         pending_identity=pending_identity,
-        execution_ids_by_rollout=controller_summary["execution_ids_by_rollout"],
     )
     from nemo_rl.data_plane.packed_tensor_wire import (
         PACKED_TENSOR_WIRE_SCHEMA_KEY,
@@ -206,9 +205,6 @@ def _build_exact_trace_controller_authority(
             "training_admission_contract_id"
         ],
         "generation_contract_id": plan["generation_contract_id"],
-        "execution_ids_by_rollout": dict(
-            controller_summary["execution_ids_by_rollout"]
-        ),
         "logical_rollout_count": int(plan["logical_rollout_count"]),
         "physical_trace_count": int(plan["physical_trace_count"]),
         "padding_row_count": int(plan["padding_row_count"]),

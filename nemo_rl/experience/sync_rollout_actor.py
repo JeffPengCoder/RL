@@ -366,7 +366,7 @@ class SyncRolloutActor:
             if (
                 isinstance(v, torch.Tensor)
                 or k in bulk_batch
-                or k in {"message_log", "rollout_execution_context"}
+                or k == "message_log"
             ):
                 continue
             bulk_batch[k] = (
@@ -604,7 +604,6 @@ class SyncRolloutActor:
                 plan,
                 pending_identity=pending_identity,
                 bundles=fb["rollout_trace_bundle"],
-                execution_contexts=fb["rollout_execution_context"],
             )
             train_data = preparation["materialization"]["train_data"]
             train_data.to("cpu")
@@ -737,9 +736,6 @@ class SyncRolloutActor:
         sample_ids, tags, extra_info = build_exact_trace_wire_identity(
             plan,
             pending_identity=pending["pending_identity"],
-            execution_ids_by_rollout=pending["controller_summary"][
-                "execution_ids_by_rollout"
-            ],
         )
         packed_tensor_wire_schema = pending["controller_summary"].get(
             "packed_tensor_wire_schema"
@@ -773,9 +769,6 @@ class SyncRolloutActor:
             extra_info=meta.extra_info,
             plan=plan,
             pending_identity=pending["pending_identity"],
-            execution_ids_by_rollout=pending["controller_summary"][
-                "execution_ids_by_rollout"
-            ],
         )
         if (
             packed_tensor_schema_from_extra_info(meta.extra_info)
@@ -820,9 +813,6 @@ class SyncRolloutActor:
             extra_info=meta.extra_info,
             plan=plan,
             pending_identity=pending["pending_identity"],
-            execution_ids_by_rollout=pending["controller_summary"][
-                "execution_ids_by_rollout"
-            ],
         )
         fields = [
             "input_ids",

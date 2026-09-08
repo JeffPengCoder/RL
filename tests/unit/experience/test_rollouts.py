@@ -1349,7 +1349,7 @@ def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
         {"agent_ref": {"name": "agent"}, "_ng_task_index": 42},
     ]
     results = []
-    for row_index, reward in enumerate((1.0, 2.0)):
+    for reward in (1.0, 2.0):
         input_message = {
             "role": "user",
             "content": "prompt",
@@ -1381,11 +1381,7 @@ def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
                 "rollout_trace_bundle": {"rollout_id": f"rollout-{reward}"},
                 "full_result": {
                     "reward": reward,
-                    "response": {
-                        "execution_context": {
-                            "execution_id": f"execution-{row_index}",
-                        }
-                    },
+                    "response": {},
                 },
             }
         )
@@ -1407,10 +1403,6 @@ def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
 
     assert rollout_result.task_index == 42
     assert rollout_result.final_batch["total_reward"].tolist() == [1.0, 2.0]
-    assert rollout_result.final_batch["rollout_execution_context"] == [
-        {"execution_id": "execution-0"},
-        {"execution_id": "execution-1"},
-    ]
     assert (
         "agent/full_result" in rollout_result.rollout_metrics
     ) is log_full_result_tables
@@ -1645,7 +1637,6 @@ def test_run_async_nemo_gym_rollout(
     actual_result["final_batch"] = actual_result["final_batch"].get_dict()
     assert len(actual_result["final_batch"]["physical_message_logs"]) == len(rows)
     assert len(actual_result["final_batch"]["rollout_trace_bundle"]) == len(rows)
-    assert len(actual_result["final_batch"]["rollout_execution_context"]) == len(rows)
     for message_logs, bundle in zip(
         actual_result["final_batch"]["physical_message_logs"],
         actual_result["final_batch"]["rollout_trace_bundle"],
@@ -1756,7 +1747,6 @@ def test_run_async_nemo_gym_rollout(
         final_batch.pop("message_log", None)
         final_batch.pop("physical_message_logs", None)
         final_batch.pop("rollout_trace_bundle", None)
-        final_batch.pop("rollout_execution_context", None)
         final_batch["total_reward"] = final_batch["total_reward"].tolist()
         final_batch["loss_multiplier"] = final_batch["loss_multiplier"].tolist()
         final_batch["length"] = final_batch["length"].tolist()

@@ -62,7 +62,6 @@ class ExactTracePlanSummary(TypedDict):
     logical_rollout_count: int
     eligible_action_token_count: int
     scheduler_step_increment: int
-    execution_ids_by_rollout: dict[str, str]
 
 
 def _require_nonempty_string(value: Any, *, field: str) -> str:
@@ -87,9 +86,8 @@ def build_exact_trace_pending_identity(
 ) -> ExactTracePendingIdentity:
     """Mint the retry-stable handle for one controller sampling event.
 
-    The handle intentionally excludes execution IDs.  A retry of the same
-    controller-owned sampling decision must address the same pending plan,
-    while a new sampling event must never alias it.
+    A retry of the same controller-owned sampling decision must address the
+    same pending plan, while a new sampling event must never alias it.
     """
     identity_without_handle = {
         "schema_version": _SYNC_EXACT_PENDING_SCHEMA_VERSION,
@@ -134,7 +132,6 @@ def summarize_exact_trace_plan(
     *,
     pending_identity: ExactTracePendingIdentity,
     bundles: Sequence[Mapping[str, Any]],
-    execution_contexts: Sequence[Mapping[str, Any]],
 ) -> ExactTracePlanSummary:
     """Validate a physical plan and expose its registration/scheduler counts."""
     validate_trace_batch_plan(plan, bundles=bundles)
@@ -177,39 +174,6 @@ def summarize_exact_trace_plan(
         )
     if admission_ids != {plan["training_admission_contract_id"]}:
         raise ValueError("Trace admission identity does not match the physical plan")
-    if len(execution_contexts) != len(bundles):
-        raise ValueError(
-            "Physical execution context count does not match logical rollouts"
-        )
-    execution_ids_by_rollout: dict[str, str] = {}
-    for bundle, context in zip(bundles, execution_contexts, strict=True):
-        if not isinstance(context, Mapping):
-            raise ValueError("Exact-trace rollout has no physical execution context")
-        rollout_id = _require_nonempty_string(
-            bundle.get("rollout_id"),
-            field="rollout_id",
-        )
-        execution_id = _require_nonempty_string(
-            context.get("execution_id"),
-            field=f"execution_id[{rollout_id!r}]",
-        )
-        if context.get("rollout_id") != rollout_id:
-            raise ValueError(
-                "Physical execution context disagrees with its logical rollout"
-            )
-        if context.get("group_id") != bundle.get("group_id"):
-            raise ValueError(
-                "Physical execution context disagrees with its comparison group"
-            )
-        if context.get("sampling_event_id") != pending_identity["sampling_event_id"]:
-            raise ValueError(
-                "Physical execution context disagrees with the sampling event"
-            )
-        if rollout_id in execution_ids_by_rollout:
-            raise ValueError(f"Duplicate logical rollout identity {rollout_id!r}")
-        if execution_id in execution_ids_by_rollout.values():
-            raise ValueError(f"Duplicate physical execution identity {execution_id!r}")
-        execution_ids_by_rollout[rollout_id] = execution_id
     return {
         "pending_identity": pending_identity,
         "plan_id": str(plan["plan_id"]),
@@ -223,7 +187,6 @@ def summarize_exact_trace_plan(
         "logical_rollout_count": int(plan["logical_rollout_count"]),
         "eligible_action_token_count": int(plan["eligible_action_token_count"]),
         "scheduler_step_increment": int(plan["logical_rollout_count"]),
-        "execution_ids_by_rollout": execution_ids_by_rollout,
     }
 
 
@@ -231,7 +194,6 @@ def build_exact_trace_wire_identity(
     plan: Mapping[str, Any],
     *,
     pending_identity: ExactTracePendingIdentity,
-    execution_ids_by_rollout: Mapping[str, str],
 ) -> tuple[list[str], list[dict[str, Any]], dict[str, Any]]:
     """Build stable sample IDs, row tags, and batch metadata from one plan."""
     validate_trace_batch_plan(plan)
@@ -244,19 +206,6 @@ def build_exact_trace_wire_identity(
         plan.get("training_admission_contract_id"),
         field="training_admission_contract_id",
     )
-    expected_rollout_ids = set(plan["rollout_ids"])
-    if set(execution_ids_by_rollout) != expected_rollout_ids:
-        raise ValueError(
-            "Physical execution identities do not cover the trace plan rollouts"
-        )
-    if len(set(execution_ids_by_rollout.values())) != len(execution_ids_by_rollout):
-        raise ValueError("Physical execution identities must be unique")
-    for rollout_id, execution_id in execution_ids_by_rollout.items():
-        _require_nonempty_string(rollout_id, field="rollout_id")
-        _require_nonempty_string(
-            execution_id,
-            field=f"execution_id[{rollout_id!r}]",
-        )
     sample_ids: list[str] = []
     tags: list[dict[str, Any]] = []
     for row_index, row in enumerate(plan["rows"]):
@@ -279,11 +228,6 @@ def build_exact_trace_wire_identity(
                 "row_kind": str(row["row_kind"]),
                 "parent_rollout_index": int(row["parent_rollout_index"]),
                 "rollout_id": row["rollout_id"],
-                "execution_id": (
-                    execution_ids_by_rollout[row["rollout_id"]]
-                    if row["rollout_id"] is not None
-                    else None
-                ),
                 "group_id": row["group_id"],
                 "trace_id": row["trace_id"],
                 "eligible_action_token_count": int(row["eligible_token_count"]),
@@ -298,7 +242,6 @@ def build_exact_trace_wire_identity(
         "optimizer_step_id": str(plan["optimizer_step_id"]),
         "training_admission_contract_id": admission_id,
         "generation_contract_id": str(plan["generation_contract_id"]),
-        "execution_ids_by_rollout": dict(execution_ids_by_rollout),
         "logical_rollout_count": int(plan["logical_rollout_count"]),
         "physical_trace_count": int(plan["physical_trace_count"]),
         "padding_row_count": int(plan["padding_row_count"]),
@@ -316,13 +259,11 @@ def validate_exact_trace_committed_meta(
     extra_info: Mapping[str, Any],
     plan: Mapping[str, Any],
     pending_identity: ExactTracePendingIdentity,
-    execution_ids_by_rollout: Mapping[str, str],
 ) -> None:
     """Cross-check returned KV metadata against the plan-derived authority."""
     expected_ids, expected_tags, expected_extra = build_exact_trace_wire_identity(
         plan,
         pending_identity=pending_identity,
-        execution_ids_by_rollout=execution_ids_by_rollout,
     )
     if sample_ids != expected_ids:
         raise ValueError("Committed TQ sample IDs disagree with TraceBatchPlan")
