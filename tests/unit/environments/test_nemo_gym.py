@@ -725,7 +725,10 @@ def test_nemo_gym_postprocess_allows_rewrite_only_for_generation_collection():
     assert not result["rollout_trace_bundle"]["checks"]["ok"]
 
 
-def test_nemo_gym_postprocess_builds_exact_compacted_trace_bundle():
+@pytest.mark.parametrize("exact_trace_schema_version", [2, 3])
+def test_nemo_gym_postprocess_builds_exact_compacted_trace_bundle(
+    exact_trace_schema_version: int,
+):
     class _Tokenizer:
         def batch_decode(self, batch):
             return [" ".join(map(str, token_ids)) for token_ids in batch]
@@ -836,7 +839,7 @@ def test_nemo_gym_postprocess_builds_exact_compacted_trace_bundle():
                 for model_call in trajectory_model_calls
             ],
             "context_compaction_contract": {
-                "schema_version": 2,
+                "schema_version": exact_trace_schema_version,
                 "mode": "exact_trace_authority",
                 "rollout_id": rollout_id,
                 "group_id": "group-cc",
@@ -952,6 +955,32 @@ def test_nemo_gym_postprocess_builds_exact_compacted_trace_bundle():
         }
         for evidence in result_payload["response"]["completion_evidence"]
     ]
+    if exact_trace_schema_version == 3:
+        response = result_payload["response"]
+        completion_evidence = response.pop("completion_evidence")
+        response.pop("trajectory_model_calls")
+        response["model_call_metadata"] = [
+            {
+                **{
+                    key: value
+                    for key, value in evidence.items()
+                    if key
+                    not in {
+                        "prompt_token_ids",
+                        "sampled_token_ids",
+                        "sampled_logprobs",
+                    }
+                },
+                "generation_evidence_digest": canonical_digest(
+                    {
+                        "prompt_token_ids": evidence["prompt_token_ids"],
+                        "sampled_token_ids": evidence["sampled_token_ids"],
+                        "sampled_logprobs": evidence["sampled_logprobs"],
+                    }
+                ),
+            }
+            for evidence in completion_evidence
+        ]
     row = {
         "_rowidx": 3,
         "trajectory_identity": {
@@ -983,6 +1012,34 @@ def test_nemo_gym_postprocess_builds_exact_compacted_trace_bundle():
         [message["token_ids"].tolist() for message in physical_trace]
         for physical_trace in training_result["physical_message_logs"]
     ] == [[[1], [2]], [[8], [9]]]
+
+    if exact_trace_schema_version == 3:
+        missing_summaries = deepcopy(result_payload)
+        missing_summaries["response"]["model_call_summaries"] = None
+        with pytest.raises(
+            TypeError,
+            match="Schema-3 exact traces require model_call_summaries",
+        ):
+            NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+                _MockSelf(),
+                row,
+                missing_summaries,
+                _Tokenizer(),
+                generation_only=False,
+            )
+
+        corrupted_digest = deepcopy(result_payload)
+        corrupted_digest["response"]["model_call_metadata"][0][
+            "generation_evidence_digest"
+        ] = "0" * 64
+        with pytest.raises(ValueError, match="metadata digest does not match"):
+            NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+                _MockSelf(),
+                row,
+                corrupted_digest,
+                _Tokenizer(),
+                generation_only=False,
+            )
 
     result = (
         NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
@@ -1057,6 +1114,7 @@ def test_nemo_gym_postprocess_builds_exact_compacted_trace_bundle():
             "lineage_deltas",
         }
     )
+
 
 def test_validate_trajectory_transitions_rejects_unknown_model_call_reference():
     contract = _test_trajectory_contract(
@@ -1500,7 +1558,10 @@ def test_generic_trajectory_ids_are_retry_and_order_stable():
         for row in reordered
     }
     assert by_task == reordered_by_task
-    assert all(row["_ng_rollout_id"] == row["trajectory_identity"]["rollout_id"] for row in rows)
+    assert all(
+        row["_ng_rollout_id"] == row["trajectory_identity"]["rollout_id"]
+        for row in rows
+    )
 
     new_attempt = deepcopy(source_rows[0])
     new_attempt["trajectory_identity"]["attempt_index"] = 1

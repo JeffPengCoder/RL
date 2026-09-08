@@ -234,6 +234,7 @@ def _validate_trajectory_transitions(
     model_call_summaries: Any,
     completion_evidence: list[dict[str, Any]],
     media_assets: Any,
+    exact_trace_schema_version: int | None = None,
 ) -> None:
     """Validate model-independent env transitions and exact-call references."""
     if trajectory_contract is None:
@@ -362,13 +363,6 @@ def _validate_trajectory_transitions(
             f"transitions={len(transitions)} "
             f"contract={trajectory_contract['transition_count']}"
         )
-    if not isinstance(trajectory_model_calls, list):
-        raise TypeError("trajectory_model_calls must be a list")
-    if len(trajectory_model_calls) != trajectory_contract["model_call_count"]:
-        raise ValueError(
-            "Trajectory model-call count does not match the trajectory contract"
-        )
-
     if not isinstance(media_assets, dict):
         raise TypeError("OSWorld trajectory media_assets must be a mapping")
     for media_id, asset in media_assets.items():
@@ -385,8 +379,30 @@ def _validate_trajectory_transitions(
                 f"OSWorld trajectory media asset {media_id!r} is corrupted"
             )
 
+    compact_transport = (
+        trajectory_model_calls is None and exact_trace_schema_version == 3
+    )
+    if compact_transport:
+        if not isinstance(model_call_summaries, list):
+            raise TypeError(
+                "Schema-3 exact traces require model_call_summaries when "
+                "trajectory_model_calls are omitted"
+            )
+        if len(model_call_summaries) != trajectory_contract["model_call_count"]:
+            raise ValueError(
+                "Trajectory model-call summary count does not match the "
+                "trajectory contract"
+            )
+    else:
+        if not isinstance(trajectory_model_calls, list):
+            raise TypeError("trajectory_model_calls must be a list")
+        if len(trajectory_model_calls) != trajectory_contract["model_call_count"]:
+            raise ValueError(
+                "Trajectory model-call count does not match the trajectory contract"
+            )
+
     summary_by_id: dict[str, dict[str, Any]] = {}
-    for call_index, model_call in enumerate(trajectory_model_calls):
+    for call_index, model_call in enumerate(trajectory_model_calls or []):
         if not isinstance(model_call, dict):
             raise TypeError(f"trajectory_model_calls[{call_index}] must be a mapping")
         model_call_id = model_call.get("model_call_id")
@@ -481,13 +497,68 @@ def _validate_trajectory_transitions(
                     f"trajectory_model_calls[{call_index}].{field} must be boolean"
                 )
         summary_by_id[model_call_id] = model_call
-    if exact_evidence and any(
-        model_call["generation_evidence"]["exact"] is not True
-        for model_call in trajectory_model_calls
+    if (
+        exact_evidence
+        and not compact_transport
+        and any(
+            model_call["generation_evidence"]["exact"] is not True
+            for model_call in trajectory_model_calls
+        )
     ):
         raise ValueError("Exact OSWorld trajectory contains an inexact model call")
 
-    if model_call_summaries is not None:
+    if compact_transport:
+        for call_index, summary in enumerate(model_call_summaries):
+            if not isinstance(summary, dict):
+                raise TypeError(f"model_call_summaries[{call_index}] must be a mapping")
+            model_call_id = summary.get("model_call_id")
+            if not isinstance(model_call_id, str) or not model_call_id:
+                raise ValueError(f"model_call_summaries[{call_index}] has no identity")
+            if model_call_id in summary_by_id:
+                raise ValueError(f"Duplicate model-call identity {model_call_id!r}")
+            if summary.get("turn_id") != call_index + 1:
+                raise ValueError(
+                    f"model_call_summaries[{call_index}] has invalid turn_id"
+                )
+            environment_step = summary.get("environment_step")
+            if (
+                isinstance(environment_step, bool)
+                or not isinstance(environment_step, int)
+                or environment_step < 0
+            ):
+                raise ValueError(
+                    f"model_call_summaries[{call_index}] has invalid environment_step"
+                )
+            parse_attempt = summary.get("parse_attempt")
+            if (
+                isinstance(parse_attempt, bool)
+                or not isinstance(parse_attempt, int)
+                or parse_attempt <= 0
+            ):
+                raise ValueError(
+                    f"model_call_summaries[{call_index}] has invalid parse_attempt"
+                )
+            if not isinstance(summary.get("accepted"), bool):
+                raise TypeError(
+                    f"model_call_summaries[{call_index}].accepted must be boolean"
+                )
+            if summary.get("parse_error") is not None and not isinstance(
+                summary.get("parse_error"), str
+            ):
+                raise TypeError(
+                    f"model_call_summaries[{call_index}].parse_error must be a "
+                    "string or None"
+                )
+            if not isinstance(summary.get("exact_evidence"), bool):
+                raise TypeError(
+                    f"model_call_summaries[{call_index}].exact_evidence must be boolean"
+                )
+            if exact_evidence and summary["exact_evidence"] is not True:
+                raise ValueError(
+                    "Exact OSWorld trajectory contains an inexact model call"
+                )
+            summary_by_id[model_call_id] = summary
+    elif model_call_summaries is not None:
         if not isinstance(model_call_summaries, list) or len(
             model_call_summaries
         ) != len(trajectory_model_calls):
@@ -583,11 +654,13 @@ def _validate_trajectory_transitions(
                 model_call["parse_attempt"],
             ):
                 raise ValueError(f"Model call {model_call_id!r} identity is corrupted")
-            for field in ("reward", "done", "eligible"):
-                if model_call[field] != transition[field]:
-                    raise ValueError(
-                        f"Model call {model_call_id!r} {field} disagrees with its transition"
-                    )
+            if not compact_transport:
+                for field in ("reward", "done", "eligible"):
+                    if model_call[field] != transition[field]:
+                        raise ValueError(
+                            f"Model call {model_call_id!r} {field} disagrees "
+                            "with its transition"
+                        )
         accepted_model_call_id = action.get("accepted_model_call_id")
         if (
             accepted_model_call_id is not None
@@ -660,6 +733,28 @@ def _validate_trajectory_transitions(
                     f"Model call {model_call_id!r} eligibility disagrees with its transition"
                 )
             model_call = summary_by_id[model_call_id]
+            if evidence.get("turn_id") != model_call.get("turn_id"):
+                raise ValueError(
+                    f"Model call {model_call_id!r} turn_id is inconsistent"
+                )
+            for record_field, evidence_field in (
+                ("environment_step", "environment_step"),
+                ("parse_attempt", "parse_attempt"),
+                ("accepted", "accepted"),
+                ("parse_error", "parse_error"),
+            ):
+                if model_call[record_field] != evidence.get(evidence_field):
+                    raise ValueError(
+                        f"Model call {model_call_id!r} {record_field} is inconsistent"
+                    )
+            if compact_transport:
+                digest = evidence.get("generation_evidence_digest")
+                if not isinstance(digest, str) or not digest:
+                    raise ValueError(
+                        f"Model call {model_call_id!r} has no generation evidence digest"
+                    )
+                continue
+
             generation_evidence = model_call["generation_evidence"]
             expected_arrays = {
                 "prompt_token_ids": evidence.get("prompt_token_ids"),
@@ -677,16 +772,6 @@ def _validate_trajectory_transitions(
                 raise ValueError(
                     f"Model call {model_call_id!r} media order is inconsistent"
                 )
-            for record_field, evidence_field in (
-                ("environment_step", "environment_step"),
-                ("parse_attempt", "parse_attempt"),
-                ("accepted", "accepted"),
-                ("parse_error", "parse_error"),
-            ):
-                if model_call[record_field] != evidence.get(evidence_field):
-                    raise ValueError(
-                        f"Model call {model_call_id!r} {record_field} is inconsistent"
-                    )
             if generation_evidence.get("finish_reason") != evidence.get(
                 "finish_reason"
             ):
@@ -1613,6 +1698,9 @@ Depending on your data shape, you may want to change these values."""
             model_call_summaries=response.get("model_call_summaries"),
             completion_evidence=completion_evidence,
             media_assets=response.get("media_assets"),
+            exact_trace_schema_version=(
+                contract["schema_version"] if exact_trace_authority else None
+            ),
         )
         if trajectory_contract is not None:
             expected_model_name = self.cfg.get("model_name")
