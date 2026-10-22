@@ -134,6 +134,46 @@ def _unpack_route_fragments(
     ]
 
 
+# Local patch (OSWorld forest run, 2026-10-19): one step's DP shard of screenshot tensors is tens of GiB (job
+# 20465913: a single 40.07 GiB allocation in the packed_tensor branch next to a 56.7 GiB resident model). Payloads
+# whose source sits on another device type than the broadcast device (CPU data-plane outputs over an NCCL group) are
+# staged through the broadcast device in bounded chunks and land directly in a host buffer, which is where
+# non-leaders moved them anyway. Same bytes, same order, same final device; only peak GPU staging is bounded.
+_BROADCAST_STAGING_BYTES = int(
+    os.environ.get("NRL_DATA_PLANE_BROADCAST_CHUNK_BYTES", str(1 << 30))
+)
+
+
+def _is_host_payload(source_device: Any, bcast_device: Any) -> bool:
+    return torch.device(source_device).type != torch.device(bcast_device).type
+
+
+def _broadcast_flat_via_staging(
+    flat: torch.Tensor,
+    *,
+    is_leader: bool,
+    src: int,
+    group: Any,
+    bcast_device: Any,
+) -> None:
+    """Broadcast a contiguous 1-D host tensor in chunks staged on ``bcast_device``.
+
+    The leader passes its payload; every other rank passes a same-size buffer that is filled in place.
+    """
+    assert flat.dim() == 1
+    step = max(1, _BROADCAST_STAGING_BYTES // max(1, flat.element_size()))
+    for start in range(0, flat.numel(), step):
+        length = min(step, flat.numel() - start)
+        if is_leader:
+            buf = flat.narrow(0, start, length).to(bcast_device)
+        else:
+            buf = torch.empty(length, dtype=flat.dtype, device=bcast_device)
+        torch.distributed.broadcast(buf, src=src, group=group)
+        if not is_leader:
+            flat.narrow(0, start, length).copy_(buf)
+        del buf
+
+
 def _broadcast_batched_data_dict(
     data: Optional[BatchedDataDict[Any]],
     *,
@@ -235,7 +275,24 @@ def _broadcast_batched_data_dict(
     for entry in descriptor:
         key = entry[0]
         kind = entry[1]
-        if kind == "tensor":
+        if kind == "tensor" and _is_host_payload(entry[4], bcast_device):
+            # Local patch: chunked host staging (see _broadcast_flat_via_staging).
+            dtype_str, shape, src_device = entry[2], entry[3], entry[4]
+            dtype = getattr(torch, dtype_str.split(".")[-1])
+            if is_leader:
+                host = out[key].contiguous().reshape(-1)
+            else:
+                host_full = torch.empty(shape, dtype=dtype, device=src_device)
+                host = host_full.reshape(-1)
+            wire = host.view(torch.uint8) if dtype == torch.int16 else host
+            _broadcast_flat_via_staging(
+                wire, is_leader=is_leader, src=src, group=group, bcast_device=bcast_device
+            )
+            if not is_leader:
+                out[key] = host_full
+                del host_full
+            del host, wire
+        elif kind == "tensor":
             dtype_str, shape, src_device = entry[2], entry[3], entry[4]
             dtype = getattr(torch, dtype_str.split(".")[-1])
             if is_leader:
@@ -280,6 +337,30 @@ def _broadcast_batched_data_dict(
                     values, offsets.to(values.device)
                 )
             del values
+        elif kind == "packed_tensor" and _is_host_payload(entry[5], bcast_device):
+            # Local patch: chunked host staging (see _broadcast_flat_via_staging).
+            header, shapes, dtype_str, source_device = entry[2:]
+            dtype = getattr(torch, dtype_str.split(".")[-1])
+            numel = sum(
+                torch.Size(shape).numel() for shape in shapes if shape is not None
+            )
+            if is_leader:
+                segments = packed_segments.pop(key)
+                host = (
+                    torch.cat([segment.contiguous().view(-1) for segment in segments])
+                    if segments
+                    else torch.empty(0, dtype=dtype)
+                )
+                del segments
+            else:
+                host = torch.empty(numel, dtype=dtype, device=source_device)
+            wire = host.view(torch.uint8) if dtype == torch.int16 else host
+            _broadcast_flat_via_staging(
+                wire, is_leader=is_leader, src=src, group=group, bcast_device=bcast_device
+            )
+            if not is_leader:
+                out[key] = header.rebuild_from_broadcast_parts(shapes, host)
+            del host, wire
         elif kind == "packed_tensor":
             header, shapes, dtype_str, source_device = entry[2:]
             if is_leader:
