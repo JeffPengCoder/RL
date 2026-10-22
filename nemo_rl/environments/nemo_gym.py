@@ -1343,9 +1343,21 @@ Depending on your data shape, you may want to change these values."""
         # attempt is untrainable, not a controller failure. Keep pending IDs in
         # the receipt: their writes may still arrive and must not be cleaned here.
         capture_failed = bool(parsed.pending_call_ids or parsed.failures)
+        # An environment that failed before the first model call (an OSWorld VM that
+        # never came up) returns a Gym-masked result with nothing captured. Mask that
+        # owner like a failed capture; selection would raise "No accepted captured
+        # generations" and, classified DATA, stop the run.
+        env_failed_before_model = (
+            not capture_failed
+            and not parsed.records
+            and bool(
+                result.get("mask_sample")
+                or (result.get("instance_config") or {}).get("mask_sample")
+            )
+        )
         selected = []
         terminal_response_id = None
-        if not capture_failed:
+        if not capture_failed and not env_failed_before_model:
             try:
                 if self._selection_policy == "all_captured":
                     selected = list(parsed.records)
@@ -1413,6 +1425,10 @@ Depending on your data shape, you may want to change these values."""
         )
         if capture_failed:
             receipt.update(capture_poisoned=True, failure_reason="capture_incomplete")
+        elif env_failed_before_model:
+            receipt.update(
+                capture_poisoned=True, failure_reason="environment_failed_before_model"
+            )
         elif any(
             r.response_status == "failed"
             or (
