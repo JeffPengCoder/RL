@@ -112,6 +112,36 @@ def _aggregate_train_results(results: list[dict[str, Any]]) -> dict[str, Any]:
 # dispatcher only waits for completion — no aggregation needed.
 
 
+
+def _split_meta_into_rounds(
+    meta: KVBatchMeta, dp_size: int, per_rank_cap: int
+) -> list[KVBatchMeta]:
+    """Local patch (OSWorld forest run, 2026-10-19): split a dispatch into rounds.
+
+    Every rank of a replica group materializes its whole DP shard in host
+    memory for one dispatch (jobs 20465916 and 20468489: 190-390 GB per
+    Megatron worker, node at 1.95 of 2.0 TB, Ray OOM kills; ~1.1k-1.8k
+    image-heavy samples per step at DP1). Rounds of at most ``per_rank_cap``
+    samples per DP rank bound that. Samples are dealt to the rounds in blocks
+    of ``dp_size``, longest first, so every round's size stays a multiple of
+    ``dp_size`` (shard_by_batch_size requires it) and rounds mix long and
+    short samples. Each round is then sharded and packed exactly as the whole
+    batch was. Returns ``[meta]`` when no split is needed or possible.
+    """
+    n_samples = len(meta.sample_ids)
+    if meta.sequence_lengths is None or n_samples % dp_size != 0:
+        return [meta]
+    blocks = n_samples // dp_size
+    rounds = max(1, math.ceil(n_samples / (dp_size * max(1, per_rank_cap))))
+    rounds = min(rounds, blocks)
+    if rounds <= 1:
+        return [meta]
+    order = sorted(range(n_samples), key=lambda i: -meta.sequence_lengths[i])
+    round_indices: list[list[int]] = [[] for _ in range(rounds)]
+    for block in range(blocks):
+        round_indices[block % rounds].extend(order[block * dp_size : (block + 1) * dp_size])
+    return [meta.subset(sorted(indices)) for indices in round_indices if indices]
+
 logger = logging.getLogger(__name__)
 
 
@@ -452,19 +482,11 @@ class TQPolicy(TQDriverMixin, Policy):
         # workers write each sample's result back by key, so the outputs are
         # unchanged.
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
-        per_rank_cap = int(os.environ.get("NRL_LOGPROB_MAX_SAMPLES_PER_RANK", "192"))
-        n_samples = len(lp_meta.sample_ids)
-        blocks = n_samples // dp_size if n_samples % dp_size == 0 else 0
-        rounds = max(1, math.ceil(n_samples / (dp_size * max(1, per_rank_cap))))
-        rounds = min(rounds, max(1, blocks))
-        if rounds > 1 and lp_meta.sequence_lengths is not None:
-            order = sorted(range(n_samples), key=lambda i: -lp_meta.sequence_lengths[i])
-            round_indices: list[list[int]] = [[] for _ in range(rounds)]
-            for block in range(blocks):
-                round_indices[block % rounds].extend(order[block * dp_size : (block + 1) * dp_size])
-            round_metas = [lp_meta.subset(sorted(indices)) for indices in round_indices if indices]
-        else:
-            round_metas = [lp_meta]
+        round_metas = _split_meta_into_rounds(
+            lp_meta,
+            dp_size,
+            int(os.environ.get("NRL_LOGPROB_MAX_SAMPLES_PER_RANK", "192")),
+        )
         for round_meta in round_metas:
             with timer.time(f"{timer_prefix}/shard_meta") if timer else nullcontext():
                 metas, _ = shard_meta_for_dp(
@@ -733,16 +755,26 @@ class TQPolicy(TQDriverMixin, Policy):
             task_name="train",
             want_routes=True,
         )
-        with timer.time("policy_training/shard_meta") if timer else nullcontext():
-            dp_metas, _ = shard_meta_for_dp(
-                train_meta,
-                dp_world=self.sharding_annotations.get_axis_size("data_parallel"),
-                batch_size=None,
-                sequence_packing_args=spa,
-                dynamic_batching_args=dba,
-            )
-
-        self._dispatch_train_microbatches(dp_metas, timer=timer)
+        # Local patch (OSWorld forest run, 2026-10-19): same rounds as the
+        # logprob dispatch (_split_meta_into_rounds). All rounds go into the
+        # one open train step: gradients accumulate across calls and
+        # finish_train_step rescales by the step's global counts, so the
+        # update equals the one-call update up to summation order.
+        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        for round_meta in _split_meta_into_rounds(
+            train_meta,
+            dp_size,
+            int(os.environ.get("NRL_TRAIN_MAX_SAMPLES_PER_RANK", "192")),
+        ):
+            with timer.time("policy_training/shard_meta") if timer else nullcontext():
+                dp_metas, _ = shard_meta_for_dp(
+                    round_meta,
+                    dp_world=dp_size,
+                    batch_size=None,
+                    sequence_packing_args=spa,
+                    dynamic_batching_args=dba,
+                )
+            self._dispatch_train_microbatches(dp_metas, timer=timer)
 
     def train_placed_microbatches(
         self,
