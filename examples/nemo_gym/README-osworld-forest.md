@@ -10,14 +10,15 @@ SingleController, plus its configs. Its files outside `3rdparty/` are byte-ident
 | `83385307` | NeMo-RL main (2026-10-17) |
 | merge | #4200 head `c9c1b020` (checkpoint/resume for the SingleController), stacked on #4124 head `2f3649d75` (forest training from captured rollouts); conflicts resolved as listed in the merge message |
 | test | the PR tests aligned with main (`fetch_prefix_chains`, forest attributes of a fake) |
-| build(gym) | `3rdparty/Gym-workspace/Gym` → `1aa581c8` and the uv.lock built against it |
+| build(gym) | `3rdparty/Gym-workspace/Gym` → `1aa581c8` and the uv.lock built against it; later repointed to the same tree on GitHub (below) |
 | fix(nemo-gym) | mask environments that fail before the first model call |
 | fix(loss) | chunk the top-k/top-p logprob path in float32 (48k-token bins) |
 | fix(data-plane) | broadcast host payloads in bounded staged chunks |
 | fix(tq-policy) × 2 | logprob and training dispatch in rounds of at most `NRL_LOGPROB_MAX_SAMPLES_PER_RANK` samples per DP rank (host memory) |
 
-The Gym commit `1aa581c8` (Gym main `b3103ea8` + #3591 + #4128 + #3368 + taskgen plugins and reward modes + served-call
-history under token capture) is not on GitHub yet, so `git submodule update` cannot fetch it from the URL in `.gitmodules`.
+The Gym submodule is JeffPengCoder/Gym branch `jepeng/osworld-forest-training` at `3116a376d727`.
+- That branch is Gym main `b3103ea8` plus merges of #3591 (head `4547ad10`), #4128 (`b53e7b7e`) and #3368 (`507d15c3`), a test alignment, the taskgen task plugins and reward modes, and served-call history under token capture.
+- Its tree is identical to `1aa581c8`, the local commit the run used: same git tree hash, `55fb21c26a8c`.
 
 ## Configs
 
