@@ -1880,6 +1880,8 @@ def _train_pump_controller(*, sampler) -> object:
         # The pump's step epilogue reads the save triggers even when saving
         # is disabled.
         checkpointing={"enabled": False, "save_period": 10},
+        # #4124: the train pump reads token_capture.forest_training.
+        token_capture=SimpleNamespace(enabled=False, forest_training=False),
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False

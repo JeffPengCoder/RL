@@ -306,7 +306,7 @@ def recovery_stack(monkeypatch, tmp_path):
         monkeypatch,
         tmp_path,
         sink=TQTokenSink(plane, staging_partition="staged"),
-        fetch_prefix=source.fetch_prefix_token_ids,
+        fetch_prefix=lambda keys: source.fetch_prefix_chains(keys).expanded,
         root_prompt=[10, 11],
         decide_input=decide_capture_input,
     )

@@ -194,7 +194,7 @@ def test_same_calls_as_segments_preserve_loss_and_gradients(
         monkeypatch,
         tmp_path,
         sink=TQTokenSink(plane, staging_partition="staged"),
-        fetch_prefix=source.fetch_prefix_token_ids,
+        fetch_prefix=lambda keys: source.fetch_prefix_chains(keys).expanded,
         root_prompt=root_prompt,
         decide_input=decide_capture_input,
     )
