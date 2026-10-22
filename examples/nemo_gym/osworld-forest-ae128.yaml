@@ -1,6 +1,6 @@
 # OSWorld forest training on AgentEnv, batch 128 (2026-10-22). Decisions (user, 2026-10-21, RUN_LOG item 58): restart
 # from the base model on AgentEnv, binary reward from step 1, 16 tasks x 8 rollouts per step, held-out evaluation
-# on AgentEnv as well; then "你直接推进就行". Plan: 8 nodes per link (2 vLLM + 6 Megatron), 25 steps (= the 3,200
+# on AgentEnv as well; then "你直接推进就行". Plan: 10 nodes per link (2 vLLM + 8 Megatron), 25 steps (= the 3,200
 # trajectories of the first run's 100 x 32), evaluate, then decide whether to continue.
 # Everything else is the first run's (osworld-forest-train.yaml, steps 1-31): same source, runtime, model, data
 # (a-train-20261013-noident, 122 tasks), 200-step horizon, 3-10-3 history, 48k packing bins, TP2 x CP8, lr 5e-6.
@@ -30,9 +30,11 @@ policy:
         num_nodes: 2                   # two vLLM engines (TP8 each), 64 agent loops per engine
         gpus_per_node: 8
   megatron_cfg:
-    # TP2 x CP8 per replica as in the first run (Mamba CP is all-to-all; a 48k bin at CP8 trains), now DP3 on the six
-    # Megatron nodes: each replica gets a third of the step's ~4x larger data, so training time and host memory per
-    # node stay near the first run's (DP1 there broadcast the whole step to all 16 ranks).
+    # TP2 x CP8 per replica as in the first run (Mamba CP is all-to-all; a 48k bin at CP8 trains), now DP4 on eight
+    # Megatron nodes: each replica gets a quarter of the step's ~4x larger data, so training time and host memory per
+    # node stay near the first run's (DP1 there broadcast the whole step to all 16 ranks). Not DP3 on six nodes:
+    # Megatron-Bridge checks eval_global_batch_size (= train_global_batch_size 128) % DP == 0 at worker init (the
+    # first 8-node launches failed on it), and 48 GPUs give no TP x CP with DP 2 or 4.
     context_parallel_size: 8
     optimizer:
       lr: 5.0e-6
@@ -91,11 +93,11 @@ logger:
   wandb:
     entity: ${oc.env:WANDB_ENTITY}
     project: grpo-nemotron-omni-osworld
-    name: forest A-train AgentEnv b128 (NeMo-RL SC, CP8 DP3)
+    name: forest A-train AgentEnv b128 (NeMo-RL SC, CP8 DP4)
     group: nrl-forest-ae128
     id: nrl-forest-ae128-20261022
     resume: allow
 
 cluster:
-  num_nodes: 8                         # 2 vLLM (TP8 x 2) + 6 Megatron (TP2 x CP8 x DP3)
+  num_nodes: 10                        # 2 vLLM (TP8 x 2) + 8 Megatron (TP2 x CP8 x DP4)
   gpus_per_node: 8

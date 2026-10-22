@@ -26,7 +26,7 @@ The Gym submodule is JeffPengCoder/Gym branch `jepeng/osworld-forest-training` a
 |---|---|
 | `osworld-forest-smoke.yaml` | Smoke recipe on top of `vlm_grpo_nemotron_omni_clevr_vllm_token_capture_single_controller.yaml`: 2 × 4 per step, 15 actions, remote_docker VMs, 3 × 8 H100 (1 vLLM TP8 + 2 Megatron). |
 | `osworld-forest-train.yaml` | First training run, on top of the smoke recipe: 4 × 8 per step, 200 actions, 7200 s per task, 48k packing bins, Megatron TP2 × CP8, lr 5e-6 constant, `all_captured` selection, checkpoint every step (4 h job chains). Reward `signed_v1` up to step 23, then `binary`: signed_v1 pays success with or without DONE, so the policy learned to run to the step cap instead of declaring DONE. |
-| `osworld-forest-ae128.yaml` | Second run, on top of the smoke recipe: AgentEnv desktops through Gym's E2B provider (`osworld_agentenv`), 16 × 8 per step, 128 concurrent agents, 8 × 8 H100 (2 vLLM + 6 Megatron, DP3), binary reward, 25 steps. |
+| `osworld-forest-ae128.yaml` | Second run, on top of the smoke recipe: AgentEnv desktops through Gym's E2B provider (`osworld_agentenv`), 16 × 8 per step, 128 concurrent agents, 10 × 8 H100 (2 vLLM + 8 Megatron, DP4; DP3 on 6 Megatron nodes fails Megatron-Bridge's batch % DP check), binary reward, 25 steps. |
 
 Environment the configs read:
 - `OSWORLD_SERVING_ASSETS`: the chat template and the `nano_v3` reasoning-parser plugin.
