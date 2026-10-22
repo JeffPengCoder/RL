@@ -30,6 +30,8 @@ no key minting). Workers fetch their slice from TQ via
 from __future__ import annotations
 
 import logging
+import math
+import os
 import time
 import warnings
 from collections import Counter, defaultdict
@@ -436,33 +438,61 @@ class TQPolicy(TQDriverMixin, Policy):
             task_name=task_name,
             want_routes=include_router_replay,
         )
-        with timer.time(f"{timer_prefix}/shard_meta") if timer else nullcontext():
-            metas, _ = shard_meta_for_dp(
-                lp_meta,
-                dp_world=self.sharding_annotations.get_axis_size("data_parallel"),
-                batch_size=None,
-                sequence_packing_args=spa,
-                dynamic_batching_args=dba,
-            )
-        with timer.time(f"{timer_prefix}/submit_futures") if timer else nullcontext():
-            futures = self.worker_group.run_all_workers_sharded_data(
-                worker_method,
-                meta=metas,
-                in_sharded_axes=["data_parallel"],
-                replicate_on_axes=[
-                    "context_parallel",
-                    "tensor_parallel",
-                    "pipeline_parallel",
-                ],
-                output_is_replicated=[
-                    "context_parallel",
-                    "tensor_parallel",
-                    "pipeline_parallel",
-                ],
-                common_kwargs={**common_kwargs, **trace_context_kwargs()},
-            )
-        # Wait for completion; per-rank returns are None.
-        self.worker_group.get_all_worker_results(futures)
+        # Local patch (OSWorld forest run, 2026-10-19): every rank of a replica
+        # group holds its whole DP shard in host memory during this dispatch
+        # (job 20465916: 192-351 GB per Megatron worker in
+        # get_logprobs_presharded, node at 1.95 of 2.0 TB, Ray OOM kill with
+        # ~1.1k-1.8k image-heavy samples per step and DP1). Split the samples
+        # into rounds of at most NRL_LOGPROB_MAX_SAMPLES_PER_RANK per DP rank
+        # and dispatch the rounds one after another. Samples are dealt to the
+        # rounds in blocks of dp_size, longest first, so every round's size
+        # stays a multiple of dp_size (shard_by_batch_size requires it) and
+        # rounds mix long and short samples. Each round is sharded and packed
+        # exactly as the whole batch was (shard_meta_for_dp over dp_size), and
+        # workers write each sample's result back by key, so the outputs are
+        # unchanged.
+        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        per_rank_cap = int(os.environ.get("NRL_LOGPROB_MAX_SAMPLES_PER_RANK", "192"))
+        n_samples = len(lp_meta.sample_ids)
+        blocks = n_samples // dp_size if n_samples % dp_size == 0 else 0
+        rounds = max(1, math.ceil(n_samples / (dp_size * max(1, per_rank_cap))))
+        rounds = min(rounds, max(1, blocks))
+        if rounds > 1 and lp_meta.sequence_lengths is not None:
+            order = sorted(range(n_samples), key=lambda i: -lp_meta.sequence_lengths[i])
+            round_indices: list[list[int]] = [[] for _ in range(rounds)]
+            for block in range(blocks):
+                round_indices[block % rounds].extend(order[block * dp_size : (block + 1) * dp_size])
+            round_metas = [lp_meta.subset(sorted(indices)) for indices in round_indices if indices]
+        else:
+            round_metas = [lp_meta]
+        for round_meta in round_metas:
+            with timer.time(f"{timer_prefix}/shard_meta") if timer else nullcontext():
+                metas, _ = shard_meta_for_dp(
+                    round_meta,
+                    dp_world=dp_size,
+                    batch_size=None,
+                    sequence_packing_args=spa,
+                    dynamic_batching_args=dba,
+                )
+            with timer.time(f"{timer_prefix}/submit_futures") if timer else nullcontext():
+                futures = self.worker_group.run_all_workers_sharded_data(
+                    worker_method,
+                    meta=metas,
+                    in_sharded_axes=["data_parallel"],
+                    replicate_on_axes=[
+                        "context_parallel",
+                        "tensor_parallel",
+                        "pipeline_parallel",
+                    ],
+                    output_is_replicated=[
+                        "context_parallel",
+                        "tensor_parallel",
+                        "pipeline_parallel",
+                    ],
+                    common_kwargs={**common_kwargs, **trace_context_kwargs()},
+                )
+            # Wait for completion; per-rank returns are None.
+            self.worker_group.get_all_worker_results(futures)
 
     def get_logprobs_from_meta(
         self,
