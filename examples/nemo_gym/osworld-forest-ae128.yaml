@@ -1,0 +1,101 @@
+# OSWorld forest training on AgentEnv, batch 128 (2026-10-22). Decisions (user, 2026-10-21, RUN_LOG item 58): restart
+# from the base model on AgentEnv, binary reward from step 1, 16 tasks x 8 rollouts per step, held-out evaluation
+# on AgentEnv as well; then "你直接推进就行". Plan: 8 nodes per link (2 vLLM + 6 Megatron), 25 steps (= the 3,200
+# trajectories of the first run's 100 x 32), evaluate, then decide whether to continue.
+# Everything else is the first run's (osworld-forest-train.yaml, steps 1-31): same source, runtime, model, data
+# (a-train-20261013-noident, 122 tasks), 200-step horizon, 3-10-3 history, 48k packing bins, TP2 x CP8, lr 5e-6.
+# Copied next to osworld-forest-smoke.yaml in <RL>/examples/nemo_gym/ at launch so `defaults` resolves.
+defaults: osworld-forest-smoke.yaml
+
+grpo:
+  num_prompts_per_step: 16             # train_global_batch_size = 16 x 8 = 128 (smoke: ${mul:...})
+  num_generations_per_prompt: 8
+  max_num_steps: 25
+
+async_rl:
+  rollout_failure:
+    nemo_gym:
+      rollout_timeout_s: 10800         # > task_timeout 7200 + sandbox setup/teardown
+  stall_watchdog:
+    stall_timeout_s: 14400             # schema: must exceed rollout_timeout_s
+
+policy:
+  sequence_packing:
+    # As in the first run: one bin holds the longest model call, which vLLM caps at max_total_sequence_length (49,152).
+    train_mb_tokens: 49152
+    logprob_mb_tokens: 49152
+  generation:
+    colocated:
+      resources:
+        num_nodes: 2                   # two vLLM engines (TP8 each), 64 agent loops per engine
+        gpus_per_node: 8
+  megatron_cfg:
+    # TP2 x CP8 per replica as in the first run (Mamba CP is all-to-all; a 48k bin at CP8 trains), now DP3 on the six
+    # Megatron nodes: each replica gets a third of the step's ~4x larger data, so training time and host memory per
+    # node stay near the first run's (DP1 there broadcast the whole step to all 16 ranks).
+    context_parallel_size: 8
+    optimizer:
+      lr: 5.0e-6
+      min_lr: 5.0e-6
+    scheduler:
+      lr_warmup_iters: 0
+      lr_warmup_init: 5.0e-6
+
+token_capture:
+  selection_policy: all_captured       # as in the first run (returned_history stops on byte-identical repeated outputs)
+
+env:
+  nemo_gym:
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - responses_api_agents/osworld_agent/configs/osworld_agent.yaml
+    - benchmarks/osworld/configs/osworld_agentenv.yaml    # the osworld_agentenv sandbox provider (Gym's E2B provider)
+    osworld_simple_agent:
+      responses_api_agents:
+        osworld_agent:
+          max_steps: 200
+          concurrency: 128             # 16 prompts x 8 generations, all at once on AgentEnv
+          task_timeout: 7200
+          reward_mode: binary
+          # AgentEnv instead of remote_docker VMs on a KVM host. Fields as Gym's
+          # osworld_agent_nano_omni_agentenv.yaml and the AgentEnv benchmark run of 2026-10-20 (361 tasks, 0 masked):
+          # the canonical OSWorld template via AGENTENV_TEMPLATE; AGENTENV_URL /
+          # AGENTENV_API_KEY from train-ae128.sbatch; proxy off (AgentEnv guests cannot reach the site proxy).
+          provider_name: docker        # unused when sandbox_provider is set; as the AgentEnv profile
+          sandbox_provider: osworld_agentenv
+          sandbox_require_kvm: false
+          sandbox_ready_timeout_s: 900.0
+          sandbox_vnc_guest_port: 6901
+          vm_path: "agentenv-template-managed"
+          sandbox_spec:
+            image: ${oc.env:AGENTENV_TEMPLATE}
+            ttl_s: 14400
+            ready_timeout_s: 900
+            entrypoint: null
+            env: {}
+            resources: {}
+            provider_options: {}
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: /opt/ckpt
+  metric_name: null                    # no validation under SingleController
+  keep_top_k: 3
+  save_period: 1
+  save_optimizer: true
+  save_data_plane: true                # required with a replay-capable sampler
+  checkpoint_must_save_by: "00:03:15:00"
+
+logger:
+  wandb_enabled: true
+  wandb:
+    entity: ${oc.env:WANDB_ENTITY}
+    project: grpo-nemotron-omni-osworld
+    name: forest A-train AgentEnv b128 (NeMo-RL SC, CP8 DP3)
+    group: nrl-forest-ae128
+    id: nrl-forest-ae128-20261022
+    resume: allow
+
+cluster:
+  num_nodes: 8                         # 2 vLLM (TP8 x 2) + 6 Megatron (TP2 x CP8 x DP3)
+  gpus_per_node: 8

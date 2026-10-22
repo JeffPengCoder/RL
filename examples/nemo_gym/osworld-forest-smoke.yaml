@@ -1,0 +1,240 @@
+# OSWorld forest-training smoke (2026-10-17): NeMo-RL integ/nrl-cc-20261017 @978c6c18
+#   = RL main 83385307 + #4124 (forest training) + #4200 (SC checkpoint/resume)
+# paired with Gym integ/osworld-cc-20261017-taskgen-forest @1aa581c8
+#   = Gym main b3103ea8 + #3591 + #4128 + #3368 + taskgen plugins/signed_v1 + served-call history under capture.
+# Data: a taskgen OSWorld train pool of 122 tasks (rows.jsonl sha256 8b9041bc...).
+# Trained from a-train-20261013-noident (sha256 9ea716fa...): the same rows minus the top-level trajectory_identity
+# template (no rollout_id; the OSWorld agent rejects it, so the agent derives a per-rollout identity instead).
+# Agent contract follows the pool's calibration harness: Nano Omni runner + protocol
+# nano-omni-v3-osworld-v1, remote_docker VMs on a KVM host, 4096 tokens, 0.6/0.95; differs on purpose in
+# max_steps (15, smoke) and history (hysteresis 3-10-3 as in r37 instead of calibration's fixed 3).
+# Copied to <RL>/examples/nemo_gym/ at launch so `defaults` resolves.
+# Topology: 3 x 8 H100: 1 node async vLLM TP8, 2 nodes Megatron TP2 x CP4 x DP2 (EP8).
+defaults: vlm_grpo_nemotron_omni_clevr_vllm_token_capture_single_controller.yaml
+
+grpo:
+  num_prompts_per_step: 2
+  num_generations_per_prompt: 4
+  max_num_steps: 3
+  max_num_epochs: 1000                 # SC rejects <= 0; bounded by max_num_steps
+  max_rollout_turns: 1  # NeMo-Gym path asserts 1; the OSWorld agent runs its own loop (max_steps: 15)
+  async_grpo: null                     # SC requirement (inherited, restated)
+  val_period: 0                        # SC rejects validation
+  val_at_start: false
+  val_at_end: false
+  calculate_advantages_on_gpu: false   # forest: validate_forest_objective
+  seq_logprob_error_threshold: null    # diagnostic only for the smoke
+  # Forest rejects these; inherited defaults are already off/None:
+  #   use_dynamic_sampling, reward_shaping.enabled, reward_scaling.enabled,
+  #   invalid_tool_call_advantage, malformed_thinking_advantage
+
+loss_fn:
+  token_level_loss: true               # forest requirement
+  sequence_level_importance_ratios: false
+  use_importance_sampling_correction: true   # inherited; harmless at lookahead 0
+  reference_policy_kl_penalty: 0.0     # inherited from the CLEVR recipe
+
+token_capture:
+  enabled: true
+  forest_training: true
+  selection_policy: returned_history   # default; all_captured needs terminal attribution
+  staging_partition: rollout_staging
+  defer_routed_experts_to_policy: false  # forest requires direct route assembly
+
+data_plane:
+  enabled: true                        # SC requirement
+  backend: simple
+  simple:
+    num_storage_units: 4
+
+async_rl:
+  sampler:
+    name: in_order
+    max_lookahead_versions: 0          # synchronous / on-policy smoke
+  min_groups_for_streaming_train: ${grpo.num_prompts_per_step}
+  max_inflight_prompts: ${grpo.num_prompts_per_step}
+  max_buffered_rollouts: ${grpo.num_prompts_per_step}
+  rollout_failure:
+    min_step_batch_fraction: 1         # forest requirement (any dropped group stops training)
+    nemo_gym:
+      rollout_timeout_s: 5400          # backstop for a hung prompt-group stream (15 OSWorld steps)
+  stall_watchdog:
+    stall_timeout_s: 7200              # schema: must exceed rollout_timeout_s
+  generation_fleet_health:
+    refit_timeout_s: null              # inherited from the CLEVR recipe
+
+policy:
+  model_name: /opt/model             # Nano Omni v3 @24e67ea0 (mounted)
+  is_vlm: true
+  # Serving tuple of the calibration harness and the r37 training contract
+  # (osworld/recipes/training/nano-omni-osworld-rl, contract.json): checkpoint tokenizer/processor + template
+  # ab7813c3... + nano_v3 parser plugin aafb1220...; the trainer renders with the same template and kwargs.
+  tokenizer:
+    name: /opt/model
+    chat_template: ${oc.env:OSWORLD_SERVING_ASSETS}/chat_template.jinja
+    chat_template_kwargs:
+      enable_thinking: true            # = the template's defaults; restated as in r37
+      truncate_history_thinking: true
+  train_global_batch_size: ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  # A packed microbatch is ~48k tokens; full-vocab fp32 logprobs over it needed 11.7 GiB on one TP2 rank (OOM in job
+  # 20404673). Chunk the logprob computation by tokens.
+  logprob_chunk_size: 4096
+  max_total_sequence_length: 49152     # 3-10-3 live screenshots @1920x1080 + reasoning; tune
+  make_sequence_length_divisible_by: 32
+  sequence_packing:
+    enabled: true                      # forest supports ordinary packing (rows only need DP divisibility)
+    # One 48k-token bin held ~10 samples' screenshots and OOMed in the RADIO encoder during the logprob pass (job
+    # 20406436: 66 GiB allocated, 22 GiB of it the model). A model call is ~2.4k prompt tokens per screenshot, so a
+    # 10-image segment fits 24k; a longer one fails loudly ("exceeds bin capacity") rather than silently.
+    train_mb_tokens: 24576
+    logprob_mb_tokens: 24576
+  dynamic_batching:
+    enabled: false                     # forest guard
+  router_replay:
+    enabled: false                     # see open risk: Omni MBridge wrapper + packing + routed_experts
+  megatron_cfg:
+    defer_fp32_logits: true          # required by logprob_chunk_size
+    enabled: true
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+      TORCH_CUDA_ARCH_LIST: '9.0'      # H100 (inherited recipe says 10.0 = Blackwell)
+    tensor_model_parallel_size: 2
+    expert_model_parallel_size: 8
+    expert_tensor_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    virtual_pipeline_model_parallel_size: null   # forest rejects interleaved PP
+    # Job 20410269 (CP2) passed the logprob pass but OOMed in the training loss: with top_p 0.95 the loss takes the
+    # unchunked top-p logprob path (full-vocab fp32 + sort), and the longest segment is ~22k tokens (step 10, 10
+    # screenshots), so a bin already holds one segment. Megatron now gets 2 nodes: TP2 x CP4 x DP2 (EP8 x EDP2), which
+    # halves per-rank activations again without touching sampling (top_p stays 0.95, as in calibration).
+    # CP2 (TP2 x CP2 x DP2): halves LM activations and, with the Omni provider's default vision_dp_over_cp, splits a
+    # bin's screenshots across the CP ranks. TP>2 is not an option (2 KV heads). Job 20407151 (24k bins, CP1) still
+    # OOMed in the RADIO encoder: native-res 1920x1080 is ~8.1k patches per screenshot, ~4x its LM image tokens.
+    context_parallel_size: 4
+    sequence_parallel: true
+    activation_checkpointing: true
+    # MoE routing must stay dropless/per-token with no aux loss and no active
+    # bias updates (validate_forest_execution_padding). grpo_math_1B defaults
+    # already give freeze_moe_router: true, moe_router_load_balancing_type: none,
+    # moe_router_bias_update_rate: 0.0 -- restated so an override cannot drift.
+    freeze_moe_router: true
+    moe_router_load_balancing_type: "none"
+    moe_router_bias_update_rate: 0.0
+    optimizer:
+      optimizer_cpu_offload: true      # 1 x 8 H100 for ~31.6B params with EDP=1 for experts
+      optimizer_offload_fraction: 1.0
+  automodel_cfg:
+    enabled: false
+  generation:
+    backend: vllm
+    refit_transport: null              # as in the validated vLLM capture example
+    max_new_tokens: 4096
+    temperature: 0.6
+    top_p: 0.95
+    colocated:
+      enabled: false                   # SC rejects colocated vLLM
+      resources:
+        num_nodes: 1
+        gpus_per_node: 8
+    vllm_cfg:
+      async_engine: true
+      # Calibration's chat template (serving-assets sha256 ab7813c3...). The checkpoint's template (41428e0c...) loops over
+      # message content parts, so vLLM's "auto" content format picks openai and hands assistant history to the template
+      # as a part list, which it renders with `| string`: the model saw "[{'type': 'text', ...}]" history and copied it
+      # (no ## Code section from step 2 on, job 20406436). The calibration template keeps the string format.
+      expose_http_server: true
+      tensor_parallel_size: 8
+      expert_parallel_size: 1
+      pipeline_parallel_size: 1
+      max_model_len: ${policy.max_total_sequence_length}
+      gpu_memory_utilization: 0.7
+      # r37: sampling uses top_p 0.95 on both sides, so vLLM returns the processed distribution that Megatron
+      # recomputes; raw_logprobs shifted the ratio (r35: all 128 rollouts masked; job 20411111: token_mult_prob_error
+      # 1.07-1.08).
+      logprobs_mode: processed_logprobs
+      enable_prefix_caching: false     # hybrid-Mamba align-cache constraint (example comment)
+      enforce_eager: true
+      reasoning_parser_plugin: ${oc.env:OSWORLD_SERVING_ASSETS}/nano_v3_reasoning_parser.py
+      http_server_serving_chat_kwargs:
+        # nano_v3 as in calibration and r37 (job 20411111 used vLLM's built-in nemotron_v3, which also split reasoning).
+        # No tool parser: this agent protocol answers with ## Action / ## Code text, and calibration served none.
+        reasoning_parser: nano_v3
+        chat_template: ${oc.env:OSWORLD_SERVING_ASSETS}/chat_template.jinja
+        chat_template_kwargs:
+          enable_thinking: true
+          truncate_history_thinking: true
+        chat_template_content_format: auto   # resolves to string for this template
+    vllm_kwargs:
+      limit_mm_per_prompt:
+        image: 16                      # >= high_water 10 + headroom
+      max_num_batched_tokens: ${policy.max_total_sequence_length}
+      mm_processor_cache_gb: 0         # keep concrete pixels for the capture host
+      skip_mm_profiling: true
+      mamba_ssm_cache_dtype: float32
+      kernel_config:
+        enable_flashinfer_autotune: false
+        moe_backend: triton
+
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  train:
+    data_path: /opt/data/a-train-20261013-noident/rows.jsonl   # agent_ref osworld_simple_agent
+  validation: null
+  # default.{dataset_name: NemoGymDataset, env_name: nemo_gym,
+  #          processor: nemo_gym_data_processor} inherited from the example.
+
+env:
+  _override_: true
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: false
+  should_mask_flagged_samples: true
+  nemo_gym:
+    is_trajectory_collection: false
+    skip_venv_if_present: true
+    port_range_low: 5000
+    port_range_high: 5999
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - responses_api_agents/osworld_agent/configs/osworld_agent.yaml
+    osworld_simple_agent:
+      responses_api_agents:
+        osworld_agent:
+          runner_name: nemotron_v3_nano_omni_agent
+          model_protocol_id: nano-omni-v3-osworld-v1
+          max_steps: 15
+          max_trajectory_length: 3
+          history_policy:              # r37's 3-10-3 image compaction
+            name: hysteresis
+            params:
+              low_water: 3
+              high_water: 10
+          max_tokens: ${policy.generation.max_new_tokens}
+          temperature: 0.6             # RL also injects generation temperature/top_p per request
+          top_p: 0.95
+          concurrency: 8               # 2 prompts x 4 generations
+          provider_name: remote_docker   # VMs on a KVM host via OSWORLD_REMOTE_* (as calibration)
+          sandbox_provider: null
+          resources_server: null         # taskgen plugins refuse a remote Resources Server
+          vm_path: ${oc.env:OSWORLD_VM_PATH,""}
+          sleep_after_execution: 1.5
+          setup_cache_dir: /opt/data/a-train-20261013/setup_cache
+          task_timeout: 3600
+          reward_mode: signed_v1         # taskgen reward contract (row field is not read)
+
+checkpointing:
+  enabled: false                       # smoke; to exercise #4200 set true +
+  # checkpoint_dir: /shared/...        #   save_data_plane: true, save_period: 1
+  # save_data_plane: true
+
+logger:
+  log_dir: /opt/run/logs
+  wandb_enabled: false
+  tensorboard_enabled: true
+  monitor_gpus: false
+
+cluster:
+  num_nodes: 3                           # 1 vLLM (TP8) + 2 Megatron (TP2 x CP4 x DP2)
+  gpus_per_node: 8
+  segment_size: null                   # inherited recipe sets 2 (GB200 NVL); unset for H100

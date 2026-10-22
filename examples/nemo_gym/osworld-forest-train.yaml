@@ -1,0 +1,100 @@
+# OSWorld forest training, 100 steps (2026-10-18): the smoke recipe (osworld-forest-smoke.yaml, validated end to end
+# in jobs 20411111 and 20413267) with the training-scale choices below. Same source, runtime, model, data
+# (a-train-20261013-noident, 122 tasks), serving tuple and topology (3 x 8 H100).
+#   - rollout horizon 200 steps, 7200 s per task: the calibration contract (calibration_overlay.yaml) that placed
+#     these tasks in the training window, and r37's max_turns;
+#   - 4 prompts x 8 generations per step (smoke: 2 x 4);
+#   - lr 5e-6 constant, no warmup (r37; the inherited CLEVR recipe was 2e-7 with a 50-step warmup from 2e-8);
+#   - checkpoints every step: cluster jobs are capped at 4 h, so the run is a chain of 4 h jobs that resume from
+#     the latest checkpoint.
+# Copied next to osworld-forest-smoke.yaml in <RL>/examples/nemo_gym/ at launch so `defaults` resolves.
+defaults: osworld-forest-smoke.yaml
+
+grpo:
+  num_prompts_per_step: 4
+  num_generations_per_prompt: 8
+  max_num_steps: 100
+
+async_rl:
+  rollout_failure:
+    nemo_gym:
+      rollout_timeout_s: 10800         # > task_timeout 7200 + VM setup/teardown
+  stall_watchdog:
+    stall_timeout_s: 14400             # schema: must exceed rollout_timeout_s
+
+policy:
+  sequence_packing:
+    # One bin must hold the longest segment, and a segment is one model call (prompt + output), which vLLM caps at
+    # max_total_sequence_length. The agent folds every older turn into text and never drops one, so text grows
+    # ~160 tokens per step (job 20461768's IO log: 29,084 text tokens at step 180, 29,996 at step 186), and a
+    # 10-screenshot call (~1,950 tokens per screenshot) passes 24k near step 30, 32k near step 80 and 49,152 near
+    # step 185 (one prompt hit 49,699 there). 24k bins failed in jobs 20461767 and 20461768 (24832, 24960).
+    # 48k bins are 12k tokens per rank at CP4, which OOMed in the unchunked top-p loss at CP2 (job 20410269); the
+    # local loss_input.py patch now chunks that path (logprob_chunk_size 4096) with unchanged results.
+    train_mb_tokens: 49152
+    logprob_mb_tokens: 49152
+  megatron_cfg:
+    # CP8 (TP2 x CP8 x DP1 on the 2 Megatron nodes; the smoke ran CP4 x DP2). 48k bins at CP4 passed the logprob pass
+    # but OOMed in the training backward of a Mamba layer (job 20465914: mamba_ssm _chunk_scan_bwd_dz, "Triton Error
+    # [CUDA]: out of memory"). Megatron's Mamba context parallelism is all-to-all: each rank runs the whole sequence
+    # for nheads / (TP x CP) heads, so per-rank Mamba activations scale with bin length / (TP x CP). A 48k bin at CP8
+    # matches the smoke's 24k bin at CP4, which trained. Divisibility: 64 Mamba heads / (2 x 8) = 4; 8 groups / TP2
+    # = 4 per rank, and CP8 is a multiple of 4; 32 attention heads, 2 KV heads (sequence-split under CP); EP8 over 16
+    # ranks. DP1 broadcasts the whole step's data to all 16 ranks: host memory ~0.9 TB per Megatron node of 2 TB
+    # (20465914 peaked at 557 GiB per node with DP2).
+    context_parallel_size: 8
+    optimizer:
+      lr: 5.0e-6
+      min_lr: 5.0e-6
+    scheduler:
+      lr_warmup_iters: 0
+      lr_warmup_init: 5.0e-6
+
+token_capture:
+  # returned_history matches the agent's returned history to captured calls by content; two byte-identical model
+  # outputs in one trajectory (an agent repeating an action) make that match ambiguous and stop the run (job 20440445:
+  # "multiple captured calls match" at output 12). all_captured trains every captured call and needs only the scored
+  # terminal, which the OSWorld agent names (terminal_response_id). The agent does retry unparseable output (up to
+  # parse_retries), and all_captured trains those abandoned calls too; they are rare (job 20461768: 1 of 1819 calls,
+  # an output truncated at 4096 tokens, apart from one rollout already masked by a context overflow).
+  selection_policy: all_captured
+
+env:
+  nemo_gym:
+    osworld_simple_agent:
+      responses_api_agents:
+        osworld_agent:
+          max_steps: 200
+          concurrency: 32              # 4 prompts x 8 generations; calibration also ran 32 VMs on the host
+          task_timeout: 7200
+          # signed_v1 (smoke default) until step 23; binary from link 20516550 on (user, 2026-10-20). signed_v1 pays
+          # success with or without DONE and adds -1 only for DONE, so the policy learned to run to the 200-step cap
+          # instead of declaring DONE (RUN_LOG items 46, 49). The model never ends with FAIL, so binary {0, 1} gives
+          # the same GRPO advantages as "running out of steps = -1".
+          reward_mode: binary
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: /opt/ckpt
+  metric_name: null                    # no validation under SingleController
+  keep_top_k: 3
+  save_period: 1
+  save_optimizer: true
+  save_data_plane: true                # required with a replay-capable sampler
+  # Measured from the controller's start, ~10 min after the job's; leaves room for one save before the 4 h limit.
+  checkpoint_must_save_by: "00:03:15:00"
+
+logger:
+  # One W&B run for the whole chain (user, 2026-10-19: continuous W&B curves). Every link resumes the same run id;
+  # NeMo-RL writes one history row per trainer step on the hidden x-axis nemo_rl/step, so rows land at their step
+  # whatever order they arrive in. Steps a link finished before W&B was on (1 to 3, and those of link 20479533) are
+  # filled from TensorBoard by wandb_backfill.py, which train-env.sh runs at link start before training resumes the run.
+  # Credentials: WANDB_API_KEY, exported by train-env.sh from ~/.netrc (machine api.wandb.ai).
+  wandb_enabled: true
+  wandb:
+    entity: ${oc.env:WANDB_ENTITY}
+    project: grpo-nemotron-omni-osworld
+    name: forest A-train 100 steps (NeMo-RL SC, CP8) v2
+    group: nrl-forest-atrain100
+    id: nrl-forest-atrain100-v2-20261020
+    resume: allow
