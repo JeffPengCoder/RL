@@ -666,6 +666,23 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     # Fixed CPU finalizer pool size; actors are never automatically replaced.
     num_reassembler_workers: PositiveInt = 2
 
+    # Reconstruct selected capture paths as rows of one logical rollout.
+    # Forest groups are single-attempt; ordinary capture keeps its retry policy.
+    # Initially requires unit dataset loss weights and disables both trainer and
+    # rollout checkpointing; ordinary capture retains those capabilities.
+    forest_training: bool = False
+    # returned_history preserves the harness-selected trajectory (default).
+    # all_captured includes every captured call, including abandoned attempts.
+    selection_policy: Literal["returned_history", "all_captured"] = "returned_history"
+
+    @model_validator(mode="after")
+    def validate_selection_policy(self) -> "TokenCaptureConfig":
+        if self.selection_policy == "all_captured" and not self.forest_training:
+            raise ValueError(
+                "selection_policy=all_captured requires forest_training=true"
+            )
+        return self
+
 
 @dataclass(frozen=True)
 class TaskSourceRecoveryGranularity:
@@ -863,6 +880,60 @@ class MasterConfig(BaseModel, extra="allow"):
                 "At least one algorithm block must be set, either `grpo` or `ppo`."
             )
         return self
+
+
+def validate_forest_objective(grpo: GRPOConfig, loss: ClippedPGLossConfig) -> None:
+    """Keep the initial Forest objective identical at startup and before fanout."""
+    if (
+        grpo.adv_estimator.name != "grpo"
+        or not loss.token_level_loss
+        or loss.sequence_level_importance_ratios
+        or loss.truncated_importance_sampling_type == "seq-mask-tis"
+        or loss.use_kl_in_reward
+        or loss.positive_example_nll_weight != 0
+        or grpo.use_dynamic_sampling
+        or grpo.reward_shaping.enabled
+        or grpo.reward_scaling.enabled
+        or grpo.calculate_advantages_on_gpu
+        or grpo.invalid_tool_call_advantage is not None
+        or grpo.malformed_thinking_advantage is not None
+    ):
+        raise ValueError(
+            "Forest requires standard token-level GRPO without advantage overrides"
+        )
+
+
+def forest_execution_row_multiple(
+    policy: PolicyConfig, *, dp_size: int, logprobs_required: bool
+) -> int:
+    """Common row divisibility for fixed or packed Megatron consumers.
+
+    Policy and reference forwards share this trainer's mesh and logprob MBS.
+    Packed consumers form their own bins and only need complete DP shards.
+    Non-interleaved PP admits any positive microbatch count; interleaved PP
+    and dynamic batching require separate qualification.
+    """
+    if (
+        not policy["megatron_cfg"]["enabled"]
+        or policy["dynamic_batching"]["enabled"]
+        or policy["megatron_cfg"].get("virtual_pipeline_model_parallel_size")
+        is not None
+    ):
+        raise ValueError(
+            "Forest execution padding requires fixed or packed, non-interleaved Megatron"
+        )
+    if policy["sequence_packing"]["enabled"]:
+        if type(dp_size) is not int or dp_size < 1:
+            raise ValueError("Forest consumer DP size must be a positive integer")
+        return dp_size
+    sizes = [policy["train_micro_batch_size"]]
+    if logprobs_required:
+        sizes.append(policy["logprob_batch_size"])
+    if any(type(size) is not int or size < 1 for size in [dp_size, *sizes]):
+        raise ValueError(
+            "Forest consumer DP and microbatch sizes must be positive integers"
+        )
+    return dp_size * math.lcm(*sizes)
 
 
 def is_ppo_run(master_config: MasterConfig) -> bool:
@@ -1425,6 +1496,34 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "non-default rollout_recovery policies require "
             "token_capture.enabled=true; without token capture, unfinished Gym "
             "siblings have no durable receipts to recover"
+        )
+    if token_capture_config.forest_training:
+        if master_config.grpo is None:
+            raise ValueError("forest training requires GRPO")
+        if not token_capture_config.enabled:
+            raise ValueError(
+                "token_capture.forest_training requires token_capture.enabled=true"
+            )
+        if (
+            master_config.grpo.invalid_tool_call_advantage is not None
+            or master_config.grpo.malformed_thinking_advantage is not None
+        ):
+            raise ValueError(
+                "forest training does not support message-level advantage overrides"
+            )
+        if token_capture_config.defer_routed_experts_to_policy:
+            raise ValueError("forest training requires direct routed-expert assembly")
+        if async_config.rollout_failure.min_step_batch_fraction != 1:
+            raise ValueError("forest training requires min_step_batch_fraction=1")
+        validate_forest_objective(master_config.grpo, master_config.loss_fn)
+        if reward_penalties_enabled or opd_module.is_opd_enabled(master_config):
+            raise ValueError(
+                "Forest does not support reward penalties or on-policy distillation"
+            )
+        # Validate the fixed-batch policy shape before workers/generation start.
+        # Setup recomputes Q from the actual trainer DP mesh.
+        forest_execution_row_multiple(
+            master_config.policy, dp_size=1, logprobs_required=True
         )
     if token_capture_config.defer_routed_experts_to_policy and not (
         token_capture_config.enabled
