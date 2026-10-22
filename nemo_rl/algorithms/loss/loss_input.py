@@ -516,10 +516,17 @@ def prepare_packed_loss_input(
 
     # With chunking, keep logits in their original dtype: the chunked logprob
     # kernel casts each chunk to float32 internally.
-    use_chunking = chunk_size is not None and not need_top_k_or_top_p_filtering(
-        sampling_params
+    # Local patch (OSWorld forest run, 2026-10-19): chunk the top-k/top-p path
+    # too. Its logits are cast to float32 first, exactly as the unchunked path
+    # does, so filtering and log-softmax see the same values; chunking splits
+    # only the sequence dimension and both operations are per token, so the
+    # results are unchanged while peak memory drops from the whole sequence's
+    # full-vocabulary tensors to one chunk's (H100, CP4, 48k bins).
+    need_filtering = need_top_k_or_top_p_filtering(sampling_params)
+    use_chunking = chunk_size is not None
+    logits_for_logprobs = (
+        logits.to(torch.float32) if (need_filtering or not use_chunking) else logits
     )
-    logits_for_logprobs = logits if use_chunking else logits.to(torch.float32)
 
     logprobs = from_parallel_logits_to_logprobs_packed_sequences(
         logits_for_logprobs,
